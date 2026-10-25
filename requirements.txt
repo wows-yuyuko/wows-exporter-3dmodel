@@ -1,0 +1,7 @@
+# wows-exporter-3dmodel - model export only (no GUI / no Qt)
+numpy>=1.24
+meshoptimizer>=0.2
+pygltflib>=1.16
+Pillow>=10.0
+texture2ddecoder>=1.0.6
+zstandard>=0.25

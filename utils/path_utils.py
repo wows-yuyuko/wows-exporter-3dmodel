@@ -1,0 +1,268 @@
+"""
+统一路径管理 —— 所有模块通过此模块获取路径。
+
+路径策略（区分打包内部资源 vs 外部用户数据）：
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  get_app_dir()     用户数据目录（exe 同级）              │
+  │  用途: config.json, data/, data/split/                 │
+  │  源码 → 项目根 | standalone → exe 同级 | onefile → exe  │
+  │                    同级（sys.argv[0] 原始 exe 路径）    │
+  ├─────────────────────────────────────────────────────────┤
+  │  get_bundled_dir() 打包资源目录（onefile 解压目录）      │
+  │  用途: resources/, tools/                              │
+  │  源码 → 项目根 | standalone → exe 同级 | onefile → 临时 │
+  │                    解压目录（sys.executable）           │
+  └─────────────────────────────────────────────────────────┘
+
+注：Nuitka 编译模式用 "__compiled__" in globals() 判定。
+  - get_app_dir → Path(sys.argv[0]).resolve().parent：onefile 下 sys.argv[0]
+    仍是用户启动的原始 exe 路径 → 用户数据（config.json / data/）落在 exe 同级
+  - get_bundled_dir → Path(sys.executable).resolve().parent：onefile 下
+    sys.executable 指向自解压出的临时 exe → 内置资源在解压目录
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+#: 是否 Nuitka 编译产物（发布版 exe）。
+#: 必须在**模块级**求值：Nuitka 会把 `__compiled__` 注入每个被编译模块的 globals。
+IS_COMPILED: bool = "__compiled__" in globals()
+
+
+def is_debug_build() -> bool:
+    """是否「调试模式」——即按源码方式启动（非 Nuitka 编译的发布版）。
+
+    用途：把只有排障时才需要的信息（引擎功率基准 P、阻力系数 k、弹射功率倍率…）
+    限制在源码/调试运行时显示，发布版 exe 不显示。
+    """
+    return not IS_COMPILED
+
+
+def _get_source_root() -> Path:
+    """源码模式下的项目根目录"""
+    return Path(__file__).resolve().parent.parent
+
+
+def get_app_dir() -> Path:
+    """用户数据目录：exe 同级（config.json, data/ 等存放于此）"""
+    if "__compiled__" in globals():
+        # Nuitka 编译模式：sys.argv[0] 始终是原始 exe 路径（onefile / standalone 均适用）
+        return Path(sys.argv[0]).resolve().parent
+    return _get_source_root()
+
+
+def get_bundled_dir() -> Path:
+    """打包资源目录：resources/, tools/ 等内置资源的实际位置"""
+    if "__compiled__" in globals():
+        # onefile / standalone 下，内置资源都在 sys.executable 同级
+        return Path(sys.executable).resolve().parent
+    return _get_source_root()
+
+
+# ── 用户数据（exe 同级目录） ──────────────────────────────
+
+def get_data_dir() -> Path:
+    """返回 data/ 目录，不存在则自动创建"""
+    d = get_app_dir() / "data"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_split_dir() -> Path:
+    """返回 data/split/ 目录（不自动创建，由 processor_service 按需创建）"""
+    return get_data_dir() / "split"
+
+
+def get_config_path() -> Path:
+    """返回 config.json 路径（不存在时调用方负责创建）"""
+    return get_app_dir() / "config.json"
+
+
+def safe_join(base: str | Path, *parts: str | Path) -> Path:
+    """把由外部数据推导出的路径拼到 ``base`` 下，落点越界时抛 :class:`ValueError`。
+
+    ``.idx`` / ``.pkg`` 条目名、游戏数据里的类型名与实体名都不可信：可能含 ``..``、
+    反斜杠分隔符、盘符前缀或 UNC 路径。直接 ``/`` 或 ``os.path.join`` 拼接会让写入
+    落到输出目录之外（任意文件写入 → 代码执行）。
+
+    只做纯字符串归一化，不解析符号链接，避免 data/ 被重定向（OneDrive、目录联接）
+    时误判为越界。
+    """
+    root = os.path.abspath(base)
+    for part in parts:
+        s = str(part)
+        # 绝对路径 / 盘符相对路径（C:foo）/ UNC / NTFS 数据流（a:b）一律拒绝
+        if os.path.isabs(s) or os.path.splitdrive(s)[0] or ":" in s:
+            raise ValueError(f"非法输出路径（含盘符或绝对路径）: {s}")
+    target = os.path.abspath(os.path.join(root, *(str(p) for p in parts)))
+    # commonpath 比较时按平台归一化、但返回的是原始大小写；两侧都 normcase 后再比，
+    # 否则 Windows 上合法路径会被误判为越界。
+    norm_root = os.path.normcase(root)
+    try:
+        inside = os.path.normcase(os.path.commonpath([root, target])) == norm_root
+    except ValueError:  # 不同盘符
+        inside = False
+    if not inside:
+        raise ValueError(f"非法输出路径（越出 {root}）: {target}")
+    return Path(target)
+
+
+# ── 打包内置资源（源码 / standalone / onefile 解压目录） ──
+
+# ── 游戏目录辅助 ────────────────────────────────────────
+
+def find_latest_bin_folder(game_path, require_idx: bool = False) -> str | None:
+    """在游戏目录 bin/ 下查找最大的数字版本号子目录，返回该目录名。
+
+    ``require_idx=True`` 时只考虑含 ``idx/`` 的目录（客户端更新中断时最新数字
+    目录可能不完整），用于需要读写 .idx/.pkg 的调用方。
+    供 extractor_service / data_extractor / localization_service 共用，
+    消除三处"找最新 bin 目录"的重复实现。无 bin 目录或无版本文件夹返回 None。
+    """
+    import os
+    bin_path = os.path.join(str(game_path), "bin")
+    if not os.path.exists(bin_path):
+        return None
+    folders = [f for f in os.listdir(bin_path)
+               if f.isdigit() and os.path.isdir(os.path.join(bin_path, f))]
+    if require_idx:
+        folders = [f for f in folders
+                   if os.path.isdir(os.path.join(bin_path, f, "idx"))]
+    if not folders:
+        return None
+    folders.sort(key=int)
+    return folders[-1]
+
+
+def detect_wows_type(game_dir) -> str:
+    """按目录内容探测客户端类型：``'Lesta'``（Korabli*.exe）/ ``'Wargaming'``（WorldOfWarships*.exe）。
+
+    找不到返回空串。用途：防止把一服的客户端目录写进另一服的配置槽位
+    （config 的 game_path_lesta / game_path_wargaming 按当前 wows_type 分槽），
+    否则主程序会「用 Lesta 身份去读 WG 客户端」，表现就是读到另一服的数据。
+
+    ⚠️ 分家前（2022 及更早）的客户端**还没有莱服 / 寄服之分**，主程序同样叫
+    ``WorldOfWarships64.exe``，所以这个结果**不能用来判断远古版本**；那种情况
+    按版本号统一识别为「远古版本」即可（见 ``uncode_assets.parse_rules``）。
+    """
+    import os
+
+    root = str(game_dir or "")
+    if not root or not os.path.isdir(root):
+        return ""
+
+    def _probe(base: str) -> str:
+        for name in ("Korabli64.exe", "Korabli.exe"):
+            if os.path.exists(os.path.join(base, name)):
+                return "Lesta"
+        for name in ("WorldOfWarships64.exe", "WorldOfWarships.exe"):
+            if os.path.exists(os.path.join(base, name)):
+                return "Wargaming"
+        return ""
+
+    hit = _probe(root)
+    if hit:
+        return hit
+    bin_dir = os.path.join(root, "bin")
+    if os.path.isdir(bin_dir):
+        try:
+            for sub in sorted(os.listdir(bin_dir), reverse=True):
+                hit = _probe(os.path.join(bin_dir, sub, "bin64"))
+                if hit:
+                    return hit
+        except OSError:
+            pass
+    return ""
+
+
+#: 客户端主程序名（bin64 / bin32 内）。根目录的 WorldOfWarships.exe 是启动器，
+#: 版本恒为 1.0.0.0，不能用于判断客户端版本。
+CLIENT_EXE_NAMES: tuple[str, ...] = (
+    "Korabli64.exe", "Korabli32.exe",
+    "WorldOfWarships64.exe", "WorldOfWarships32.exe",
+)
+
+
+def read_exe_version(exe_path) -> tuple[int, ...] | None:
+    """读取 exe 的 FileVersion（PE 版本资源的 VS_FIXEDFILEINFO）为元组。
+
+    读的是 ``VS_FIXEDFILEINFO.dwFileVersion*``（与资源语言无关），
+    如 ``(0, 10, 0, 0)`` / ``(26, 10, 0, 0)``；读不到返回 None。
+    """
+    import ctypes
+    import os
+
+    path = str(exe_path or "")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        ver = ctypes.windll.version  # noqa: E1101 (仅 Windows)
+        size = ver.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(path, None, size, buf):
+            return None
+        ptr = ctypes.c_void_p()
+        length = ctypes.c_uint()
+        if not ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)):
+            return None
+        if not ptr.value or length.value < 52:
+            return None
+        # VS_FIXEDFILEINFO: dwSignature, dwStrucVersion, dwFileVersionMS, dwFileVersionLS, ...
+        fields = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint32))
+        ms = fields[2]
+        ls = fields[3]
+        if ms == 0 and ls == 0:
+            return None
+        return (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def read_client_version_from_exe(game_dir, bin_folder: str | None = None) -> tuple[int, ...] | None:
+    """从 ``bin/<构建号>/bin64|bin32`` 的客户端主程序读取版本号。
+
+    ``game_info.xml`` 在 Steam / depot 下载的老客户端里并不存在，但主程序的
+    版本资源里始终带着客户端版本（如 ``v20210216`` → ``0,10,0,0``）。
+    按「指定 bin_folder → 最新 bin 目录 → 其余 bin 目录 → 根目录」的顺序探测，
+    返回其中最高的版本；找不到返回 None。
+    """
+    import os
+
+    root = str(game_dir or "")
+    if not root or not os.path.isdir(root):
+        return None
+
+    bases: list[str] = []
+    if bin_folder:
+        bases.append(os.path.join(root, "bin", str(bin_folder)))
+    bin_dir = os.path.join(root, "bin")
+    if os.path.isdir(bin_dir):
+        try:
+            subs = [f for f in os.listdir(bin_dir)
+                    if os.path.isdir(os.path.join(bin_dir, f))]
+            subs.sort(key=lambda f: (f.isdigit(), int(f) if f.isdigit() else 0),
+                      reverse=True)
+        except OSError:
+            subs = []
+        bases.extend(os.path.join(bin_dir, sub) for sub in subs)
+    bases.extend([root, os.path.join(root, "bin")])
+
+    best: tuple[int, ...] | None = None
+    for base in bases:
+        for arch in ("bin64", "bin32", ""):
+            folder = os.path.join(base, arch) if arch else base
+            for name in CLIENT_EXE_NAMES:
+                exe = os.path.join(folder, name)
+                if not os.path.isfile(exe):
+                    continue
+                version = read_exe_version(exe)
+                if version and (best is None or version > best):
+                    best = version
+    return best
