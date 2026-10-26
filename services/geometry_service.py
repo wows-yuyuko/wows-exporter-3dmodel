@@ -631,7 +631,7 @@ class GeometryService:
                   cancel_event: threading.Event | None = None,
                   model_replace: dict | None = None,
                   skin: dict | None = None,
-                  partial_cb=None) -> ShipGeometry:
+                  partial_cb=None, lod: int = 2) -> ShipGeometry:
         """加载一艘船的船体网格 + 挂载模型 + 装甲网格 + 碰撞模型。
 
         model_replace：皮肤变体（origin="model"）的「原始 .model 路径 → 替换路径」映射
@@ -640,12 +640,13 @@ class GeometryService:
         用于整体替换船体模型 + 各挂载模型 + miscFilter 过滤。
         partial_cb：**分阶段交付**回调（在后台线程调用）。船体（+装甲）解析完、挂载还没开始时
         先回传一份几何**快照**，调用方可据此提前出图，不必等挂载全部解析完。
+        lod：目标 LOD 级别。-1（默认）= 只用 LOD0；0..3 = 尽量用该级（无该级的部件回退 LOD0）。
         """
         try:
             return self._load_ship_impl(ship, progress_cb=progress_cb,
                                         cancel_event=cancel_event,
                                         model_replace=model_replace, skin=skin,
-                                        partial_cb=partial_cb)
+                                        partial_cb=partial_cb, lod=lod)
         finally:
             self._clear_per_load_caches()
 
@@ -877,7 +878,7 @@ class GeometryService:
                         cancel_event: threading.Event | None = None,
                         model_replace: dict | None = None,
                         skin: dict | None = None,
-                        partial_cb=None) -> ShipGeometry:
+                        partial_cb=None, lod: int = 2) -> ShipGeometry:
         """加载一艘船的船体网格 + 挂载模型 + 装甲网格 + 碰撞模型（实现）。
 
         - 舰体：模型目录内全部 .geometry 分段（已处于舰船坐标系，直接合并）
@@ -1010,7 +1011,8 @@ class GeometryService:
                 # ★ 只从数据库读取，绝不现场读 assets.bin
                 sdict = self._shape_names_sdict()
                 groups = self._split_primitives_by_material(parsed.primitives, ship_rs, sdict,
-                                                            geom_path=e.path, instancing=True)
+                                                            geom_path=e.path, instancing=True,
+                                                            lod=lod)
                 if groups:
                     for mat_key, g in groups.items():
                         if not g.get('prims'):
@@ -1141,7 +1143,7 @@ class GeometryService:
         self._raise_if_cancelled(cancel_event)
         self._load_mounts(geom, ship, extractor, armor_thickness, progress_cb,
                           cancel_event=cancel_event, model_replace=model_replace,
-                          skin_nodes=skin_nodes)
+                          skin_nodes=skin_nodes, lod=lod)
 
         if progress_cb:
             progress_cb(100, "加载完成")
@@ -1265,7 +1267,7 @@ class GeometryService:
                      armor_thickness: dict, progress_cb=None,
                      cancel_event: threading.Event | None = None,
                      model_replace: dict | None = None,
-                     skin_nodes: dict | None = None):
+                     skin_nodes: dict | None = None, lod: int = -1):
         """加载 GameParams 各 HP_* 挂载模型并按骨架挂点定位。
 
         同一模型目录（如 JGM178 炮塔）只解析一次几何，按每个挂点实例化；
@@ -1325,7 +1327,8 @@ class GeometryService:
             armor_mtx = np.ascontiguousarray(_negz @ m_raw @ _negz, dtype=np.float32)
             if folder not in model_cache:
                 model_cache[folder] = self._load_mount_model(
-                    folder, extractor, armor_thickness, comp, cancel_event=cancel_event)
+                    folder, extractor, armor_thickness, comp, cancel_event=cancel_event,
+                    lod=lod)
             src = model_cache[folder]
             if src is None:
                 continue
@@ -1391,7 +1394,7 @@ class GeometryService:
             if folder not in model_cache:
                 model_cache[folder] = self._load_mount_model(
                     folder, extractor, armor_thickness, COMPONENT_DECK,
-                    cancel_event=cancel_event)
+                    cancel_event=cancel_event, lod=lod)
             src = model_cache[folder]
             if src is None:
                 continue
@@ -2060,7 +2063,8 @@ class GeometryService:
 
     def _load_mount_model(self, folder: str, extractor, armor_thickness: dict,
                           component: str,
-                          cancel_event: threading.Event | None = None) -> dict | None:
+                          cancel_event: threading.Event | None = None,
+                          lod: int = -1) -> dict | None:
         """加载一个挂载模型目录的几何+贴图+装甲（本地坐标）。失败返回 None。
 
         使用目录索引 O(1) 查找；结果按 folder 缓存（跨船复用，多船共享炮塔等）。
@@ -2106,7 +2110,7 @@ class GeometryService:
             all_armor.extend(parsed.armor_models)
             if parsed.primitives:
                 groups = self._split_primitives_by_material(parsed.primitives, mount_rs, sdict,
-                                                            geom_path=e.path)
+                                                            geom_path=e.path, lod=lod)
                 for mat, g in groups.items():
                     # 保留所有分组（含 None 组：shape 无渲染集材质时用默认/文件名约定贴图，
                     # 如指挥仪 ControlTowerShape —— 否则指挥仪/雷达等会整组丢失不显示）
@@ -2331,6 +2335,23 @@ class GeometryService:
         # ★ 不再按文件名约定补全（_Hull_a.dd0/_Hull_camo 等）：只认 mfm 声明的 diffuseMap。
         return "", b""
 
+    #: shape 名里的 LOD 标记。两种命名并存：
+    #: `Bow_lod2Shape`（数字在前）与 `JM039_lodShape1`（数字在后）
+    _LOD_RES = (
+        re.compile(r'_lod(\d+)', re.IGNORECASE),
+        re.compile(r'_lodShape(\d+)', re.IGNORECASE),
+    )
+
+    @staticmethod
+    def _shape_lod(name: str) -> tuple[str, int]:
+        """shape 名 → (去掉 LOD 标记的基名, LOD 级别)。无标记视为 0。"""
+        s = name or ''
+        for rx in GeometryService._LOD_RES:
+            m = rx.search(s)
+            if m:
+                return s[:m.start()] + s[m.end():], int(m.group(1))
+        return s, 0
+
     @staticmethod
     def _palette_subgroups(prims) -> list[list]:
         """按蒙皮调色板把 primitive 再分组（保序）。
@@ -2349,26 +2370,50 @@ class GeometryService:
     def _split_primitives_by_material(self, primitives, global_rs: dict,
                                       sdict: dict | None = None,
                                       geom_path: str | None = None,
-                                      instancing: bool = False) -> dict:
+                                      instancing: bool = False,
+                                      lod: int = -1) -> dict:
         """按渲染集索引把 primitives 分组：{material_key: {material, mfm, prims}}。
 
         - 用 murmur3(shape.vertices) == primitive.mapping_id 连接渲染集与几何
-        - **damage/crack 渲染集**（crack/patch 等损伤网格）保留到 `__crack__` 组
-          （查看器不显示，GLB 导出保留用；带 crack mfm）
-        - LOD 低模仍跳过（不同 LOD 级，非 crack）
+        - **damage/crack 渲染集**（断面、`*_in` 盖板等）归 `__crack__` 组并标
+          is_crack：查看器不渲染，GLB 导出默认剔除（`--damage` 才导出）
+        - LOD：`lod<0` 只用 LOD0；`lod>=0` 尽量用该级，部件没有该级时回退 LOD0
         - 匹配到材质的按材质分组；未匹配的归 None（用舰体默认贴图）
         - sdict 兜底：无渲染集匹配的 primitive 用字符串表反查 shape 名，
           LOD 低模跳过；`_crack_`/Crack 名归 `__crack__` 组
         - 多个 shape 同材质（如 Hull 本体 + DeckHouse）自动合并
         """
+        # 目标 LOD 过滤：名字里的 `_lodN` 决定级别（`Bow_lod2Shape` → 2，`BowShape` → 0）。
+        # 级别表取自 render_sets（DB），不依赖 shape_names 表——后者按 bin_folder 存储，
+        # 换版本后可能查不到（会导致 LOD 参数失效）。
+        levels_by_base: dict = {}
+        if lod >= 0:
+            for _rs in global_rs.values():
+                _base, _lv = GeometryService._shape_lod(_rs.get('shape') or '')
+                if _base:
+                    levels_by_base.setdefault(_base, set()).add(_lv)
+
+        def _lod_skip(name: str) -> bool:
+            if not name:
+                return False
+            base, lv = GeometryService._shape_lod(name)
+            if lod < 0 or not levels_by_base:
+                return lv > 0
+            want = lod if lod in levels_by_base.get(base, ()) else 0
+            return lv != want
+
         mat_by_mid: dict = {}
         damage_mids: set = set()
+        alt_mat_by_mid: dict = {}  # 目标 LOD 变体的材质（它们被 DB 标 damage，不在 mat_by_mid 里）
         norm_to_rs: dict = {}   # 归一化 shape stem → 渲染集（模糊兜底：处理视觉/几何笔误）
         rs_by_mid: dict = {}    # 任意一个 entry（按 mid 兜底）
         rs_by_gp_mid: dict = {} # (geom_path, mid) → 分段精确（刚性绑定用）
         for key, rs in global_rs.items():
             mid = key[1] if isinstance(key, tuple) else key
-            mat_by_mid[mid] = (rs.get('material') or '', rs.get('mfm') or '')
+            _mm = (rs.get('material') or '', rs.get('mfm') or '')
+            mat_by_mid[mid] = _mm
+            if lod >= 0 and GeometryService._shape_lod(rs.get('shape') or '')[1] == lod:
+                alt_mat_by_mid[mid] = _mm
             rs_by_mid.setdefault(mid, rs)
             if isinstance(key, tuple):
                 rs_by_gp_mid[key] = rs
@@ -2426,23 +2471,24 @@ class GeometryService:
 
         for p in primitives:
             _annotate(p)
-            if p.mapping_id in damage_mids:
-                # 损伤网格：DB 把 LOD 与真 crack 都标 damage=1，按 shape 名区分——
-                # `_lod` 低模跳过（非 crack）；保留真 crack（`_crack_`/Crack 名或
-                # crack 材质变体，如 BowShape 的 crack 渲染集）到 __crack__ 组
-                _rs = _rs_for(p.mapping_id) or {}
-                _sname = (_rs.get('shape') or '')
-                if '_lod' in _sname.lower():
-                    continue
-                mat, mfm = mat_by_mid.get(p.mapping_id, ('', ''))
-                _crack_group(mat, mfm)['prims'].append(p)
+            _rs0 = _rs_for(p.mapping_id) or {}
+            _sname0 = _rs0.get('shape') or ''
+            if _lod_skip(_sname0):
                 continue
-            entry = mat_by_mid.get(p.mapping_id)
+            # DB 把 LOD 变体也标 damage=1；按名字/材质区分真 crack 与普通 LOD 变体
+            if p.mapping_id in damage_mids:
+                _mat0, _mfm0 = mat_by_mid.get(p.mapping_id) or ('', '')
+                # 名字取不到时按旧行为当 damage 处理（宁可少导不可混入断面）
+                if not _sname0 or '_crack_' in _sname0 or 'Crack' in _mat0:
+                    # 损伤网格：真 crack（含其 LOD 变体）进 __crack__ 组，导出时剔除
+                    _crack_group(_mat0, _mfm0)['prims'].append(p)
+                    continue
+            entry = mat_by_mid.get(p.mapping_id) or alt_mat_by_mid.get(p.mapping_id)
             if entry is None:
                 # 无渲染集匹配：字符串表反查 shape 名，LOD 低模跳过；crack 名保留
                 if sdict is not None:
                     _name = sdict.get(p.mapping_id) or ''
-                    if '_lod' in _name:
+                    if _lod_skip(_name):
                         continue
                     if '_crack_' in _name or 'Crack' in _name:
                         _crack_group('', '')['prims'].append(p)
