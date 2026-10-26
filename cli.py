@@ -98,7 +98,8 @@ def _export_ship(ship, args, out: Path):
         texture_uri_prefix="../textures",
         texture_format="webp",
         texture_max_size=getattr(args, "texture_size", 1024),
-        split_shapes=not getattr(args, "merge_shapes", False),
+        split_shapes=(getattr(args, "split_shapes", False)
+                      or not getattr(args, "merge_shapes", False)),
         include_damage=getattr(args, "damage", False),
         include_decals=getattr(args, "decals", False),
     )
@@ -319,8 +320,11 @@ def main(argv=None):
     p.add_argument("--no-textures", action="store_true")
     p.add_argument("--zstd", action="store_true", help="also write .glb.zst")
     p.add_argument("--armor", action="store_true", help="also export armor GLB")
-    p.add_argument("--merge-shapes", action="store_true", help="(default) export each hull segment as one mesh")
-    p.add_argument("--split-shapes", action="store_true", help="debug: split hull by shape_spans")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--merge-shapes", action="store_true",
+                   help="merge each hull segment into one mesh (slower to load, can drop faces)")
+    g.add_argument("--split-shapes", action="store_true",
+                   help="split hull by shape_spans (default; flag kept for explicitness)")
     p.add_argument("--damage", action="store_true",
                    help="include damage/crack geometry (default: excluded)")
     p.add_argument("--decals", action="store_true",
@@ -356,7 +360,10 @@ def main(argv=None):
     p.add_argument("--permoflage", action="store_true",
                    help="also export permoflage (needs --skins)")
     p.add_argument("--model-skins", action="store_true")
-    p.add_argument("--merge-shapes", action="store_true")
+    gb = p.add_mutually_exclusive_group()
+    gb.add_argument("--merge-shapes", action="store_true")
+    gb.add_argument("--split-shapes", action="store_true",
+                    help="split hull by shape_spans (default; flag kept for explicitness)")
     p.add_argument("--damage", action="store_true",
                    help="include damage/crack geometry (default: excluded)")
     p.add_argument("--decals", action="store_true",
