@@ -3,7 +3,8 @@
 更新时间：2026-10-26
 
 本文档记录当前导出器仍未解决的问题、已经排除的方向，以及下一步建议。
-设计说明见 [web-render-design.md](web-render-design.md)。
+设计说明见 [web-render-design.md](web-render-design.md)；
+待办清单（对照 Wows_Paragrams_Unpack 的 todo_list 逐条判定）见 [todo-backlog.md](todo-backlog.md)。
 
 ## 状态总览
 
@@ -45,7 +46,26 @@
 ### 当前判断
 
 - 更可能是 Hull albedo 中黑色占位区，或 camo/colorScheme mask；
-- 也可能是分段边界重叠面在同一位置反复遮挡，视觉上像透明。
+- 也可能是分段边界重叠面在同一位置反复遮挡，视觉上像透明；
+- **2026-10-26 补：只在 Lesta 客户端「视觉 2.0」的船上出现**——即 Lesta 的
+  **INDEXED 材质体系**（`TL2_SHIPMAT_INDEXED_PBS_*`），WG 侧目前没有这套。
+  INDEXED 船体只有分段外壳（Bow/MidFront/…），内部空腔没有任何遮挡，
+  从船首视角会一路看穿到船尾（能看到尾部螺旋桨）。游戏另有一个 `Full_*` 低模
+  （整船封闭体，通常只有 LOD4 一份）负责挡这条视线。
+
+### 试过但已回退：`Full_*` 当内部遮挡体
+
+思路是把主 geometry 的 `Full_*` 一起导出当作遮挡体。试过三种做法，都不成立：
+
+1. **直接导出** —— `Full_lod4` 在平坦处比分段外壳大，且 UV 是远景那套，
+   结果整船被深色多边形盖住（涂装消失）；
+2. **沿法线内缩 0.12** —— 仍然露出大半，LOD4 与 LOD2 外壳的偏差不止这个量级；
+3. **单面材质 + 反绕序**（本意「从外看不见、从内挡视线」）—— 几何上有效，
+   但 `docs/threejs-example.html` 把所有材质强制改成了 `THREE.DoubleSide`，
+   把单面设置覆盖掉了；换任何同样强制的查看器都会失效。
+
+已全部撤回，导出回到只含分段外壳的干净版本。真要解决得在前端做（尊重 GLB
+的 `doubleSided`、或限制相机/用背面剔除渲染遮挡体），不在导出侧。
 
 ### 下一步
 
@@ -134,7 +154,7 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 
 - 没有自动化测试 / CI；
 - 没有 NOTICE（kraken.py 为 GPLv3）；
-- `docs/sample` 约 660 MB，未纳入 git（.gitignore 已忽略）；
+- `docs/sample` 约 111 MB，未纳入 git（.gitignore 已忽略）；
 - 文档中的样本清单需要随导出更新。
 
 ## 已修复（备查）
@@ -158,17 +178,22 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 - 水下光照黑块（HemisphereLight groundColor + AmbientLight）；
 - three.js 白底主题；
 - model 皮肤独立 geometry/manifest 与 switchModel()；
-- `--merge-shapes` 保留为可选，但不推荐（会丢 shape）。
+- `--merge-shapes` 保留为可选，但不推荐（会丢 shape）；
+- `--split-shapes` 曾是死参数（解析了但 `_export_ship` 不读），`--merge-shapes` 帮助还写着
+  "(default)"（与实现相反）。现在两者是 argparse 互斥组：默认拆分，`--split-shapes` 只是显式声明；
+- `manifest.hashes.textures` 只统计 `slots`，INDEXED 船换涂装（artMap）/换图集时指纹不变，
+  前端缓存读旧图。改为覆盖 `slots + layers + indexed 图集 + 数组 bin`（`_asset_uris()`）。
+  实测 Waterloo：geometry / materials 哈希不变，textures 从 `ac2839a2…` → `f4491ec4…`；
+- `GeometryService.load_ship` docstring 写 `lod=-1` 默认，实际签名是 `2`（导出默认 LOD2）；
 
 ## 测试样本
 
 ```text
-docs/sample/
-  PBSD511_Waterloo/              81 MB     主 glb 73.9 MiB
-  PJSB018_Yamato_1944/          166 MB     Lesta，主 glb 30.7 MiB
-  PJSB018_Yamato_1944_WG/       410 MB     WG，主 glb 35.2 MiB
-                                         （含 PJSB018_Yamato_1944.before.glb 37.2 MiB，
-                                           剔除 crack 前的对照件）
+docs/sample/                    默认参数（texture 1024 / LOD2），不含皮肤
+  PBSD511_Waterloo/              23 MB     Lesta，主 glb 18.0 MiB（已剔除 decal）
+  PJSB018_Yamato_1944/           23 MB     Lesta，主 glb 17.2 MiB
+  PJSB018_Yamato_1944_WG/        65 MB     WG，主 glb 22.8 MiB
+                                         （含 before.glb 37.2 MiB，剔除 crack 前的对照件）
 ```
 
 本地预览：
