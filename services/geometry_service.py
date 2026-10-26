@@ -640,7 +640,8 @@ class GeometryService:
         用于整体替换船体模型 + 各挂载模型 + miscFilter 过滤。
         partial_cb：**分阶段交付**回调（在后台线程调用）。船体（+装甲）解析完、挂载还没开始时
         先回传一份几何**快照**，调用方可据此提前出图，不必等挂载全部解析完。
-        lod：目标 LOD 级别。-1（默认）= 只用 LOD0；0..3 = 尽量用该级（无该级的部件回退 LOD0）。
+        lod：目标 LOD 级别。**默认 2**（CLI 未显式指定时走 LOD2，体积约为 LOD0 的 60%）；
+        -1 = 只用 LOD0（最高模）；0..3 = 尽量用该级，该级缺失/退化的部件回退 LOD0。
         """
         try:
             return self._load_ship_impl(ship, progress_cb=progress_cb,
@@ -2393,15 +2394,6 @@ class GeometryService:
                 if _base:
                     levels_by_base.setdefault(_base, set()).add(_lv)
 
-        def _lod_skip(name: str) -> bool:
-            if not name:
-                return False
-            base, lv = GeometryService._shape_lod(name)
-            if lod < 0 or not levels_by_base:
-                return lv > 0
-            want = lod if lod in levels_by_base.get(base, ()) else 0
-            return lv != want
-
         mat_by_mid: dict = {}
         damage_mids: set = set()
         alt_mat_by_mid: dict = {}  # 目标 LOD 变体的材质（它们被 DB 标 damage，不在 mat_by_mid 里）
@@ -2431,6 +2423,40 @@ class GeometryService:
                 if rs is not None:
                     return rs
             return rs_by_mid.get(mid)
+
+        # 每个 (基名, LOD 级) 的三角数：用于「最小面数保护」。某些船的低级 LOD 会把
+        # 船首/船尾压成 2 个三角形的占位块（Waterloo Bow/Stern_lod2Shape），
+        # 目标级面数远低于 LOD0 时回退 LOD0，否则正面会直接看穿船壳。
+        tri_by_base_lod: dict = {}
+        if lod >= 0:
+            _tri_by_mid: dict = {}
+            for _p in primitives:
+                _n = 0 if _p.indices is None else int(_p.indices.size) // 3
+                _tri_by_mid[_p.mapping_id] = _tri_by_mid.get(_p.mapping_id, 0) + _n
+            for _mid, _n in _tri_by_mid.items():
+                _nm = (sdict or {}).get(_mid) or ((_rs_for(_mid) or {}).get("shape") or "")
+                _base, _lv = GeometryService._shape_lod(_nm)
+                _k = (_base, _lv)
+                tri_by_base_lod[_k] = tri_by_base_lod.get(_k, 0) + _n
+
+        def _lod_skip(name: str) -> bool:
+            if not name:
+                return False
+            base, lv = GeometryService._shape_lod(name)
+            if lod < 0 or not levels_by_base:
+                return lv > 0
+            want = lod if lod in levels_by_base.get(base, ()) else 0
+            if want:
+                # 辅助几何（线材/补丁/穿孔/玻璃/网格）面数天然少，不参与面数保护，
+                # 否则会把 LOD2 的 623 面线材换成 LOD0 的 13,015 面（船壳被线框盖住）。
+                low = (name or "").lower()
+                if not any(k in low for k in ("wire", "patch", "perforation", "glass", "_net")):
+                    tri0 = tri_by_base_lod.get((base, 0), 0)
+                    tri_want = tri_by_base_lod.get((base, want), 0)
+                    # 目标级几乎是占位几何（< LOD0 的 5% 且 < 50 面）→ 回退 LOD0
+                    if tri0 and tri_want < max(50, tri0 * 0.05):
+                        want = 0
+            return lv != want
 
         def _annotate(p) -> None:
             """写入该 primitive 的 .visual 形状名与绑定节点名（GLB 导出命名用）。
