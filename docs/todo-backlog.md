@@ -24,7 +24,7 @@
 
 ## 二、P0：正确性问题（已定位根因，可直接动手）
 
-### P0-1 artMap 没进 manifest —— INDEXED 涂装叠加层全程缺失
+### P0-1 artMap 没进 manifest —— INDEXED 涂装叠加层全程缺失 ✅ 已修复（2026-10-26）
 
 **现象**：`docs/sample/PBSD511_Waterloo/manifests/PBSD511_Waterloo.json` 里唯一的
 INDEXED 材质 `TL2_SHIPMAT_INDEXED_PBS_Hull`，`layers` 只有 `materialIdMap`，
@@ -59,6 +59,54 @@ artMap   4096x2048 array=1 mips=1 bc=8   →  DX10 arraySize 字段 = 1，数据
 
 **验收**：重导 Waterloo 后 `layers.artMap` 存在；页面加 `?debug=alb` 之外再跑
 art 覆盖强度（参考项目的 debug 5 语义），能看出图案区域。
+
+### P0-1 修复与实测（2026-10-26）
+
+改动：`services/export_service.py::_is_dds_array()` 删掉 `len(dds) > 8_000_000`
+快捷分支，只保留三条结构判据（无 DX10→单图 / `arraySize>1`→数组 / 单层字节×2
+→数组）。**对真实源贴图的判定对照**（Lesta 库，`JSB039_Yamato_1945_Hull.mfm`
+与 `BSD100_Waterloo_1956.mfm`）：
+
+| 贴图 | 尺寸 / dxgi | 体积 | 实测层数 | 旧规则 | 新规则 |
+|---|---|---|---|---|---|
+| Yamato `diffuseMap` | 4096² BC1 | 8.00 MB | 0.5（含 mip） | ❌ 判数组→丢失 | ✅ 单图 |
+| Yamato `metallicGlossMap` | 4096² BC1 | 8.00 MB | 0.5 | ❌ 丢失 | ✅ 单图 |
+| Yamato `normalMap` | 4096² BC7(98) | 16.00 MB | 1.00 | ❌ 丢失 | ✅ 单图 |
+| Waterloo `artMap` | 4096×2048 BC7(98) | 8.00 MB | 1.00 | ❌ 丢失 | ✅ 单图 |
+| Waterloo `normalMap` | 4096×2048 BC7(98) | 8.00 MB | 1.00 | ❌ 丢失 | ✅ 单图 |
+| Waterloo `albedoArray` | 1024² BC1(71) | 20.00 MB | 40.00 | ✅ 数组 | ✅ 数组 |
+| Waterloo `normalArray` | 1024² BC7(98) | 40.00 MB | 40.00 | ✅ 数组 | ✅ 数组 |
+| Waterloo `rgbNoiseMap` | 1024² BC7(98) | 2.67 MB | 2.67 | ❌ 漏判为单图 | ✅ 数组 |
+
+即：旧规则**双向都错**——大单图被当数组丢掉，小数组（`rgbNoiseMap` 2.67 MB）
+被当单图导出。新规则两侧都对。
+
+**六船重导验收**（默认参数 `--texture-size 1024 --lod 2`，decal 默认剔除）：
+
+| 用例 | 船 | 材质模式 | meshes | 三角 | GLB | 关键槽位 |
+|---|---|---|---|---|---|---|
+| INDEXED Lesta | `PBSD511_Waterloo` | indexed 1 / pbs 14 | 731 | 297,425 | 18.02 MiB | `artMap` 1024×512 ✅ `materialIdMap` 1024×512 ✅ |
+| INDEXED Lesta | `PRSB539_Ural` | indexed 1 / pbs 13 | 1,601 | 1,085,431 | 62.77 MiB | `artMap` 1024² ✅ `materialIdMap` 1024² ✅ |
+| PBS Lesta | `PJSB018_Yamato_1944` | pbs 78 | 422 | 249,131 | 17.41 MiB | albedo/ao/mg/normal 均 1024² ✅ |
+| PBS Lesta | `PRSB910_Kremlin` | pbs 74 | 371 | 145,532 | 9.86 MiB | 同上 ✅ |
+| PBS WG | `PJSB018_Yamato_1944` | pbs 76 | 429 | 264,772 | 22.93 MiB | 同上 ✅ |
+| PBS WG | `PRSB110_Sovetskaya_Rossiya` | pbs 74 | 368 | 145,494 | 12.17 MiB | 同上 ✅ |
+
+（WG 无名为 Kremlin 的船，`PRSB110_Sovetskaya_Rossiya` 即克里姆林级。）
+修复前后按材质统计（`docs/sample` 是修复前的产物，材质总数一致，可直接对位）：
+
+| 船 | 修复前 | 修复后 |
+|---|---|---|
+| Lesta 大和 | 59 带 normal / 2 个 `albedo+ao+mg` 缺 normal / 6 / 11（共 78） | 61 带 normal / 6 / 11（共 78） |
+| WG 大和 | 58 带 normal / 2 缺 / 5 / 11（共 76） | 60 带 normal / 5 / 11（共 76） |
+
+即每船**恰好 2 个材质（4K 船体/甲板法线）找回 normal**；其余材质本来就没有
+normalMap 或贴图小于阈值，不受影响。INDEXED 船的 `layers` 恢复
+`artMap` + `materialIdMap`。
+
+**遗留**：backlog 里写的「补一条 4096² 单图 + 30 层数组的回归断言」未做——
+本仓库没有测试框架（见 known-issues P2 工程化），暂靠上表的人工实测，
+探针脚本留在 `.workbuddy/tmp/probe_dim.py`（未纳入 git）。
 
 ### P0-2 贴图去重按 `id(bytes)` —— 假命中会静默串图
 

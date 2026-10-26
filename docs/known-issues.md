@@ -173,7 +173,12 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
   alphaMode、MESHDECAL、log depth / polygonOffset、皮肤模型加载错误；
 - 双服 GameParams 解析；
 - Lesta INDEXED 数组 / atlas / materialIdMap；
-- skipped_textures 658 → 0（DX10 texture array 判断）；
+- skipped_textures 658 → 0（DX10 texture array 判断）；该功能后来发现**双向误判**：
+  判据里有一条 `len(dds) > 8_000_000 → 数组` 的大小捷径，导致 4096² BC1/BC7 单图
+  （Yamato 的 diffuse/mg/normal、Waterloo 的 artMap/normalMap）被当数组整张丢弃；
+  而 2.67 MB 的 `rgbNoiseMap` 又是真数组却漏判。已删掉大小捷径，改为纯结构判定
+  （`arraySize>1` + 单层字节×2）。实测与六船重导数据见
+  [todo-backlog.md](todo-backlog.md) 的 P0-1；
 - ARP 皮肤 hull_config 字符串解析；
 - 水下光照黑块（HemisphereLight groundColor + AmbientLight）；
 - three.js 白底主题；
@@ -189,12 +194,18 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 ## 测试样本
 
 ```text
-docs/sample/                    默认参数（texture 1024 / LOD2），不含皮肤
-  PBSD511_Waterloo/              23 MB     Lesta，主 glb 18.0 MiB（已剔除 decal）
-  PJSB018_Yamato_1944/           23 MB     Lesta，主 glb 17.2 MiB
-  PJSB018_Yamato_1944_WG/        65 MB     WG，主 glb 22.8 MiB
-                                         （含 before.glb 37.2 MiB，剔除 crack 前的对照件）
+docs/sample/                         默认参数（texture 1024 / LOD2）
+  PBSD511_Waterloo/                    24 MB   Lesta，主 glb 18.0 MiB（已剔除 decal）
+  PJSB018_Yamato_1944/                 93 MB   Lesta，主 glb 17.2 MiB（含 4 套 model skin）
+  PJSB018_Yamato_1944_WG/             256 MB   WG，主 glb 22.8 MiB（含 8 套 model skin
+                                               + before.glb 37.2 MiB，剔除 crack 前的对照件）
+  PBSD511_Waterloo_before_array_fix/   23 MB   修复前的 Waterloo（无 artMap），对照用，可删
 ```
+
+2026-10-26：数组误判修完后三份样本按「复现命令」重导（`--armor --skins`，大和另加
+`--model-skins`，因此比旧的「不含皮肤」样本大不少；想要小样本就去掉这两个开关）。
+Waterloo 的 `layers` 恢复 `artMap`（1024×512）+ `materialIdMap`；
+两份大和各多出 2 个材质的 4K 法线（59→61 / 58→60）。
 
 本地预览：
 
