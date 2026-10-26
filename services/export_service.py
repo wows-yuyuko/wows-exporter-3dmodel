@@ -173,6 +173,8 @@ class GlbRenderOptions:
     #: 测量」时使用；代价是 tip 必须进 `skin.joints` 才算骨骼，而 Blender 会为每个
     #: joint 建顶点组 → 顶点组数量翻倍（多出来的是空 `*_tip` 组）。默认关闭。
     tip_bones: bool = False
+    #: 是否按 shape_spans 拆分网格；关闭后每个 hull 分段一次性导出，避免拆点接缝
+    split_shapes: bool = False
 
 
 @dataclass
@@ -1335,7 +1337,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
         inst = getattr(hm, "instance_matrices", None) or []
         matrices = list(inst) if inst else [None]
         for k, matrix in enumerate(matrices):
-            for shape, node_name, piece in _pieces(hm):
+            pieces = _pieces(hm) if options.split_shapes else [("", "", hm)]
+            for shape, node_name, piece in pieces:
                 label = _shape_label(piece, shape, key)
                 if len(matrices) > 1:
                     label = f"{label}_{k}"

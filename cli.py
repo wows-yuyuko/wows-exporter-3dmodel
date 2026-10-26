@@ -96,6 +96,7 @@ def _export_ship(ship, args, out: Path):
         textures_dir=str(textures_dir) if not args.no_textures else "",
         texture_uri_prefix="../textures",
         texture_format="ktx2" if getattr(args, "ktx2", False) else "webp",
+        split_shapes=bool(getattr(args, "split_shapes", False)),
     )
     report = export_render_glb(geom, str(glb), options)
     print(report)
@@ -175,6 +176,8 @@ def cmd_batch(args):
         extra.append("--armor")
     if getattr(args, "ktx2", False):
         extra.append("--ktx2")
+    if getattr(args, "merge_shapes", False):
+        extra.append("--merge-shapes")
     if getattr(args, "skins", False):
         extra.append("--skins")
     if getattr(args, "model_skins", False):
@@ -304,6 +307,8 @@ def main(argv=None):
     p.add_argument("--zstd", action="store_true", help="also write .glb.zst")
     p.add_argument("--armor", action="store_true", help="also export armor GLB")
     p.add_argument("--ktx2", action="store_true", help="use KTX2 textures when toktx is available")
+    p.add_argument("--merge-shapes", action="store_true", help="(default) export each hull segment as one mesh")
+    p.add_argument("--split-shapes", action="store_true", help="debug: split hull by shape_spans")
     p.add_argument("--skins", action="store_true", help="export permoflage/mskin/skin material skins")
     p.add_argument("--model-skins", action="store_true", help="export model-replacement skins")
     p.add_argument("--gp", default=None, help="explicit GameParams file")
@@ -328,6 +333,7 @@ def main(argv=None):
     p.add_argument("--ktx2", action="store_true")
     p.add_argument("--skins", action="store_true")
     p.add_argument("--model-skins", action="store_true")
+    p.add_argument("--merge-shapes", action="store_true")
     p.add_argument("--force", action="store_true")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--jobs", type=int, default=1)
