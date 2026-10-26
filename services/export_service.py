@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import io
 import os
+import struct
 import time
 from dataclasses import dataclass, field
 
@@ -105,25 +106,36 @@ _MIRROR = np.array([1.0, 1.0, -1.0], dtype=np.float32)
 _MIRROR4 = np.diag([1.0, 1.0, -1.0, 1.0]).astype(np.float32)
 
 
+#: BC1 / BC4 系：8 字节每 4×4 块；其余 BC2/3/5/7：16 字节
+_BC_BLOCK_8 = {71, 72, 77, 78, 80, 81}
+#: 未压缩 RGBA/BGRA/BGRX（每像素 4 字节）
+_DXGI_RGBA = {28, 29, 87, 88, 91}
+
+
 def _is_dds_array(dds: bytes) -> bool:
+    """DDS 是否为纹理数组（2DArray）。
+
+    只按结构判定，不看文件大小：4096² 单图 BC1 就有 8 MB、BC5/BC7 是 16 MB，
+    「文件大 = 数组」会把 4K 法线/artMap 当数组整张丢掉。
+    无 DX10 → 单图；arraySize>1 → 数组（偏移 128+12）；
+    arraySize 被写回 1 的容器按单层字节×2 兜底（单图带 mip 也只有约 1.33 层）。
+    """
     try:
-        if len(dds) < 132 or dds[:4] != b"DDS " or dds[84:88] != b"DX10":
+        if len(dds) < 148 or dds[:4] != b"DDS " or dds[84:88] != b"DX10":
             return False
-        if len(dds) > 8_000_000:
-            return True
+        dxgi = struct.unpack_from("<I", dds, 128)[0]
         if struct.unpack_from("<I", dds, 128 + 12)[0] > 1:
             return True
-        # 小数组（如 2048² BC1 × 2）按尺寸推断
         width = struct.unpack_from("<I", dds, 16)[0]
         height = struct.unpack_from("<I", dds, 12)[0]
-        block = 8 if dds[128:132] in (b"G\x00\x00\x00", b"H\x00\x00\x00") else 16
-        try:
-            dxgi = struct.unpack_from("<I", dds, 128)[0]
-            block = 8 if dxgi in (71, 72, 77, 78) else 16
-        except Exception:
-            pass
-        slice_size = max(1, (width + 3) // 4) * max(1, (height + 3) // 4) * block
-        return slice_size > 0 and (len(dds) - 148) >= slice_size * 2
+        if width == 0 or height == 0:
+            return False
+        if dxgi in _DXGI_RGBA:
+            slice_size = width * height * 4
+        else:
+            block = 8 if dxgi in _BC_BLOCK_8 else 16
+            slice_size = max(1, (width + 3) // 4) * max(1, (height + 3) // 4) * block
+        return (len(dds) - 148) >= slice_size * 2
     except Exception:
         return False
 
