@@ -146,9 +146,16 @@ class GlbRenderOptions:
     textures_dir: str = ""
     #: GLB 里引用贴图的相对前缀（默认 geometry/ → ../textures）
     texture_uri_prefix: str = "../textures"
-    #: 外部贴图格式：webp（默认）或 ktx2（需要 toktx）
+    #: 外部贴图格式。目前只有 webp（KTX2/Basis 方案已弃用：Python 3.10 无 pyktx wheel，
+    #: 且 ETC1S 画质与 BC 源贴图不匹配）
     texture_format: str = "webp"
+    #: 贴图最大边长（像素）。超过则等比缩小，小图不放大；`--texture-size` 控制。
+    texture_max_size: int = 1024
     export_mounts: bool = True         # 是否包含挂载（炮塔/副炮/防空/甲板设备等）
+    #: 是否导出破损/断面几何（`_crack_*`、`*_in` 断面盖板等 damage 网格）。
+    #: 默认排除，与 wows-model-exporter 的 `--damage` 口径一致：这些网格只在战舰
+    #: 沉没断裂时出现，混进正常模型会让船体看起来断成几截。
+    include_damage: bool = False
     double_sided: bool = True          # 材质双面渲染（绕序不统一时防背面剔除）
     #: 面朝向统一翻转（glTF 默认 CCW 正面；负 Z 镜像后绕序为 CW 背面，需翻转一次）
     flip_winding: bool = True
@@ -396,10 +403,11 @@ class _GlbBuilder:
     """增量构建 GLB：单一二进制 blob + glTF 图（bufferView/accessor/…/node）。"""
 
     def __init__(self, textures_dir: str = "", texture_uri_prefix: str = "../textures",
-                 texture_format: str = "webp"):
+                 texture_format: str = "webp", texture_max_size: int = 1024):
         self.textures_dir = textures_dir
         self.texture_uri_prefix = texture_uri_prefix.rstrip("/")
         self.texture_format = texture_format
+        self.texture_max_size = max(64, int(texture_max_size))
         self.texture_records: list[dict] = []
         self._array_texture_cache: dict[int, dict | None] = {}
         self.blob = bytearray()
@@ -457,7 +465,7 @@ class _GlbBuilder:
         cached = self._texture_cache.get(key)
         if cached is not None:
             return cached
-        png = dds_to_png(dds_bytes, max_size=2048 if self.textures_dir else 4096, kind=kind)
+        png = dds_to_png(dds_bytes, max_size=self.texture_max_size, kind=kind)
         if png is None:
             if os.environ.get("WOWS_DEBUG_TEXTURES"):
                 import struct
@@ -533,7 +541,7 @@ class _GlbBuilder:
                 tiles.append(im)
             if not tiles:
                 return None
-            tile = 256 if max(width, height) > 256 else max(width, height)
+            tile = min(256, self.texture_max_size) if max(width, height) > 256 else max(width, height)
             cols = int(len(tiles) ** 0.5)
             while cols * cols < len(tiles):
                 cols += 1
@@ -557,40 +565,21 @@ class _GlbBuilder:
             return None
 
     def _write_external_texture(self, png: bytes, label: str) -> str | None:
-        """PNG bytes -> webp/ktx2 file; returns relative URI."""
+        """PNG bytes -> webp file; returns relative URI."""
         import hashlib
         import io
         from pathlib import Path
-        data = png
-        ext = ".png"
-        mime = "image/png"
-        if self.texture_format == "ktx2":
-            import shutil, subprocess, tempfile
-            tool = shutil.which("toktx")
-            if tool:
-                try:
-                    with tempfile.TemporaryDirectory() as td:
-                        src = Path(td) / "in.png"
-                        dst = Path(td) / "out.ktx2"
-                        src.write_bytes(png)
-                        subprocess.run([tool, "--t2", "--encode", "etc1s", "--clevel", "2",
-                                        "--qlevel", "128", str(dst), str(src)],
-                                       check=True, capture_output=True)
-                        data = dst.read_bytes()
-                    ext, mime = ".ktx2", "image/ktx2"
-                except Exception:
-                    data, ext, mime = png, ".png", "image/png"
-        if ext == ".png":
-            try:
-                from PIL import Image as PILImage
-                im = PILImage.open(io.BytesIO(png)).convert("RGBA")
-                if max(im.size) > 2048:
-                    im.thumbnail((2048, 2048), PILImage.LANCZOS)
-                out = io.BytesIO()
-                im.save(out, "WEBP", quality=85, method=2)
-                data, ext, mime = out.getvalue(), ".webp", "image/webp"
-            except Exception:
-                pass
+        data, ext, mime = png, ".png", "image/png"
+        try:
+            from PIL import Image as PILImage
+            im = PILImage.open(io.BytesIO(png)).convert("RGBA")
+            if max(im.size) > self.texture_max_size:
+                im.thumbnail((self.texture_max_size, self.texture_max_size), PILImage.LANCZOS)
+            out = io.BytesIO()
+            im.save(out, "WEBP", quality=85, method=2)
+            data, ext, mime = out.getvalue(), ".webp", "image/webp"
+        except Exception:
+            pass
         digest = hashlib.sha1(data).hexdigest()
         out_dir = Path(self.textures_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -949,7 +938,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
     t0 = time.time()
     report = ExportReport(output_path=str(output_path), content="render")
 
-    builder = _GlbBuilder(options.textures_dir, options.texture_uri_prefix, options.texture_format)
+    builder = _GlbBuilder(options.textures_dir, options.texture_uri_prefix, options.texture_format,
+                          options.texture_max_size)
     builder.gltf.asset.extras = {
         "game_key": geometry.game_key,
         "display_name": geometry.display_name,
@@ -1327,6 +1317,9 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
     n_hull = len(geometry.hull_meshes)
     for i, hm in enumerate(geometry.hull_meshes):
         _check_cancel(cancel_event)
+        # 破损/断面几何默认剔除（GLB 只表示完好状态）
+        if not options.include_damage and getattr(hm, "is_crack", False):
+            continue
         if progress_cb:
             progress_cb(5 + 60 * i / max(1, n_hull), f"导出舰体 {i + 1}/{n_hull}")
         key = str(hm.name).split("#")[0].split("|")[0]
@@ -1353,6 +1346,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
     n_mounts = len(mounts)
     for i, mm in enumerate(mounts):
         _check_cancel(cancel_event)
+        if not options.include_damage and getattr(mm, "is_crack", False):
+            continue
         if progress_cb:
             progress_cb(65 + 30 * i / max(1, n_mounts), f"导出挂载 {i + 1}/{n_mounts}")
         inst = getattr(mm, "instance_matrices", None) or []
