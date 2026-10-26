@@ -96,7 +96,7 @@ def _export_ship(ship, args, out: Path):
         textures_dir=str(textures_dir) if not args.no_textures else "",
         texture_uri_prefix="../textures",
         texture_format="ktx2" if getattr(args, "ktx2", False) else "webp",
-        split_shapes=bool(getattr(args, "split_shapes", False)),
+        split_shapes=not getattr(args, "merge_shapes", False),
     )
     report = export_render_glb(geom, str(glb), options)
     print(report)

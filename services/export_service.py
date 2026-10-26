@@ -174,7 +174,7 @@ class GlbRenderOptions:
     #: joint 建顶点组 → 顶点组数量翻倍（多出来的是空 `*_tip` 组）。默认关闭。
     tip_bones: bool = False
     #: 是否按 shape_spans 拆分网格；关闭后每个 hull 分段一次性导出，避免拆点接缝
-    split_shapes: bool = False
+    split_shapes: bool = True
 
 
 @dataclass
