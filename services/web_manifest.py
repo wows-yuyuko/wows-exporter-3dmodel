@@ -16,6 +16,26 @@ def _sha1_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _asset_uris(materials: dict) -> list[str]:
+    """材质引用的**全部外部文件**（相对输出目录）。
+
+    只统计 `slots` 会漏掉 INDEXED 的图集/索引图与数组 bin ——
+    换涂装（artMap）或换图集时 `hashes.textures` 不变，前端缓存无法失效。
+    """
+    uris: set[str] = set()
+    for m in materials.values():
+        uris.update(u for u in (m.get("slots") or {}).values() if u)
+        uris.update(u for u in (m.get("layers") or {}).values() if u)
+        idx = m.get("indexed") or {}
+        for meta in (idx.get("textures") or {}).values():
+            if isinstance(meta, dict) and meta.get("uri"):
+                uris.add(meta["uri"])
+        for meta in (idx.get("arrays") or {}).values():
+            if isinstance(meta, dict) and meta.get("bin"):
+                uris.add(meta["bin"])
+    return sorted(uris)
+
+
 def _slot_uri(gltf: GLTF2, info):
     if info is None:
         return None
@@ -112,9 +132,10 @@ def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: st
                 "component": mesh_extras.get("component", (node.extras or {}).get("component", "")),
             })
 
-    textures = sorted({u for m in materials.values() for u in m["slots"].values() if u})
+    #: 覆盖 slots + layers + INDEXED 图集 + 数组 bin（换涂装/换图集都能让指纹变化）
+    assets = _asset_uris(materials)
     tex_hash = hashlib.sha1()
-    for uri in textures:
+    for uri in assets:
         tex_hash.update(uri.encode("utf-8"))
         p = manifest_path.parent.parent / uri
         if p.is_file():
