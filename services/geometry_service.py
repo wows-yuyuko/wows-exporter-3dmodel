@@ -905,8 +905,9 @@ class GeometryService:
             if not model_replace:
                 model_replace = skin.get("peculiarity_models") or None
             for hv in (skin.get("hull_config") or {}).values():
-                if isinstance(hv, dict) and hv.get("model"):
-                    use_mf_override = hv["model"].rsplit("/", 2)[-2] if "/" in hv["model"] else ""
+                hv_model = hv.get("model") if isinstance(hv, dict) else (hv if isinstance(hv, str) else "")
+                if hv_model:
+                    use_mf_override = hv_model.rsplit("/", 2)[-2] if "/" in hv_model else ""
                     if use_mf_override:
                         use_mf = use_mf_override
                     break

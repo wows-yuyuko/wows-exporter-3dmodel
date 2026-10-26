@@ -105,6 +105,29 @@ _MIRROR = np.array([1.0, 1.0, -1.0], dtype=np.float32)
 _MIRROR4 = np.diag([1.0, 1.0, -1.0, 1.0]).astype(np.float32)
 
 
+def _is_dds_array(dds: bytes) -> bool:
+    try:
+        if len(dds) < 132 or dds[:4] != b"DDS " or dds[84:88] != b"DX10":
+            return False
+        if len(dds) > 8_000_000:
+            return True
+        if struct.unpack_from("<I", dds, 128 + 12)[0] > 1:
+            return True
+        # 小数组（如 2048² BC1 × 2）按尺寸推断
+        width = struct.unpack_from("<I", dds, 16)[0]
+        height = struct.unpack_from("<I", dds, 12)[0]
+        block = 8 if dds[128:132] in (b"G\x00\x00\x00", b"H\x00\x00\x00") else 16
+        try:
+            dxgi = struct.unpack_from("<I", dds, 128)[0]
+            block = 8 if dxgi in (71, 72, 77, 78) else 16
+        except Exception:
+            pass
+        slice_size = max(1, (width + 3) // 4) * max(1, (height + 3) // 4) * block
+        return slice_size > 0 and (len(dds) - 148) >= slice_size * 2
+    except Exception:
+        return False
+
+
 def _check_cancel(cancel_event) -> None:
     """协作式取消检查点：取消已请求则抛出 TaskCancelled（正常结束，非错误）。"""
     if cancel_event is not None and cancel_event.is_set():
@@ -119,6 +142,12 @@ def _check_cancel(cancel_event) -> None:
 class GlbRenderOptions:
     """渲染模型导出选项。"""
     embed_textures: bool = True        # 是否嵌入贴图（false 导出纯几何）
+    #: 非空时贴图写到该目录，GLB 里用 uri 引用（外部贴图模式）
+    textures_dir: str = ""
+    #: GLB 里引用贴图的相对前缀（默认 geometry/ → ../textures）
+    texture_uri_prefix: str = "../textures"
+    #: 外部贴图格式：webp（默认）或 ktx2（需要 toktx）
+    texture_format: str = "webp"
     export_mounts: bool = True         # 是否包含挂载（炮塔/副炮/防空/甲板设备等）
     double_sided: bool = True          # 材质双面渲染（绕序不统一时防背面剔除）
     #: 面朝向统一翻转（glTF 默认 CCW 正面；负 Z 镜像后绕序为 CW 背面，需翻转一次）
@@ -364,7 +393,13 @@ def dds_to_png(data: bytes, max_size: int = 4096, kind: str = _TEX_COLOR) -> byt
 class _GlbBuilder:
     """增量构建 GLB：单一二进制 blob + glTF 图（bufferView/accessor/…/node）。"""
 
-    def __init__(self):
+    def __init__(self, textures_dir: str = "", texture_uri_prefix: str = "../textures",
+                 texture_format: str = "webp"):
+        self.textures_dir = textures_dir
+        self.texture_uri_prefix = texture_uri_prefix.rstrip("/")
+        self.texture_format = texture_format
+        self.texture_records: list[dict] = []
+        self._array_texture_cache: dict[int, dict | None] = {}
         self.blob = bytearray()
         self.offset = 0
         self.gltf = GLTF2()
@@ -420,9 +455,26 @@ class _GlbBuilder:
         cached = self._texture_cache.get(key)
         if cached is not None:
             return cached
-        png = dds_to_png(dds_bytes, max_size=4096, kind=kind)
+        png = dds_to_png(dds_bytes, max_size=2048 if self.textures_dir else 4096, kind=kind)
         if png is None:
+            if os.environ.get("WOWS_DEBUG_TEXTURES"):
+                import struct
+                fourcc = dds_bytes[84:88] if len(dds_bytes) > 88 else b""
+                dxgi = struct.unpack_from("<I", dds_bytes, 128)[0] if fourcc == b"DX10" and len(dds_bytes) >= 132 else -1
+                print("[SKIP-TEX]", label, "fourcc", fourcc, "dxgi", dxgi, "len", len(dds_bytes))
             return None
+        if self.textures_dir:
+            uri = self._write_external_texture(png, label)
+            if uri is None:
+                return None
+            img_idx = len(self.gltf.images)
+            self.gltf.images.append(Image(uri=uri, mimeType=self._texture_mime,
+                                          name=label or None))
+            tex_idx = len(self.gltf.textures)
+            self.gltf.textures.append(Texture(sampler=self.sampler_idx, source=img_idx,
+                                              name=label or None))
+            self._texture_cache[key] = tex_idx
+            return tex_idx
         bv = self.add_buffer_view(png)
         img_idx = len(self.gltf.images)
         self.gltf.images.append(Image(bufferView=bv, mimeType="image/png",
@@ -432,6 +484,121 @@ class _GlbBuilder:
                                           name=label or None))
         self._texture_cache[key] = tex_idx
         return tex_idx
+
+    def add_texture_array_from_dds(self, dds_bytes: bytes, label: str = "") -> dict | None:
+        key = id(dds_bytes)
+        if key in self._array_texture_cache:
+            return self._array_texture_cache[key]
+        meta = self._array_texture_impl(dds_bytes, label)
+        self._array_texture_cache[key] = meta
+        return meta
+
+    def _array_texture_impl(self, dds_bytes: bytes, label: str = "") -> dict | None:
+        """DDS DX10 texture array -> WebP atlas + metadata (tile_size/cols/rows/count)."""
+        try:
+            import io
+            import struct
+            import hashlib
+            from pathlib import Path
+            if len(dds_bytes) < 148 or dds_bytes[:4] != b"DDS " or dds_bytes[84:88] != b"DX10":
+                return None
+            width = struct.unpack_from("<I", dds_bytes, 16)[0]
+            height = struct.unpack_from("<I", dds_bytes, 12)[0]
+            dxgi, dim, misc, count, misc2 = struct.unpack_from("<IIIII", dds_bytes, 128)
+            if count <= 1 or width == 0 or height == 0:
+                return None
+            import texture2ddecoder as tdec
+            from PIL import Image as PILImage
+            decoders = {
+                71: tdec.decode_bc1, 72: tdec.decode_bc1,
+                77: tdec.decode_bc3, 78: tdec.decode_bc3,
+                98: tdec.decode_bc7, 99: tdec.decode_bc7,
+            }
+            dec = decoders.get(dxgi)
+            if dec is None:
+                return None
+            block = 8 if dxgi in (71, 72, 77, 78) else 16
+            slice_size = max(1, (width + 3) // 4) * max(1, (height + 3) // 4) * block
+            off = 148
+            tiles = []
+            for i in range(count):
+                raw = dds_bytes[off:off + slice_size]
+                off += slice_size
+                if len(raw) < slice_size:
+                    break
+                bgra = dec(raw, width, height)
+                im = PILImage.frombytes("RGBA", (width, height), bgra, "raw", "BGRA")
+                tiles.append(im)
+            if not tiles:
+                return None
+            tile = 256 if max(width, height) > 256 else max(width, height)
+            cols = int(len(tiles) ** 0.5)
+            while cols * cols < len(tiles):
+                cols += 1
+            rows = (len(tiles) + cols - 1) // cols
+            atlas = PILImage.new("RGBA", (cols * tile, rows * tile), (0, 0, 0, 0))
+            for i, im in enumerate(tiles):
+                atlas.paste(im.resize((tile, tile), PILImage.LANCZOS), ((i % cols) * tile, (i // cols) * tile))
+            out = io.BytesIO()
+            atlas.save(out, "WEBP", quality=85, method=2)
+            data = out.getvalue()
+            digest = hashlib.sha1(data).hexdigest()
+            out_dir = Path(self.textures_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rel = digest + ".webp"
+            p = out_dir / rel
+            if not p.exists():
+                p.write_bytes(data)
+            return {"uri": self.texture_uri_prefix + "/" + rel, "tile": tile,
+                    "cols": cols, "rows": rows, "count": len(tiles)}
+        except Exception:
+            return None
+
+    def _write_external_texture(self, png: bytes, label: str) -> str | None:
+        """PNG bytes -> webp/ktx2 file; returns relative URI."""
+        import hashlib
+        import io
+        from pathlib import Path
+        data = png
+        ext = ".png"
+        mime = "image/png"
+        if self.texture_format == "ktx2":
+            import shutil, subprocess, tempfile
+            tool = shutil.which("toktx")
+            if tool:
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        src = Path(td) / "in.png"
+                        dst = Path(td) / "out.ktx2"
+                        src.write_bytes(png)
+                        subprocess.run([tool, "--t2", "--encode", "etc1s", "--clevel", "2",
+                                        "--qlevel", "128", str(dst), str(src)],
+                                       check=True, capture_output=True)
+                        data = dst.read_bytes()
+                    ext, mime = ".ktx2", "image/ktx2"
+                except Exception:
+                    data, ext, mime = png, ".png", "image/png"
+        if ext == ".png":
+            try:
+                from PIL import Image as PILImage
+                im = PILImage.open(io.BytesIO(png)).convert("RGBA")
+                if max(im.size) > 2048:
+                    im.thumbnail((2048, 2048), PILImage.LANCZOS)
+                out = io.BytesIO()
+                im.save(out, "WEBP", quality=85, method=2)
+                data, ext, mime = out.getvalue(), ".webp", "image/webp"
+            except Exception:
+                pass
+        digest = hashlib.sha1(data).hexdigest()
+        out_dir = Path(self.textures_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (digest + ext)
+        if not path.exists():
+            path.write_bytes(data)
+        self._texture_mime = mime
+        self.texture_records.append({"label": label, "uri": self.texture_uri_prefix + "/" + digest + ext,
+                                     "sha1": digest, "mime": mime})
+        return self.texture_uri_prefix + "/" + digest + ext
 
     def add_material(self, name: str, base_color=(1.0, 1.0, 1.0, 1.0),
                      texture_idx: int | None = None, alpha_mode: str = _OPAQUE,
@@ -780,7 +947,7 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
     t0 = time.time()
     report = ExportReport(output_path=str(output_path), content="render")
 
-    builder = _GlbBuilder()
+    builder = _GlbBuilder(options.textures_dir, options.texture_uri_prefix, options.texture_format)
     builder.gltf.asset.extras = {
         "game_key": geometry.game_key,
         "display_name": geometry.display_name,
@@ -973,11 +1140,20 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
         tex = getattr(src, "texture_dds", None) or fallback_tex
         tex_idx = None
         if options.embed_textures and tex:
-            tex_idx = builder.add_texture_from_dds(tex, name)
-            if tex_idx is None:
-                report.skipped_textures += 1
+            if _is_dds_array(tex):
+                pass  # INDEXED atlas arrays are exported via wows_indexed_textures
+            else:
+                tex_idx = builder.add_texture_from_dds(tex, name)
+                if tex_idx is None:
+                    report.skipped_textures += 1
         # ── 其他 PBR 通道：只认 .mfm 声明的贴图键（material_textures）──
         mtexs = getattr(src, "material_textures", None) or {}
+        if os.environ.get("WOWS_DEBUG_MATERIALS") and getattr(src, "tech_family", "pbs") == "indexed":
+            print("[DEBUG-IDX]", getattr(src, "material", ""), {
+                k: (type(v).__name__, (len(v) if hasattr(v, "__len__") else ""),
+                    (str(v)[:80]))
+                for k, v in mtexs.items()
+            })
 
         def _pick(*keys):
             for k in keys:
@@ -996,7 +1172,7 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
                 (_TEX_COLOR, ("ambientOcclusionMap",), "ao"),
             ):
                 picked = _pick(*keys)
-                if not picked:
+                if not picked or _is_dds_array(picked[1]):
                     continue
                 slot_idx = builder.add_texture_from_dds(picked[1], f"{name}_{slot}", kind)
                 if slot_idx is None:
@@ -1008,16 +1184,78 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
                     mr_idx = slot_idx
                 else:
                     ao_idx = slot_idx
+        layer_tex = {}
+        if options.embed_textures:
+            for slot, keys in (
+                ("composite", ("compositeMap", "composite", "g_compositeMap")),
+                ("artMap", ("artMap", "g_artMap")),
+                ("materialIdMap", ("materialIdMap",)),
+            ):
+                picked = _pick(*keys)
+                if not picked or _is_dds_array(picked[1]):
+                    continue
+                slot_idx = builder.add_texture_from_dds(picked[1], f"{name}_{slot}", _TEX_COLOR)
+                if slot_idx is not None:
+                    layer_tex[slot] = slot_idx
+        indexed_tex = {}
+        if options.embed_textures and getattr(src, "tech_family", "pbs") == "indexed":
+            for slot, keys, kind in (
+                ("albedoArray", ("albedoArray", "g_albedoMap"), _TEX_COLOR),
+                ("normalArray", ("normalArray", "g_normalMap"), _TEX_NORMAL),
+                ("mgArray", ("MGArray", "g_mgMap"), _TEX_MR),
+            ):
+                picked = _pick(*keys)
+                if not picked:
+                    continue
+                meta = builder.add_texture_array_from_dds(picked[1], f"{name}_{slot}")
+                if meta:
+                    indexed_tex[slot] = meta
+        indexed_meta = {}
+        ip = getattr(src, "indexed_params", None) or {}
+        if options.embed_textures and ip:
+            arrays = ip.get("arrays") or {}
+            for aname, arr in arrays.items():
+                try:
+                    import hashlib
+                    from pathlib import Path
+                    a = np.ascontiguousarray(arr)
+                    data = a.tobytes()
+                    digest = hashlib.sha1(data).hexdigest()
+                    out_dir = Path(builder.textures_dir)
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    rel = "indexed_" + digest + ".bin"
+                    bin_path = out_dir / rel
+                    if not bin_path.exists():
+                        bin_path.write_bytes(data)
+                    indexed_meta.setdefault("arrays", {})[aname] = {
+                        "bin": builder.texture_uri_prefix + "/" + rel,
+                        "dtype": str(a.dtype), "shape": list(a.shape),
+                    }
+                except Exception:
+                    pass
+            for k, v in ip.items():
+                if k == "arrays":
+                    continue
+                if isinstance(v, (int, float, str, bool, list, tuple)):
+                    indexed_meta[k] = v
+        alpha_mode = _OPAQUE if getattr(src, "opaque", True) else _BLEND
         mat_idx = builder.add_material(
             getattr(src, "material", None) or name,
             base_color=(1.0, 1.0, 1.0, 1.0), texture_idx=tex_idx,
+            alpha_mode=alpha_mode,
             double_sided=options.double_sided,
             extras={"component": component,
                     "texture_path": getattr(src, "texture_path", ""),
                     "wows_textures": {k: (v[0] if isinstance(v, (tuple, list)) else "")
-                                      for k, v in mtexs.items()}},
+                                      for k, v in mtexs.items()},
+                    "wows_layer_textures": layer_tex,
+                    "wows_indexed": indexed_meta,
+                    "wows_indexed_textures": indexed_tex},
             normal_tex=normal_idx, mr_tex=mr_idx, occlusion_tex=ao_idx)
         # ── 顶点组 / 权重（iiiww 属性）──
+        if p.size == 0 or p.size % 3:
+            report.skipped_meshes += 1
+            return
         mesh_extras = dict(extras or {}, component=component)
         if joints0 is not None and not skinned:
             # 数据保留（自定义属性）+ 骨骼名表，供需要时重建顶点组/骨骼

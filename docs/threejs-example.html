@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>wows-exporter-3dmodel — three.js 示例</title>
+<style>
+  html,body{margin:0;height:100%;background:#f5f7fa;color:#1f2328;font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+  #hud{position:fixed;left:12px;top:12px;z-index:2;background:#ffffffdd;border:1px solid #d0d7de;
+       padding:10px 12px;border-radius:8px;backdrop-filter:blur(6px);max-width:320px;box-shadow:0 2px 10px #0001}
+  #hud label{display:block;margin:4px 0;color:#57606a}
+  #hud select{background:#fff;color:#1f2328;border:1px solid #d0d7de;padding:3px 6px;width:100%}
+  #status{color:#0969da}
+  #err{color:#cf222e;white-space:pre-wrap;font-size:12px}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="hud">
+  <label>Ship: <input id="ship" value="PJSB520_Raiju" style="width:100%;background:#fff;color:#1f2328;border:1px solid #d0d7de;padding:3px 6px"></label>
+  <label>Skin <select id="skin"></select></label>
+  <label><input type="checkbox" id="armor"> 显示装甲</label>
+  <label><input type="checkbox" id="rot"> 自动旋转</label>
+  <div id="status">loading…</div>
+  <div id="err"></div>
+  <div id="info" style="color:#8b949e"></div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const params = new URLSearchParams(location.search);
+const ROOT = params.get('root') || './';
+let SHIP = params.get('ship') || 'PJSB520_Raiju';
+const status = document.getElementById('status');
+const err = document.getElementById('err');
+const fail = e => { err.textContent = String(e && e.stack || e); status.textContent = 'error'; };
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xf5f7fa);
+scene.fog = new THREE.Fog(0xf5f7fa, 80, 260);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.05, 4000);
+camera.position.set(18, 10, 24);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 0, 0);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0xb9c1cc, 2.2));
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 2.4);
+sun.position.set(30, 45, 20);
+scene.add(sun);
+scene.add(new THREE.DirectionalLight(0x88aaff, 0.6).translateX(-30).translateY(10).translateZ(-20));
+
+const grid = new THREE.GridHelper(200, 40, 0xc9d1d9, 0xe6e9ed);
+grid.position.y = -0.01;
+scene.add(grid);
+
+const ktx2 = new KTX2Loader()
+  .setTranscoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/basis/')
+  .detectSupport(renderer);
+const gltfLoader = new GLTFLoader().setKTX2Loader(ktx2);
+const texLoader = new THREE.TextureLoader();
+
+function texture(uri, srgb) {
+  if (!uri) return null;
+  const loader = uri.endsWith('.ktx2') ? ktx2 : texLoader;
+  const t = loader.load(ROOT + uri);
+  t.flipY = false;
+  t.wrapS = THREE.RepeatWrapping;
+  t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+async function loadArrayTex(uri) {
+  const buf = await (await fetch(ROOT + uri)).arrayBuffer();
+  const data = new Float32Array(buf);
+  const t = new THREE.DataTexture(data, 196, 1, THREE.RGBAFormat, THREE.FloatType);
+  t.minFilter = t.magFilter = THREE.NearestFilter;
+  t.needsUpdate = true;
+  return t;
+}
+
+function indexedShader() {
+  return {
+    vertex: [
+      'varying vec2 vUv;',
+      'varying vec3 vN;',
+      'void main(){',
+      '  vUv = uv;',
+      '  vN = normalize(normalMatrix * normal);',
+      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);',
+      '}'
+    ].join('\n'),
+    fragment: [
+      'uniform sampler2D uMatId, uAlb, uArt, uNrm, uMg;',
+      'uniform sampler2D uTile, uOffset, uRot, uTint, uRemove;',
+      'uniform vec2 uGrid;',
+      'uniform vec2 uMatIdSize;',
+      'varying vec2 vUv;',
+      'varying vec3 vN;',
+      'vec2 atlasUV(float slice, vec2 uv){',
+      '  vec2 cell = vec2(mod(slice, uGrid.x), floor(slice / uGrid.x));',
+      '  return (cell + fract(uv)) / uGrid;',
+      '}',
+      'void main(){',
+      '  vec2 texel = 1.0 / uMatIdSize;',
+      '  vec4 m4 = vec4(',
+      '    texture2D(uMatId, vUv + vec2(-0.5,-0.5)*texel).r,',
+      '    texture2D(uMatId, vUv + vec2( 0.5,-0.5)*texel).r,',
+      '    texture2D(uMatId, vUv + vec2(-0.5, 0.5)*texel).r,',
+      '    texture2D(uMatId, vUv + vec2( 0.5, 0.5)*texel).r);',
+      '  vec4 mid4 = min(floor(m4*255.0 + 0.5), 195.0);',
+      '  float d0 = abs(mid4.x-mid4.y)+abs(mid4.x-mid4.z)+abs(mid4.x-mid4.w);',
+      '  float d1 = abs(mid4.y-mid4.x)+abs(mid4.y-mid4.z)+abs(mid4.y-mid4.w);',
+      '  float d2 = abs(mid4.z-mid4.x)+abs(mid4.z-mid4.y)+abs(mid4.z-mid4.w);',
+      '  float d3 = abs(mid4.w-mid4.x)+abs(mid4.w-mid4.y)+abs(mid4.w-mid4.z);',
+      '  float dm = min(min(d0,d1), min(d2,d3));',
+      '  float sel = (dm == d0) ? mid4.x : (dm == d1) ? mid4.y : (dm == d2) ? mid4.z : mid4.w;',
+      '  int mid = int(sel);',
+      '  vec2 coord = (vec2(float(mid), 0.5)) / vec2(196.0, 1.0);',
+      '  vec4 tile = texture2D(uTile, coord);',
+      '  vec4 offs = texture2D(uOffset, coord);',
+      '  vec4 rot = texture2D(uRot, coord);',
+      '  vec2 uv = vUv * offs.zw + offs.xy;',
+      '  float a = rot.x;',
+      '  uv = vec2(uv.x*cos(a) + uv.y*sin(a), -uv.x*sin(a) + uv.y*cos(a));',
+      '  vec3 albedo = texture2D(uAlb, atlasUV(tile.x, uv)).rgb;',
+      '  vec3 ref = pow(texture2D(uRemove, coord).rgb, vec3(2.2));',
+      '  vec4 tint4 = texture2D(uTint, coord);',
+      '  vec3 tint = pow(tint4.rgb, vec3(2.2));',
+      '  float diff = abs(albedo.x-ref.x)+abs(albedo.y-ref.y)+abs(albedo.z-ref.z);',
+      '  float k = clamp((diff + 0.001) / max(tint4.a, 1e-4), 0.0, 1.0);',
+      '  vec3 c = mix(tint, albedo, k);',
+      '  vec4 art = texture2D(uArt, vUv);',
+      '  float am = clamp(art.a * rot.y, 0.0, 1.0);',
+      '  c = mix(c, art.rgb, am);',
+      '  vec3 ntex = texture2D(uNrm, atlasUV(tile.y, uv)).rgb * 2.0 - 1.0;',
+      '  vec3 N = normalize(vN + vec3(ntex.xy * 0.6, 0.0));',
+      '  vec3 mg = texture2D(uMg, atlasUV(tile.z, uv)).rgb;',
+      '  vec3 L = normalize(vec3(0.4, 0.8, 0.5));',
+      '  float ndl = max(dot(N, L), 0.0);',
+      '  float spec = pow(max(dot(reflect(-L, N), vec3(0.0,0.0,1.0)), 0.0), mix(8.0, 64.0, mg.g));',
+      '  vec3 col = c * (0.75 + 0.35*ndl) + spec * mg.r * 0.35;',
+      '  col *= 1.65;',
+      '  col = pow(max(col, 0.0), vec3(1.0/2.2));',
+      '  col = mix(col, vec3(1.0), 0.06);',
+      '  gl_FragColor = vec4(col, 1.0);',
+      '}'
+    ].join('\n')
+  };
+}
+
+async function buildIndexedMaterial(m) {
+  const idx = m.indexed || {};
+  const tex = idx.textures || {};
+  const arrays = idx.arrays || {};
+  const [alb, nrm, mg, art, tile, offs, rot, tint, rem] = await Promise.all([
+    texture(tex.albedoArray && tex.albedoArray.uri, true),
+    texture(tex.normalArray && tex.normalArray.uri, false),
+    texture(tex.mgArray && tex.mgArray.uri, false),
+    texture((m.layers || {}).artMap, true),
+    arrays.tileIdxMatIdArr ? loadArrayTex(arrays.tileIdxMatIdArr.bin) : null,
+    arrays.offsetScaleMatIdArr ? loadArrayTex(arrays.offsetScaleMatIdArr.bin) : null,
+    arrays.rotationMatIdArr ? loadArrayTex(arrays.rotationMatIdArr.bin) : null,
+    arrays.albedoTintMatIdArr ? loadArrayTex(arrays.albedoTintMatIdArr.bin) : null,
+    arrays.albedoToRemoveTintMatIdArr ? loadArrayTex(arrays.albedoToRemoveTintMatIdArr.bin) : null,
+  ]);
+  const matId = texture((m.layers || {}).materialIdMap, false);
+  window.__idxDiag = { matId: !!matId, alb: !!alb, nrm: !!nrm, mg: !!mg, art: !!art,
+                       tile: !!tile, offs: !!offs, rot: !!rot, tint: !!tint, rem: !!rem };
+  const sh = indexedShader();
+  const dbg = params.get('debug');
+  if (dbg === 'red') sh.fragment = 'void main(){ gl_FragColor = vec4(1.0,0.0,0.0,1.0); }';
+  if (dbg === 'matid') sh.fragment = [
+    'uniform sampler2D uMatId;', 'varying vec2 vUv;',
+    'void main(){ float m = texture2D(uMatId, vUv).r * 255.0;',
+    '  gl_FragColor = vec4(vec3(m/195.0), 1.0); }'
+  ].join('\n');
+  if (dbg === 'alb') sh.fragment = [
+    'uniform sampler2D uMatId, uAlb, uTile, uOffset, uRot;',
+    'uniform vec2 uGrid;', 'varying vec2 vUv;',
+    'vec2 atlasUV(float slice, vec2 uv){',
+    '  vec2 cell = vec2(mod(slice, uGrid.x), floor(slice / uGrid.x));',
+    '  return (cell + fract(uv)) / uGrid; }',
+    'void main(){',
+    '  float mid = floor(texture2D(uMatId, vUv).r * 255.0 + 0.5);',
+    '  vec2 coord = (vec2(mid, 0.5)) / vec2(196.0, 1.0);',
+    '  vec4 t = texture2D(uTile, coord); vec4 o = texture2D(uOffset, coord); vec4 r = texture2D(uRot, coord);',
+    '  vec2 uv = vUv * o.zw + o.xy; float a = r.x;',
+    '  uv = vec2(uv.x*cos(a)+uv.y*sin(a), -uv.x*sin(a)+uv.y*cos(a));',
+    '  vec3 c = texture2D(uAlb, atlasUV(t.x, uv)).rgb;',
+    '  gl_FragColor = vec4(pow(max(c,0.0), vec3(1.0/2.2)), 1.0); }'
+  ].join('\n');
+  const col = tex.albedoArray ? [tex.albedoArray.cols || 6, tex.albedoArray.rows || 5] : [6, 5];
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uMatId: { value: matId }, uAlb: { value: alb }, uNrm: { value: nrm },
+      uMg: { value: mg }, uArt: { value: art },
+      uTile: { value: tile }, uOffset: { value: offs }, uRot: { value: rot },
+      uTint: { value: tint }, uRemove: { value: rem },
+      uGrid: { value: new THREE.Vector2(col[0], col[1]) },
+      uMatIdSize: { value: new THREE.Vector2(2048, 1024) },
+    },
+    vertexShader: sh.vertex, fragmentShader: sh.fragment,
+    side: THREE.DoubleSide,
+  });
+}
+
+function buildMaterial(m) {
+  const mat = new THREE.MeshStandardMaterial({
+    name: m.name || '', metalness: 0.05, roughness: 0.85,
+    side: THREE.DoubleSide,
+    wireframe: !!params.get('wire'),
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+  });
+  const slots = m.slots || {};
+  mat.map = texture(slots.albedo, true);
+  if (!params.get('nonormal')) mat.normalMap = texture(slots.normal, false);
+  if (!params.get('norough')) mat.roughnessMap = texture(slots.mg, false);
+  if (!params.get('noao')) mat.aoMap = texture(slots.ao, false);
+  if (mat.map) mat.color.set(0xffffff);
+  mat.needsUpdate = true;
+  return mat;
+}
+
+let mats = new Map();
+let armorMesh = null, armorData = null;
+let root = null;
+
+async function loadShip(ship) {
+  status.textContent = 'loading manifest…';
+  const manifest = await (await fetch(ROOT + 'manifests/' + ship + '.json')).json();
+  document.getElementById('ship').value = ship;
+  status.textContent = 'loading geometry…';
+  const gltf = await gltfLoader.loadAsync(ROOT + manifest.geometry);
+  if (root) { scene.remove(root); disposeTree(root); }
+  root = gltf.scene;
+  scene.add(root);
+
+  mats = new Map();
+  for (const [key, m] of Object.entries(manifest.materials || {})) {
+    mats.set(key, m.mode === 'indexed' ? await buildIndexedMaterial(m) : buildMaterial(m));
+  }
+
+  // node name -> material key (manifest meshes)
+  const byNode = new Map();
+  for (const m of manifest.meshes || []) byNode.set(m.node, m.material);
+  const byName = new Map();
+  for (const [key, m] of Object.entries(manifest.materials || {})) {
+    if (m.name && !byName.has(m.name)) byName.set(m.name, key);
+  }
+  let assigned = 0, total = 0;
+  root.traverse(o => {
+    if (!o.isMesh) return;
+    total++;
+    const glbMat = Array.isArray(o.material) ? o.material[0] : o.material;
+    const key = byNode.get(o.name) || (glbMat && byName.get(glbMat.name));
+    if (key && mats.has(key)) {
+      const mname = (manifest.materials[key] && manifest.materials[key].name || '').toUpperCase();
+      if (params.get('nodecal') && mname.includes('MESHDECAL')) { o.visible = false; return; }
+      o.material = mats.get(key);
+      assigned++;
+      if (o.material.aoMap && !o.geometry.attributes.uv2) {
+        o.material.aoMap = null;   // AO 需要第二套 UV；没有就别绑，否则水下会发黑
+        o.material.needsUpdate = true;
+      }
+    }
+    o.frustumCulled = true;
+  });
+  document.getElementById('info').textContent = 'mapped ' + assigned + '/' + total
+    + (window.__idxDiag ? ' idx=' + JSON.stringify(window.__idxDiag) : '');
+
+  // fit camera to geometry (meshes only; skeleton/bone nodes can extend far)
+  if (params.get('debug') === 'normal') {
+    root.traverse(o => { if (o.isMesh) o.material = new THREE.MeshNormalMaterial(); });
+  } else if (params.get('debug') === 'basic') {
+    root.traverse(o => {
+      if (!o.isMesh) return;
+      const src = Array.isArray(o.material) ? o.material[0] : o.material;
+      o.material = new THREE.MeshBasicMaterial({ map: src && src.map, color: 0xffffff, side: THREE.DoubleSide });
+    });
+  }
+  const box = new THREE.Box3();
+  root.traverse(o => { if (o.isMesh) box.expandByObject(o); });
+  if (box.isEmpty()) box.setFromObject(root);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  controls.target.copy(center);
+  const radius = Math.max(size.x, size.y, size.z);
+  const zoom = Math.max(0.2, parseFloat(params.get('zoom') || '1'));
+  camera.position.copy(center).add(new THREE.Vector3(radius*1.4, radius*0.8, radius*1.8).multiplyScalar(1/zoom));
+  camera.near = Math.max(0.05, radius/500); camera.far = radius*20;
+  camera.updateProjectionMatrix();
+  controls.update();
+
+  // skin selector
+  const sel = document.getElementById('skin');
+  sel.innerHTML = '';
+  const skins = manifest.skins || ['default'];
+  for (const id of skins) { const o = document.createElement('option'); o.value = id; o.textContent = id; sel.appendChild(o); }
+  sel.onchange = () => applySkin(manifest, sel.value).catch(fail);
+
+  // armor
+  armorData = null; armorMesh = null;
+  if (manifest.armor) {
+    try { armorData = await (await fetch(ROOT + manifest.armor)).json(); } catch (e) { console.warn('armor', e); }
+  }
+  if (armorData) buildArmor(manifest, armorData).catch(e => console.warn('armor', e));
+
+  const wantSkin = params.get('skin');
+  await applySkin(manifest, wantSkin || 'default');
+  status.textContent = 'ready · ' + root.children.length + ' top nodes';
+}
+
+function partCategory(name) {
+  const n = String(name || '').toLowerCase();
+  if (n.includes('_hull')) return 'hull';
+  if (n.includes('_deckhouse')) return 'deckhouse';
+  if (n.includes('_gun')) return 'gun';
+  if (n.includes('_bulge')) return 'bulge';
+  if (n.includes('_director')) return 'director';
+  if (n.includes('_misc')) return 'misc';
+  if (n.includes('_plane')) return 'plane';
+  if (n.includes('_wire')) return 'wire';
+  if (n.includes('_float')) return 'float';
+  return 'misc';
+}
+
+async function switchModel(skin) {
+  const m2 = await (await fetch(ROOT + skin.manifest)).json();
+  const gltf = await gltfLoader.loadAsync(ROOT + skin.geometry);
+  if (root) { scene.remove(root); disposeTree(root); }
+  root = gltf.scene;
+  scene.add(root);
+  mats = new Map();
+  for (const [key, m] of Object.entries(m2.materials || {})) {
+    mats.set(key, m.mode === 'indexed' ? await buildIndexedMaterial(m) : buildMaterial(m));
+  }
+  const byNode = new Map();
+  for (const m of m2.meshes || []) byNode.set(m.node, m.material);
+  const byName = new Map();
+  for (const [key, m] of Object.entries(m2.materials || {})) {
+    if (m.name && !byName.has(m.name)) byName.set(m.name, key);
+  }
+  root.traverse(o => {
+    if (!o.isMesh) return;
+    const glbMat = Array.isArray(o.material) ? o.material[0] : o.material;
+    const key = byNode.get(o.name) || (glbMat && byName.get(glbMat.name));
+    if (key && mats.has(key)) {
+      const mname = (m2.materials[key] && m2.materials[key].name || '').toUpperCase();
+      if (params.get('nodecal') && mname.includes('MESHDECAL')) { o.visible = false; return; }
+      o.material = mats.get(key);
+    }
+  });
+  document.getElementById('info').textContent = 'model skin: ' + skin.id;
+}
+
+async function applySkin(manifest, id) {
+  const skin = await (await fetch(ROOT + 'skins/' + manifest.ship + '/' + id + '.json')).json();
+  if (skin.geometry) { await switchModel(skin); return; }
+  // 1) material-key overrides (default / future baked skins)
+  for (const [key, ov] of Object.entries(skin.overrides || {})) {
+    const mat = mats.get(key); if (!mat) continue;
+    if (ov.albedo) { mat.map = texture(ov.albedo, true); }
+    if (ov.normal) { mat.normalMap = texture(ov.normal, false); }
+    if (ov.mg) { mat.roughnessMap = texture(ov.mg, false); }
+    if (ov.ao) { mat.aoMap = texture(ov.ao, false); }
+    mat.needsUpdate = true;
+  }
+  // 2) category textures (permoflage/mskin mat skins)
+  if (skin.textures) {
+    for (const mat of mats.values()) {
+      const cat = partCategory(mat.name);
+      const uri = skin.textures[cat] || skin.textures.misc || skin.textures.hull;
+      if (!uri) continue;
+      const t = texture(uri, true);
+      const uv = (skin.uv_transforms || {})[cat] || (skin.uv_transforms || {}).tile;
+      if (uv && uv.scale) t.repeat.set(uv.scale[0], uv.scale[1]);
+      if (uv && uv.offset) t.offset.set(uv.offset[0], uv.offset[1]);
+      mat.map = t;
+      mat.needsUpdate = true;
+    }
+  }
+  status.textContent = 'skin: ' + (skin.display_name || id);
+}
+
+async function buildArmor(manifest, data) {
+  const binPath = data.buffers && data.buffers.bin;
+  if (!binPath) return;
+  const buf = await (await fetch(ROOT + binPath)).arrayBuffer();
+  const posOff = data.buffers.positions.offset;
+  const nrmOff = data.buffers.normals.offset;
+  const pidOff = data.buffers.plate_ids.offset;
+  const vcount = data.buffers.positions.count;
+  const tcount = data.buffers.plate_ids.count;
+  const positions = new Float32Array(buf, posOff, vcount*3);
+  const normals = new Float32Array(buf, nrmOff, vcount*3);
+  const plateIds = new Uint32Array(buf, pidOff, tcount);
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(normals.slice(), 3));
+
+  // per-vertex color by plate thickness
+  const colors = new Float32Array(vcount*3);
+  const plates = data.plates || [];
+  const maxMM = plates.reduce((m,p)=>Math.max(m,p.thickness_mm||0), 0) || 1;
+  for (let t=0;t<tcount;t++) {
+    const p = plates[plateIds[t]] || {thickness_mm:0, hidden:false};
+    const c = thicknessColor(p.thickness_mm, maxMM);
+    for (let k=0;k<3;k++) { const i=(t*3+k)*3; colors[i]=c.r; colors[i+1]=c.g; colors[i+2]=c.b; }
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeBoundingSphere();
+
+  const mat = new THREE.MeshBasicMaterial({ vertexColors:true, transparent:true, opacity:0.35,
+    side:THREE.DoubleSide, depthWrite:false, wireframe:false });
+  armorMesh = new THREE.Mesh(geo, mat);
+  armorMesh.name = 'armor';
+  armorMesh.visible = document.getElementById('armor').checked;
+  scene.add(armorMesh);
+}
+
+function thicknessColor(mm, maxMM) {
+  const t = Math.min(1, mm / Math.max(1, maxMM));
+  const c = new THREE.Color();
+  c.setHSL(0.6 - 0.6*t, 0.85, 0.5);
+  return c;
+}
+
+function disposeTree(obj) {
+  obj.traverse(o => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) {
+      const ms = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of ms) {
+        for (const k of ['map','normalMap','roughnessMap','aoMap','emissiveMap']) if (m[k]) m[k].dispose();
+        m.dispose();
+      }
+    }
+  });
+}
+
+document.getElementById('armor').onchange = e => { if (armorMesh) armorMesh.visible = e.target.checked; };
+document.getElementById('rot').onchange = e => { controls.autoRotate = e.target.checked; controls.autoRotateSpeed = 0.8; };
+document.getElementById('ship').onchange = e => { SHIP = e.target.value.trim(); loadShip(SHIP).catch(fail); };
+
+loadShip(SHIP).catch(fail);
+
+function tick() {
+  requestAnimationFrame(tick);
+  controls.update();
+  renderer.render(scene, camera);
+}
+tick();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

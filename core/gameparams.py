@@ -4,7 +4,7 @@ from __future__ import annotations
 import pickle
 import sys
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from services import GameParams as _GP
 
@@ -17,6 +17,8 @@ class ShipEntry:
     nation: str
     tier: int
     ship_type: str
+    index: str = ""
+    permoflages: list = field(default_factory=list)
 
 
 def _ensure_stub():
@@ -80,6 +82,30 @@ def _iter_ships(data):
                 yield key, _as_dict(value)
 
 
+def exteriors(path: str) -> list[dict]:
+    """Load Exterior entities (needed for permoflage/skin enumeration)."""
+    _ensure_stub()
+    data = load_gameparams(path)
+    out = []
+    for key, value in _iter_ships(data):
+        info = _as_dict(value.get("typeinfo"))
+        if str(info.get("type", "")) != "Exterior":
+            continue
+        raw = _as_dict(value)
+        data = {k: raw.get(k) for k in (
+            "camouflage", "unpeculiarCamouflage", "unpeculiarCamouflageColorSchemeId",
+            "hullConfig", "nodesConfig", "peculiarityModels", "renderSetsStates",
+            "miscFilter", "planesConfig", "decalsEnabled",
+        ) if raw.get(k) is not None}
+        out.append({
+            "name": key,
+            "index": str(raw.get("index") or ""),
+            "species": str(info.get("species") or ""),
+            "data": data,
+        })
+    return out
+
+
 def ships(path: str, flt: str = "") -> list[ShipEntry]:
     _ensure_stub()
     data = load_gameparams(path)
@@ -103,6 +129,8 @@ def ships(path: str, flt: str = "") -> list[ShipEntry]:
             key=key, model=model, model_folder=folder,
             nation=str(info.get("nation", "")), tier=tier,
             ship_type=str(info.get("type", "")),
+            index=str(value.get("index") or ""),
+            permoflages=list(value.get("permoflages") or []),
         )
         if flt:
             hay = (entry.key + " " + entry.model_folder).lower()
