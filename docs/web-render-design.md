@@ -2,7 +2,7 @@
 
 > 状态：设计稿（2026-10-26）
 > 适用：wows-exporter-3dmodel 的网页端产物
-> 决策：three.js、KTX2 主格式 + WebP 兜底、贴图外置、涂装按游戏内叠加/图集还原
+> 决策：three.js、贴图统一 WebP（KTX2 已弃用）、贴图外置、涂装按游戏内叠加/图集还原
 
 ## 1. 目录布局
 
@@ -18,7 +18,7 @@ web/<server>/<build>/
     PJSB520_Raiju.json
     PJSB520_Raiju.bin          # 可选：装甲三角形二进制
   textures/
-    <sha1>.ktx2
+    <sha1>.webp
     <sha1>.webp                # 兜底
   skins/
     PJSB520_Raiju/
@@ -55,16 +55,16 @@ web/<server>/<build>/
       "mode": "pbs",
       "double_sided": true,
       "slots": {
-        "albedo": "textures/ab12.ktx2",
-        "normal": "textures/cd34.ktx2",
-        "mg": "textures/ef56.ktx2"
+        "albedo": "textures/ab12.webp",
+        "normal": "textures/cd34.webp",
+        "mg": "textures/ef56.webp"
       },
       "params": { "alpha": 1.0, "tint": [1, 1, 1] }
     },
     "m_1": {
       "mfm": "content/.../Deck.mfm",
       "mode": "indexed",
-      "array": "textures/aa00.ktx2",
+      "array": "textures/aa00.webp",
       "tile_index": 12,
       "uv": { "scale": [1, 1], "offset": [0, 0] }
     }
@@ -85,7 +85,8 @@ web/<server>/<build>/
 
 - materials 的 key 是稳定 id（不要用数组下标，重导出后不能变）；
 - slots 只写实际存在的通道；
-- indexed 材质的 array 指向 KTX2 texture array，tile_index 为数组层号；
+- indexed 材质的 array 指向拼好的图集 WebP，tile_index 是图集内格号；着色器按
+  `atlasUV(slice, uv)` 换算（`uGrid` 给出列/行数），不需要 sampler2DArray；
 - manifest 里的路径全部相对 manifests/ 或站点根目录，二选一并在加载器里统一。
 
 ## 4. 皮肤 / 涂装
@@ -98,9 +99,9 @@ skins/<ship>/<skin_id>.json：
   "display_name": "Camo 01",
   "overrides": {
     "m_0": {
-      "albedo": "textures/98ab.ktx2",
-      "composite": "textures/77cd.ktx2",
-      "artMap": "textures/66ef.ktx2",
+      "albedo": "textures/98ab.webp",
+      "composite": "textures/77cd.webp",
+      "artMap": "textures/66ef.webp",
       "colors": { "base": "#3a4a5a", "camo": "#6b7c8d" },
       "blend": "lerp"
     }
@@ -201,8 +202,7 @@ JSON 里增加：
 ### 加载
 
 - GLTFLoader 加载 geometry.glb（不期望 image）；
-- KTX2Loader.setTranscoderPath("/basis/")，detectSupport(renderer)；
-- 贴图按 manifest 的 URI 手动加载：KTX2Loader.load 或 TextureLoader（WebP 兜底）；
+- 贴图按 manifest 的 URI 用 TextureLoader 加载（全部 WebP，无 KTX2 分支）；
 - 所有贴图设置正确 colorSpace：albedo 用 SRGBColorSpace，normal/MG 用 NoColorSpace。
 
 ### 材质工厂
@@ -235,7 +235,7 @@ JSON 里增加：
 
 - [ ] geometry.glb 内没有 image/texture；
 - [ ] manifest 的 material key 在重导出后保持稳定；
-- [ ] KTX2 在 three.js 中正确显示，WebP 兜底可用；
+- [ ] WebP 贴图在 three.js 中正确显示（含 colorSpace 与 wrap）；
 - [ ] 切换皮肤不重新加载几何；
 - [ ] PBS 涂装与游戏内截图对比（颜色/遮罩方向）；
 - [ ] INDEXED 材质按 tile_index 采样正确；
@@ -244,6 +244,5 @@ JSON 里增加：
 
 ## 9. 待定
 
-- KTX2 编码器（toktx / basisu）与压缩参数；
 - 涂装 shader 的精确公式（需要从游戏 shader / 现有 camo_service 对齐）；
 - 坐标缩放是否在导出时统一（当前 bounds 数值偏小，网页端需确认单位）。

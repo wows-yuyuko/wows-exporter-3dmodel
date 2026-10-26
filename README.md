@@ -29,6 +29,12 @@
     # 批量（分片并行）
     python cli.py batch --game D:\Games\Korabli --filter 10 --jobs 2 --out out --armor --zstd --skins
 
+    # 需要沉没状态的断面几何时加 --damage（默认剔除）
+    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --damage
+
+    # 贴图分辨率 / LOD 可调（默认 1024 像素 / LOD2；--lod -1 回到 LOD0 高模）
+    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --texture-size 2048 --lod -1
+
 产物：
 
     geometry/<key>.glb            渲染模型
@@ -44,6 +50,7 @@
 
 - import 每服只需跑一次（客户端更新后重跑）；
 - 首次运行会自动从包里提取 GameParams 到 <game>/data/；
+- geometry.glb 默认只含完好状态：`_crack_*` / `*_in` 断面几何被剔除（与 wows-model-exporter 的 `--damage` 口径一致）；
 - 许可证：主体 Apache-2.0；data_extractor/kraken.py 为 GPLv3（见 LICENSE 文件）。
 
 ## 文档

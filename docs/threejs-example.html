@@ -33,7 +33,6 @@
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 const params = new URLSearchParams(location.search);
@@ -73,16 +72,12 @@ const grid = new THREE.GridHelper(200, 40, 0xc9d1d9, 0xe6e9ed);
 grid.position.y = -0.01;
 scene.add(grid);
 
-const ktx2 = new KTX2Loader()
-  .setTranscoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/basis/')
-  .detectSupport(renderer);
-const gltfLoader = new GLTFLoader().setKTX2Loader(ktx2);
+const gltfLoader = new GLTFLoader();
 const texLoader = new THREE.TextureLoader();
 
 function texture(uri, srgb) {
   if (!uri) return null;
-  const loader = uri.endsWith('.ktx2') ? ktx2 : texLoader;
-  const t = loader.load(ROOT + uri);
+  const t = texLoader.load(ROOT + uri);
   t.flipY = false;
   t.wrapS = THREE.RepeatWrapping;
   t.wrapT = THREE.RepeatWrapping;

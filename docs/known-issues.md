@@ -18,52 +18,14 @@
 | three.js 示例 | 完成 |
 | skipped_textures | 0 |
 | 白色主题 / 水下光照黑块 | 已修 |
-| 船体接缝 / 裂缝 | 未解决 |
+| 破损断面几何（`*_crack_*`） | 已修：默认剔除，`--damage` 恢复 |
 | 舰体深色/透视块 | 未解决 |
 | 颜色还原 | 偏灰，未对齐游戏 |
-| KTX2 真编码 | 未实现（WebP 回退） |
+| 贴图格式 | WebP（定稿，不做 KTX2） |
 | 增量导出 | 未实现 |
 | batch 启动性能 | 每船重新加载 DB |
+| 数据库体积 | game_data 已精简（318→157 MB）；assets_data 待精简（619 MB） |
 | 自动化测试 / CI / NOTICE | 未做 |
-
-## P0：船体接缝 / 裂缝
-
-### 现象
-
-- 所有船都有，不只是 ARP 大和；
-- 近看舰体侧面出现黑/白细缝、锯齿三角；
-- `debug=normal` 下几何完整，没有大洞；
-- `debug=basic` 下贴图正常，不是贴图缺失；
-- wireframe 下网格连续，没有大面积缺三角。
-
-### 已排除
-
-- 不是 AO（关闭 AO 无效）；
-- 不是法线贴图 / roughness（关闭无效）；
-- 不是 UV wrap（RepeatWrapping 无效）；
-- 不是 alphaMode（全部 OPAQUE）；
-- 不是 MESHDECAL（隐藏无效）；
-- 不是 log depth / polygonOffset（无效）；
-- 不是 ARP 皮肤加载错模型（hull_config 字符串解析已修，问题仍在）。
-
-### 已尝试
-
-1. `--merge-shapes`：每个 hull 分段整段导出，不按 shape_spans 拆。
-   - 接缝明显减少；
-   - 但部分 hull 面片丢失，Waterloo 侧面出现透明洞；
-   - 已回退，默认仍为分段导出。
-2. `polygonOffset` / `logarithmicDepthBuffer`：无效。
-
-### 当前结论
-
-接缝来自相邻 hull 分段在边界处的重叠/共面三角形，属于深度冲突，不是缺面。
-简单合并会丢 shape，不能直接用。
-
-### 下一步
-
-- 对相邻 hull 分段做顶点焊接，去掉内部重复面；
-- 或按分段给不同的 polygonOffset / renderOrder，只做视觉规避；
-- 先确认 `.geometry` 的 `shape_spans` 与真实材质分组是否一致。
 
 ## P0：Waterloo 舰体深色 / 透视块
 
@@ -87,10 +49,10 @@
 
 ### 下一步
 
+- crack 断面面已在导出时默认剔除，先重导一份排除该因素；
 - 按材质名逐个隐藏，定位覆盖该区域的 mesh/material；
 - 检查该 material 的 albedo 在对应 UV 区域是否本来就是黑色；
-- 如果是 colorScheme mask，需要导出默认涂装或烘焙；
-- 如果两层几何重叠，按 P0 接缝方案处理。
+- 如果是 colorScheme mask，需要导出默认涂装或烘焙。
 
 ## P1：颜色还原
 
@@ -108,13 +70,6 @@
 - PBS 的 composite/artMap 叠加公式需要完整实现；
 - INDEXED 的 tint/remove/art 强度需要校准。
 
-## P1：KTX2 真编码
-
-- `--ktx2` 只有在系统存在 `toktx` 时才生效；
-- 当前实际产物是 WebP；
-- 需要安装 Basis Universal / KTX-Software，或接编码库；
-- 同时更新 manifest 的 texture_format 和 three.js 的 KTX2Loader 路径。
-
 ## P1：增量导出
 
 尚未实现：
@@ -131,15 +86,66 @@
 - 四艘串行导出需要数分钟到十几分钟；
 - 可在同一进程内批量导出，省掉重复初始化。
 
+## P1：数据库精简（剩余）
+
+本项目是**纯导出器**，但两个库里仍存着原 Wows_Paragrams_Unpack 数据浏览功能留下的数据。
+导出链路实际只读这些表：
+
+| 库 | 导出用到的表 |
+|---|---|
+| `assets_data*.db` | `render_sets`、`skeleton_mounts`、`skeleton_bones`、`material_full`、`mfm_textures`、`shape_names`、`camouflages`、`camouflage_color_schemes`、`camo_ship_groups`、`exteriors` |
+| `game_data*.db` | `entity_snapshots`（只读 `entity_type='ship'`）、`meta_import_state`、`ship_models`、`entity_registry` |
+
+### A. 已完成（2026-10-26）
+
+`import` 时只写 ship 快照（其余 2.3 万条 Gun/Projectile/Aircraft/… 快照无人读取），
+并清掉了遗留的大表数据。实测：
+
+```
+data/game_data_wg.db   318 MB -> 157 MB   （删 23,250 快照 + 51,004 crew + 596 buff）
+data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
+```
+
+`--skins` 已验证不受影响（10 个皮肤正常导出）。ship 快照保留 1,246（WG）/ 1,165（Lesta）条，
+平均 105 KB/条 —— 体积大头是 `A_AirDefense`(26%)、`A_Hull`(15%)、`A_ATBA`(10%)，
+这些正是导出挂载时要读的 model 路径，**不能再裁**。
+
+### B. 待做：裁剪 assets_data（619 MB -> 估计 200 MB）
+
+`dbstat` 实测分布：
+
+| 项 | 体积 | 处理 |
+|---|---|---|
+| `skeleton_bones` + 2 个索引 | 207 MB | 只留「舰船 + 舰炮」stem（现有 27,016 个 stem，含飞机 AAB、建筑、港口） |
+| `skeleton_mounts` + 2 个索引 | 161 MB | 同上（现有 7,219 个 stem） |
+| `render_sets` + 2 个索引 | 214 MB | 只留 `/ship/` 与 `/gun/` 路径；丢掉 `other` 97k 条（location/建筑/飞机） |
+| `material_full` | 18.5 MB | 可只留被 render_sets 引用到的 mfm |
+| `exteriors` / `camo_thumbs` | 0 行 | 直接删表 |
+
+**约束**：必须按路径类型裁剪，不能按船名——否则以后导冷门船会缺数据。
+
+### C. 待做：去掉二级索引
+
+`idx_rs_geom`(48 MB)、`idx_bones_stem`(43 MB)、`idx_skel_stem`(31 MB) 合计约 122 MB。
+导出是「打开库、按 geom_path 批量取一次」的一次性扫描，索引收益不如它占的空间；
+可改成导出前临时建、用完丢。
+
 ## P2：工程化
 
 - 没有自动化测试 / CI；
 - 没有 NOTICE（kraken.py 为 GPLv3）；
-- `docs/sample` 约 700 MB，未纳入 git（.gitignore 已忽略）；
+- `docs/sample` 约 660 MB，未纳入 git（.gitignore 已忽略）；
 - 文档中的样本清单需要随导出更新。
 
 ## 已修复（备查）
 
+- 破损断面几何混入 GLB：`*_crack_*` 渲染集原本只标 `is_crack` 却照样写进 GLB，而它们
+  与正常船体表面共面、只在战舰沉没断裂时才该出现；同一份 `.geometry` 同时含完好船体与
+  断裂面，观感是船体断成几截（WG 大和 3 处断口 × 两侧 = 6 片 `*_in` 断面盖板）。现在导出
+  默认按 `is_crack` 剔除，`--damage` 才包含；见 `GlbRenderOptions.include_damage`。
+  实测 WG 大和：mesh 403→381、三角 451421→425734、体积 37.2→35.2 MiB、
+  节点/网格名含 crack 者 66→0。排查时已排除 AO、法线贴图 / roughness、UV wrap、
+  alphaMode、MESHDECAL、log depth / polygonOffset、皮肤模型加载错误；
 - 双服 GameParams 解析；
 - Lesta INDEXED 数组 / atlas / materialIdMap；
 - skipped_textures 658 → 0（DX10 texture array 判断）；
@@ -153,11 +159,11 @@
 
 ```text
 docs/sample/
-  PBSD511_Waterloo/              80.3 MB
-  PJSB018_Yamato_1944/          164.6 MB   Lesta
-  PJSB018_Yamato_1944_WG/       373.0 MB   WG
-  PJSB520_Raiju/                 34.8 MB
-  PJSB700_ARP_Yamato/            70.9 MB
+  PBSD511_Waterloo/              81 MB     主 glb 73.9 MiB
+  PJSB018_Yamato_1944/          166 MB     Lesta，主 glb 30.7 MiB
+  PJSB018_Yamato_1944_WG/       410 MB     WG，主 glb 35.2 MiB
+                                         （含 PJSB018_Yamato_1944.before.glb 37.2 MiB，
+                                           剔除 crack 前的对照件）
 ```
 
 本地预览：
@@ -171,7 +177,19 @@ python -m http.server 8767
 http://127.0.0.1:8767/threejs-example.html?ship=PBSD511_Waterloo&root=sample/PBSD511_Waterloo/
 ```
 
+WG 大和新旧对照（`before` 用的是备份的 manifest/glb，`geometry` 字段已指向 `*.before.glb`）：
+
+```text
+# 剔除 crack 后
+http://127.0.0.1:8767/threejs-example.html?ship=PJSB018_Yamato_1944&root=sample/PJSB018_Yamato_1944_WG/
+
+# 剔除前（含断面）
+http://127.0.0.1:8767/threejs-example.html?ship=PJSB018_Yamato_1944.before&root=sample/PJSB018_Yamato_1944_WG/
+```
+
 ## 复现命令
+
+> 以下命令默认输出完好状态（`*_crack_*` 断面已剔除）；需要沉没断裂几何时追加 `--damage`。
 
 Waterloo：
 
