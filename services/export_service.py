@@ -1330,6 +1330,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
         if progress_cb:
             progress_cb(5 + 60 * i / max(1, n_hull), f"导出舰体 {i + 1}/{n_hull}")
         key = str(hm.name).split("#")[0].split("|")[0]
+        if "perforation" in key.lower():
+            continue  # 洞洞板/穿孔遮罩，不是可见船体
         part = hull_parts.get(key)
         if part is None:
             part = hull_parts.setdefault(key, _Part(_part_label(key)))

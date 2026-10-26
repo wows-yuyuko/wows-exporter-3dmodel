@@ -311,6 +311,8 @@ async function loadShip(ship) {
   const off = new THREE.Vector3(radius*1.4, radius*0.8, radius*1.8).multiplyScalar(1/zoom);
   const yaw = parseFloat(params.get('yaw') || '0') * Math.PI / 180;
   if (yaw) off.applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+  const pitch = parseFloat(params.get('pitch') || '0') * Math.PI / 180;
+  if (pitch) off.applyAxisAngle(new THREE.Vector3(1, 0, 0), pitch);
   camera.position.copy(center).add(off);
   camera.near = Math.max(0.05, radius/500); camera.far = radius*20;
   camera.updateProjectionMatrix();
