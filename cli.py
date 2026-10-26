@@ -83,7 +83,8 @@ def _export_ship(ship, args, out: Path):
     snap = {}
     geom = GeometryService.instance().load_ship(
         info, progress_cb=lambda p, m: None,
-        partial_cb=lambda g: snap.setdefault("g", g))
+        partial_cb=lambda g: snap.setdefault("g", g),
+        lod=getattr(args, "lod", 2))
     geom_dir = out / "geometry"
     armor_dir = out / "armor"
     manifest_dir = out / "manifests"
@@ -95,8 +96,10 @@ def _export_ship(ship, args, out: Path):
         embed_textures=not args.no_textures,
         textures_dir=str(textures_dir) if not args.no_textures else "",
         texture_uri_prefix="../textures",
-        texture_format="ktx2" if getattr(args, "ktx2", False) else "webp",
+        texture_format="webp",
+        texture_max_size=getattr(args, "texture_size", 1024),
         split_shapes=not getattr(args, "merge_shapes", False),
+        include_damage=getattr(args, "damage", False),
     )
     report = export_render_glb(geom, str(glb), options)
     print(report)
@@ -174,10 +177,14 @@ def cmd_batch(args):
         extra.append("--zstd")
     if args.armor:
         extra.append("--armor")
-    if getattr(args, "ktx2", False):
-        extra.append("--ktx2")
     if getattr(args, "merge_shapes", False):
         extra.append("--merge-shapes")
+    if getattr(args, "damage", False):
+        extra.append("--damage")
+    if getattr(args, "texture_size", 1024) != 1024:
+        extra += ["--texture-size", str(args.texture_size)]
+    if getattr(args, "lod", 2) != 2:
+        extra += ["--lod", str(args.lod)]
     if getattr(args, "skins", False):
         extra.append("--skins")
     if getattr(args, "model_skins", False):
@@ -306,9 +313,14 @@ def main(argv=None):
     p.add_argument("--no-textures", action="store_true")
     p.add_argument("--zstd", action="store_true", help="also write .glb.zst")
     p.add_argument("--armor", action="store_true", help="also export armor GLB")
-    p.add_argument("--ktx2", action="store_true", help="use KTX2 textures when toktx is available")
     p.add_argument("--merge-shapes", action="store_true", help="(default) export each hull segment as one mesh")
     p.add_argument("--split-shapes", action="store_true", help="debug: split hull by shape_spans")
+    p.add_argument("--damage", action="store_true",
+                   help="include damage/crack geometry (default: excluded)")
+    p.add_argument("--texture-size", type=int, default=1024,
+                   help="max texture dimension in pixels (default: 1024)")
+    p.add_argument("--lod", type=int, default=2,
+                   help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
     p.add_argument("--skins", action="store_true", help="export permoflage/mskin/skin material skins")
     p.add_argument("--model-skins", action="store_true", help="export model-replacement skins")
     p.add_argument("--gp", default=None, help="explicit GameParams file")
@@ -330,10 +342,15 @@ def main(argv=None):
     p.add_argument("--no-textures", action="store_true")
     p.add_argument("--zstd", action="store_true")
     p.add_argument("--armor", action="store_true")
-    p.add_argument("--ktx2", action="store_true")
     p.add_argument("--skins", action="store_true")
     p.add_argument("--model-skins", action="store_true")
     p.add_argument("--merge-shapes", action="store_true")
+    p.add_argument("--damage", action="store_true",
+                   help="include damage/crack geometry (default: excluded)")
+    p.add_argument("--texture-size", type=int, default=1024,
+                   help="max texture dimension in pixels (default: 1024)")
+    p.add_argument("--lod", type=int, default=2,
+                   help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
     p.add_argument("--force", action="store_true")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--jobs", type=int, default=1)
@@ -356,6 +373,12 @@ def main(argv=None):
     p.add_argument("--no-textures", action="store_true")
     p.add_argument("--zstd", action="store_true")
     p.add_argument("--armor", action="store_true")
+    p.add_argument("--damage", action="store_true",
+                   help="include damage/crack geometry (default: excluded)")
+    p.add_argument("--texture-size", type=int, default=1024,
+                   help="max texture dimension in pixels (default: 1024)")
+    p.add_argument("--lod", type=int, default=2,
+                   help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
     p.add_argument("--gp", default=None)
     p.set_defaults(func=cmd_batch_worker)
 
