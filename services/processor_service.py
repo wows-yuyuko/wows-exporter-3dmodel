@@ -118,8 +118,10 @@ def run_process() -> "_AppTask":
     def _finalize_import(db: DatabaseManager, db_batch: list, snapshots_batch: list,
                           data_by_category: dict, data_dir, version_code: str) -> None:
         db.insert_entities_batch(db_batch, version_code=version_code)
-        # 同步写入实体快照（规范化 JSON），供跨版本字段级比对
-        db.save_entity_snapshots(snapshots_batch, version_code=version_code)
+        # 只存舰船快照：导出链路只读 Ship（geometry_service 取 hull/挂载路径，
+        # camo_service 取 permoflages）；其余 2.3 万条快照占 100+ MB 且无人读取。
+        db.save_entity_snapshots([s for s in snapshots_batch if s[1] == "ship"],
+                                 version_code=version_code)
         # 可载入舰船列表（3D 查看器用）：入库时一并记录，不依赖 data/split
         _save_ship_models(db, data_by_category, version_code)
         bus.task_progress.emit(45, "步骤 2/3: 写入数据库实体")
