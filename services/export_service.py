@@ -156,6 +156,10 @@ class GlbRenderOptions:
     #: 默认排除，与 wows-model-exporter 的 `--damage` 口径一致：这些网格只在战舰
     #: 沉没断裂时出现，混进正常模型会让船体看起来断成几截。
     include_damage: bool = False
+    #: 是否导出贴花（`SHIP_MESHDECAL_*`：舱门/灯/通风口/铭牌等平面片）。
+    #: 默认排除：游戏里靠 decal 投影 + alpha 混合，导出成普通网格就是一片片平板
+    #: 浮在船壳上（Waterloo 有 62% 三角形是它）。
+    include_decals: bool = False
     double_sided: bool = True          # 材质双面渲染（绕序不统一时防背面剔除）
     #: 面朝向统一翻转（glTF 默认 CCW 正面；负 Z 镜像后绕序为 CW 背面，需翻转一次）
     flip_winding: bool = True
@@ -1312,6 +1316,14 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
             return stem[len(folder) + 1:]
         return stem
 
+    def _is_decal(obj) -> bool:
+        """贴花平面片判定：材质带 MESHDECAL，或 mesh/shape 名带 decal（挂载侧）。"""
+        if "decal" in str(getattr(obj, "material", "") or "").lower():
+            return True
+        names = [str(getattr(obj, "name", "") or "")]
+        names += [str(x) for x in (getattr(obj, "shape_names", None) or [])]
+        return any("decal" in n.lower() for n in names)
+
     # ── 舰体分段：每个分段（Bow/MidFront/…）一个空物体，renderSet 各一个网格 ──
     hull_parts: dict[str, _Part] = {}
     n_hull = len(geometry.hull_meshes)
@@ -1319,6 +1331,9 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
         _check_cancel(cancel_event)
         # 破损/断面几何默认剔除（GLB 只表示完好状态）
         if not options.include_damage and getattr(hm, "is_crack", False):
+            continue
+        # 贴花平面片默认剔除（见 GlbRenderOptions.include_decals）
+        if not options.include_decals and _is_decal(hm):
             continue
         if progress_cb:
             progress_cb(5 + 60 * i / max(1, n_hull), f"导出舰体 {i + 1}/{n_hull}")
@@ -1334,6 +1349,9 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
         for k, matrix in enumerate(matrices):
             pieces = _pieces(hm) if options.split_shapes else [("", "", hm)]
             for shape, node_name, piece in pieces:
+                # 兜底：shape_spans 里的 decal 切片（材质/名称都没带标记的情况）
+                if not options.include_decals and "decal" in str(shape or "").lower():
+                    continue
                 label = _shape_label(piece, shape, key)
                 if len(matrices) > 1:
                     label = f"{label}_{k}"
@@ -1347,6 +1365,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
     for i, mm in enumerate(mounts):
         _check_cancel(cancel_event)
         if not options.include_damage and getattr(mm, "is_crack", False):
+            continue
+        if not options.include_decals and _is_decal(mm):
             continue
         if progress_cb:
             progress_cb(65 + 30 * i / max(1, n_mounts), f"导出挂载 {i + 1}/{n_mounts}")
@@ -1370,6 +1390,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
                 part = mount_parts.setdefault(key, _Part(label, world=matrix))
             part.build_nodes(nodes)
             for shape, node_name, piece in _pieces(mm):
+                if not options.include_decals and "decal" in str(shape or "").lower():
+                    continue
                 name = _shape_label(piece, shape, getattr(mm, "model_folder", "") or label)
                 _emit(piece, _unique_name(name), matrix, component,
                       part.parent_for(node_name),

@@ -100,6 +100,7 @@ def _export_ship(ship, args, out: Path):
         texture_max_size=getattr(args, "texture_size", 1024),
         split_shapes=not getattr(args, "merge_shapes", False),
         include_damage=getattr(args, "damage", False),
+        include_decals=getattr(args, "decals", False),
     )
     report = export_render_glb(geom, str(glb), options)
     print(report)
@@ -182,6 +183,8 @@ def cmd_batch(args):
         extra.append("--merge-shapes")
     if getattr(args, "damage", False):
         extra.append("--damage")
+    if getattr(args, "decals", False):
+        extra.append("--decals")
     if getattr(args, "texture_size", 1024) != 1024:
         extra += ["--texture-size", str(args.texture_size)]
     if getattr(args, "lod", 2) != 2:
@@ -320,6 +323,8 @@ def main(argv=None):
     p.add_argument("--split-shapes", action="store_true", help="debug: split hull by shape_spans")
     p.add_argument("--damage", action="store_true",
                    help="include damage/crack geometry (default: excluded)")
+    p.add_argument("--decals", action="store_true",
+                   help="include SHIP_MESHDECAL flat decals (default: excluded)")
     p.add_argument("--texture-size", type=int, default=1024,
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,
@@ -354,6 +359,8 @@ def main(argv=None):
     p.add_argument("--merge-shapes", action="store_true")
     p.add_argument("--damage", action="store_true",
                    help="include damage/crack geometry (default: excluded)")
+    p.add_argument("--decals", action="store_true",
+                   help="include SHIP_MESHDECAL flat decals (default: excluded)")
     p.add_argument("--texture-size", type=int, default=1024,
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,
@@ -382,6 +389,8 @@ def main(argv=None):
     p.add_argument("--armor", action="store_true")
     p.add_argument("--damage", action="store_true",
                    help="include damage/crack geometry (default: excluded)")
+    p.add_argument("--decals", action="store_true",
+                   help="include SHIP_MESHDECAL flat decals (default: excluded)")
     p.add_argument("--texture-size", type=int, default=1024,
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,
