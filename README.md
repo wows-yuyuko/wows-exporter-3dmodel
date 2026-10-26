@@ -49,3 +49,4 @@
 ## 文档
 
 - docs/web-render-design.md：网页端产物结构（geometry/manifest/armor/textures/skins）与 three.js 渲染/换肤设计。
+- docs/known-issues.md：已知问题与剩余工作（船体接缝、Waterloo 深色块、颜色、KTX2、增量导出等）。
