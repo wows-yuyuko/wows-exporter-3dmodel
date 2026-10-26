@@ -34,11 +34,13 @@ def export_model_skins(out_root: Path, ship, build: str, gameparams_path: str,
     gs = GeometryService.instance()
     svc = CamoService(extractor=gs.get_extractor(), cache=gs._get_assets_cache(), bin_folder=build)
     svc._ensure_loaded()
-    try:
-        from core.gameparams import exteriors
-        svc._exteriors = exteriors(gameparams_path)
-    except Exception:
-        pass
+    # DB 里没有 exteriors（旧库/未导入）时才现场解 GameParams
+    if not svc._exteriors and gameparams_path:
+        try:
+            from core.gameparams import exteriors
+            svc._exteriors = exteriors(gameparams_path)
+        except Exception:
+            pass
     infos = svc.list_camos({ship.key}, set(ship.permoflages or []))
     geom_dir = out_root / "geometry"
     manifest_dir = out_root / "manifests"
@@ -81,11 +83,13 @@ def export_model_skins(out_root: Path, ship, build: str, gameparams_path: str,
 
 
 def export_mat_skins(out_root: Path, ship, build: str, limit: int = 0,
-                     gameparams_path: str = "") -> list[str]:
+                     gameparams_path: str = "",
+                     include_permoflage: bool = False) -> list[str]:
     """Export material-type skins referenced by the ship permoflages.
 
     Only PBS-style camo textures are exported here (webp); INDEXED arrays and
     model-replacement skins are handled separately.
+    默认只导 mskin / skin；permoflage（含靠 permoflages 命中的通用迷彩）需显式开启。
     """
     from services.geometry_service import GeometryService
     from services.camo_service import CamoService
@@ -95,7 +99,7 @@ def export_mat_skins(out_root: Path, ship, build: str, limit: int = 0,
     extractor = gs.get_extractor()
     svc = CamoService(extractor=extractor, cache=gs._get_assets_cache(), bin_folder=build)
     svc._ensure_loaded()
-    if gameparams_path:
+    if not svc._exteriors and gameparams_path:
         try:
             from core.gameparams import exteriors
             svc._exteriors = exteriors(gameparams_path)
@@ -104,7 +108,9 @@ def export_mat_skins(out_root: Path, ship, build: str, limit: int = 0,
     permo = set(ship.permoflages or [])
     infos = svc.list_camos({ship.key}, permo)
 
-    species_wanted = {"permoflage", "mskin", "skin"}
+    species_wanted = {"mskin", "skin"}
+    if include_permoflage:
+        species_wanted.add("permoflage")
     textures_dir = out_root / "textures"
     skin_dir = out_root / "skins" / ship.key
     skin_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +120,12 @@ def export_mat_skins(out_root: Path, ship, build: str, limit: int = 0,
         if scheme.origin != "mat" or entry is None:
             continue
         sp = (scheme.species or "").lower()
-        if sp not in species_wanted and scheme.raw_name not in permo and scheme.ext_index not in permo:
+        if sp:
+            if sp not in species_wanted:
+                continue
+        # species 为空的通用迷彩：只有开启 permoflage 时按 permoflages 命中收录
+        elif not (include_permoflage
+                  and (scheme.raw_name in permo or scheme.ext_index in permo)):
             continue
         tex_uris = {}
         for cat, vpath in (entry.textures or {}).items():

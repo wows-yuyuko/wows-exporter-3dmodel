@@ -23,8 +23,8 @@
     # 单船：渲染 + 装甲 + zst
     python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --armor --zstd
 
-    # 导出 permoflage / mskin / skin 的 mat 皮肤
-    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --skins
+    # 材质皮肤（默认只导 mskin / skin；加 --permoflage 连同永久涂装）
+    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --skins --permoflage
 
     # 批量（分片并行）
     python cli.py batch --game D:\Games\Korabli --filter 10 --jobs 2 --out out --armor --zstd --skins

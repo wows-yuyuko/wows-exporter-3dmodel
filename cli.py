@@ -139,7 +139,8 @@ def _export_ship(ship, args, out: Path):
     skins = ["default"]
     if getattr(args, "skins", False):
         extra_skins = export_mat_skins(out, ship, app.config.bin_folder,
-                                        gameparams_path=str(_gameparams_path(Path(args.game), args.server, args.gp)))
+                                        gameparams_path=str(_gameparams_path(Path(args.game), args.server, args.gp)),
+                                        include_permoflage=getattr(args, "permoflage", False))
         skins += extra_skins
         print("[skins]", len(extra_skins), extra_skins[:8])
     if getattr(args, "model_skins", False):
@@ -187,6 +188,8 @@ def cmd_batch(args):
         extra += ["--lod", str(args.lod)]
     if getattr(args, "skins", False):
         extra.append("--skins")
+    if getattr(args, "permoflage", False):
+        extra.append("--permoflage")
     if getattr(args, "model_skins", False):
         extra.append("--model-skins")
     if args.gp:
@@ -321,7 +324,9 @@ def main(argv=None):
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,
                    help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
-    p.add_argument("--skins", action="store_true", help="export permoflage/mskin/skin material skins")
+    p.add_argument("--skins", action="store_true", help="export mskin/skin material skins")
+    p.add_argument("--permoflage", action="store_true",
+                   help="also export permoflage (needs --skins)")
     p.add_argument("--model-skins", action="store_true", help="export model-replacement skins")
     p.add_argument("--gp", default=None, help="explicit GameParams file")
     p.set_defaults(func=cmd_ship)
@@ -343,6 +348,8 @@ def main(argv=None):
     p.add_argument("--zstd", action="store_true")
     p.add_argument("--armor", action="store_true")
     p.add_argument("--skins", action="store_true")
+    p.add_argument("--permoflage", action="store_true",
+                   help="also export permoflage (needs --skins)")
     p.add_argument("--model-skins", action="store_true")
     p.add_argument("--merge-shapes", action="store_true")
     p.add_argument("--damage", action="store_true",
@@ -379,6 +386,10 @@ def main(argv=None):
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,
                    help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
+    p.add_argument("--skins", action="store_true")
+    p.add_argument("--permoflage", action="store_true")
+    p.add_argument("--model-skins", action="store_true")
+    p.add_argument("--merge-shapes", action="store_true")
     p.add_argument("--gp", default=None)
     p.set_defaults(func=cmd_batch_worker)
 
