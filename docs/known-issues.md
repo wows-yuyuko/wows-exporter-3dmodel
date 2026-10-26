@@ -120,7 +120,7 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 | `skeleton_mounts` + 2 个索引 | 161 MB | 同上（现有 7,219 个 stem） |
 | `render_sets` + 2 个索引 | 214 MB | 只留 `/ship/` 与 `/gun/` 路径；丢掉 `other` 97k 条（location/建筑/飞机） |
 | `material_full` | 18.5 MB | 可只留被 render_sets 引用到的 mfm |
-| `exteriors` / `camo_thumbs` | 0 行 | 直接删表 |
+| `camo_thumbs` | 0 行 | 直接删表（`exteriors` 已改为 GameParams 入库，WG 2,362 条） |
 
 **约束**：必须按路径类型裁剪，不能按船名——否则以后导冷门船会缺数据。
 
@@ -139,6 +139,11 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 
 ## 已修复（备查）
 
+- `exteriors` 表恒为 0 行：入库原本读 `data/split/Exterior/*.json`，而 split 是导入临时产物
+  （`keep_split_json=False` 会清）且后台任务与主流程写 split 有竞态，失败还被 `except: pass`
+  吞掉 → 每次导出都要现场解 GameParams。改为直接从 GameParams 解析
+  （`core.gameparams.exterior_entities`），split 仅作回退；`data_json` 只存涂装相关 10 个字段
+  （2.5 MB vs 整份实体 7.7 MB）。入库结果 WG 2,362 条 / Lesta 1,915 条；
 - 破损断面几何混入 GLB：`*_crack_*` 渲染集原本只标 `is_crack` 却照样写进 GLB，而它们
   与正常船体表面共面、只在战舰沉没断裂时才该出现；同一份 `.geometry` 同时含完好船体与
   断裂面，观感是船体断成几截（WG 大和 3 处断口 × 两侧 = 6 片 `*_in` 断面盖板）。现在导出

@@ -969,67 +969,83 @@ class AssetsCacheService:
                 for _fn in ("global_zh_sg.po", "global.po", "global.mo"):
                     _loc_cands.append(str(_base / _fn))
             loc_map = self._load_camo_locale(_loc_cands)
-            # 9) Exterior JSON（data/split/Exterior/*.json）→ exteriors 表
+            # 9) Exterior 实体（GameParams 直读，回退 split/Exterior/*.json）→ exteriors 表
             #    同时扫描 pkg gui/exteriors，按 name 优先/index 次之匹配选项图，
             #    提取(复制)到 data/camo_thumbs/<bin>/，并把相对 data 的路径写入 icon_path。
             try:
-                from utils.path_utils import get_split_dir
+                from core.gameparams import exterior_entities, EXTERIOR_DATA_KEYS
                 icon_map = self._camo_icon_map(game_dir, bin_folder, ext_factory=_ext_factory)
-                ext_dir = get_split_dir() / "Exterior"
+                # 来源优先 GameParams：split/Exterior 只是导入时的临时产物
+                # （keep_split_json=False 会被清理，且后台任务与主流程写 split 有竞态）
+                ext_items: list[tuple[str, dict]] = []
+                gp_file = self._find_gameparams_file(game_dir, wows_type)
+                if gp_file:
+                    try:
+                        ext_items = exterior_entities(gp_file)
+                        _p(f"外观数据来源: GameParams（{len(ext_items)} 条）")
+                    except Exception as exc:  # noqa: BLE001
+                        _p(f"GameParams 解析外观失败，回退 split: {exc}")
+                if not ext_items:
+                    from utils.path_utils import get_split_dir
+                    _ext_dir = get_split_dir() / "Exterior"
+                    if _ext_dir.exists():
+                        for f in sorted(_ext_dir.glob("*.json")):
+                            try:
+                                d = json.loads(f.read_text(encoding="utf-8"))
+                            except Exception:  # noqa: BLE001
+                                continue
+                            ext_items.append((d.get("name") or f.stem, d))
                 ext_rows: list[tuple] = []
-                # 单条 data_json 是整份 Exterior JSON（可达数十 KB），数千条堆在内存里
-                # 同样可观 → 分批落库（与骨架/渲染集同一策略）
+                # data_json 只存涂装相关字段，不存整份 Exterior（数千条会撑爆库）
                 ext_sql = ("INSERT OR REPLACE INTO exteriors "
                            "(version_code, ext_index, name, camouflage, species, nation, "
                            "cost_gold, can_buy, parts_json, custom_json, "
                            "unpeculiar_camouflage, color_scheme_id, icon_path, display_name, data_json) "
                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
                 tot_ext = 0
-                if ext_dir.exists():
-                    ext_files = sorted(ext_dir.glob("*.json"))
-                    ext_total = len(ext_files)
-                    # 外观文件极多，分批输出进度，避免长时间无任何日志（显得卡死）
-                    ext_batch = max(1, ext_total // 20 or 1)
-                    for _i, f in enumerate(ext_files, 1):
-                        try:
-                            d = json.loads(f.read_text(encoding="utf-8"))
-                        except Exception:  # noqa: BLE001
-                            continue
-                        ti = d.get("typeinfo") or {}
-                        ext_name = d.get("name", f.stem)
-                        ext_index = d.get("index", f.stem)
-                        icon_rel = self._cache_camo_icon(
-                            game_dir, bin_folder,
-                            self._resolve_camo_icon(icon_map, ext_name, ext_index), ext_name,
-                            ext_factory=_ext_factory)
-                        camo_mat = d.get("camouflage", "") or ""
-                        display_name = loc_map.get("IDS_" + ext_name.upper(), "")
-                        if camo_mat:
-                            material_to_icon[camo_mat.lower()] = icon_rel
-                            material_to_display[camo_mat.lower()] = display_name
-                        ext_rows.append((
-                            bin_folder,
-                            ext_index,
-                            ext_name,
-                            camo_mat,
-                            ti.get("species", "") or "",
-                            ti.get("nation", "") or "",
-                            int(d.get("costGold", 0) or 0),
-                            int(bool(d.get("canBuy"))),
-                            json.dumps(d.get("parts", []), ensure_ascii=False),
-                            json.dumps(d.get("custom", {}), ensure_ascii=False),
-                            d.get("unpeculiarCamouflage", "") or "",
-                            int(d.get("unpeculiarCamouflageColorSchemeId", 0) or 0),
-                            icon_rel,
-                            display_name,
-                            json.dumps(d, ensure_ascii=False),
-                        ))
-                        if len(ext_rows) >= EXT_FLUSH:
-                            self._conn.executemany(ext_sql, ext_rows)
-                            tot_ext += len(ext_rows)
-                            ext_rows.clear()
-                        if ext_total > ext_batch and _i % ext_batch == 0:
-                            _p(f"外观数据入库进度 {_i}/{ext_total} ...")
+                ext_total = len(ext_items)
+                # 外观条目极多，分批输出进度，避免长时间无任何日志（显得卡死）
+                ext_batch = max(1, ext_total // 20 or 1)
+                for _i, (ext_name, d) in enumerate(ext_items, 1):
+                    if not isinstance(d, dict):
+                        continue
+                    ti = d.get("typeinfo")
+                    if not isinstance(ti, dict):
+                        ti = getattr(ti, "__dict__", {}) or {}
+                    ext_index = d.get("index", ext_name)
+                    icon_rel = self._cache_camo_icon(
+                        game_dir, bin_folder,
+                        self._resolve_camo_icon(icon_map, ext_name, ext_index), ext_name,
+                        ext_factory=_ext_factory)
+                    camo_mat = d.get("camouflage", "") or ""
+                    display_name = loc_map.get("IDS_" + str(ext_name).upper(), "")
+                    if camo_mat:
+                        material_to_icon[camo_mat.lower()] = icon_rel
+                        material_to_display[camo_mat.lower()] = display_name
+                    ext_rows.append((
+                        bin_folder,
+                        ext_index,
+                        ext_name,
+                        camo_mat,
+                        ti.get("species", "") or "",
+                        ti.get("nation", "") or "",
+                        int(d.get("costGold", 0) or 0),
+                        int(bool(d.get("canBuy"))),
+                        json.dumps(d.get("parts", []), ensure_ascii=False),
+                        json.dumps(d.get("custom", {}), ensure_ascii=False),
+                        d.get("unpeculiarCamouflage", "") or "",
+                        int(d.get("unpeculiarCamouflageColorSchemeId", 0) or 0),
+                        icon_rel,
+                        display_name,
+                        json.dumps({k: d.get(k) for k in EXTERIOR_DATA_KEYS
+                                    if d.get(k) is not None}, ensure_ascii=False),
+                    ))
+                    if len(ext_rows) >= EXT_FLUSH:
+                        self._conn.executemany(ext_sql, ext_rows)
+                        tot_ext += len(ext_rows)
+                        ext_rows.clear()
+                    if ext_total > ext_batch and _i % ext_batch == 0:
+                        _p(f"外观数据入库进度 {_i}/{ext_total} ...")
                 if ext_rows:
                     self._conn.executemany(ext_sql, ext_rows)
                     tot_ext += len(ext_rows)
@@ -1687,6 +1703,22 @@ class AssetsCacheService:
         except sqlite3.OperationalError:
             pass
         return key
+
+    @staticmethod
+    def _find_gameparams_file(game_dir, wows_type: str = "") -> str:
+        """定位客户端 GameParams 文件（WG 优先 GameParams.data，其余优先 py3）。"""
+        if not game_dir:
+            return ""
+        data_dir = Path(game_dir) / "data"
+        low = (wows_type or "").lower()
+        names = (["GameParams.data", "GameParams_py3.data"]
+                 if ("wg" in low or "war" in low)
+                 else ["GameParams_py3.data", "GameParams_py2.data", "GameParams.data"])
+        for n in names:
+            f = data_dir / n
+            if f.is_file():
+                return str(f)
+        return ""
 
     @staticmethod
     def _material_family(shader_id: str) -> str:

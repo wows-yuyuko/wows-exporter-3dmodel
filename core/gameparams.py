@@ -106,6 +106,42 @@ def exteriors(path: str) -> list[dict]:
     return out
 
 
+#: Exterior 实体里涂装/皮肤用到的字段（data_json 只存这些，不存整份实体）
+EXTERIOR_DATA_KEYS = (
+    "camouflage", "unpeculiarCamouflage", "unpeculiarCamouflageColorSchemeId",
+    "hullConfig", "nodesConfig", "peculiarityModels", "renderSetsStates",
+    "miscFilter", "planesConfig", "decalsEnabled",
+)
+
+
+def _plain(o):
+    """GPData / 嵌套容器 → 纯 dict/list，便于 json 序列化。"""
+    if isinstance(o, dict):
+        return {k: _plain(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_plain(v) for v in o]
+    d = getattr(o, "__dict__", None)
+    if isinstance(d, dict):
+        return {k: _plain(v) for k, v in d.items()}
+    return o
+
+
+def exterior_entities(path: str) -> list[tuple[str, dict]]:
+    """全部 Exterior 实体 (name, 纯 dict)，等价于 split/Exterior/*.json 的内容。
+
+    供 assets_data.db 直接入库，避免依赖导入时可能已被清理的 split 目录。
+    """
+    _ensure_stub()
+    data = load_gameparams(path)
+    out: list[tuple[str, dict]] = []
+    for key, value in _iter_ships(data):
+        info = _as_dict(value.get("typeinfo"))
+        if str(info.get("type", "")) != "Exterior":
+            continue
+        out.append((key, _plain(value)))
+    return out
+
+
 def ships(path: str, flt: str = "") -> list[ShipEntry]:
     _ensure_stub()
     data = load_gameparams(path)
