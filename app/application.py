@@ -89,9 +89,6 @@ class Application:
         self.config.bin_folder = value
         self._refresh_ctx()
 
-    def set_theme_mode(self, value):
-        self.config.theme_mode = value
-
     def reset_all(self):
         self._refresh_ctx()
 

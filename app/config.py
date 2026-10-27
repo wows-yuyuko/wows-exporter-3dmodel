@@ -28,16 +28,7 @@ class AppConfig:
     game_data_state: bool = False
     wows_type: str = "未选择"   # "Wargaming" | "Lesta" | "未选择"
     keep_split_json: bool = False  # 解析后是否保留 split JSON 文件
-    bin_folder: str = ""  # 游戏 bin 子版本号（如 <bin目录名>）
-    theme_mode: str = "auto"  # "auto"(跟随系统) | "light" | "dark" | <皮肤 id>(如 cyrene)
-    auto_check_update: bool = True   # 启动时自动检测 GitHub 新版本
-    include_prerelease: bool = False  # 版本检测是否把 pre-release 视为可更新版本
-
-    # 资源解包器（UnpackerDialog）的**独立**记录：与主程序的 game_path_* 完全分离，
-    # 主程序切换服务器/改路径不会影响解包器上次使用的目录。
-    unpacker_game_path: str = ""
-    unpacker_bin_folder: str = ""
-    unpacker_output_dir: str = ""
+    bin_folder: str = ""  # 游戏 bin 子版本号（运行时由 import/扫描 <game>/bin 得到）
 
     # ── 游戏路径（按当前服务器动态解析） ──────────────────
     @property
@@ -87,6 +78,12 @@ class AppConfig:
     @classmethod
     def default(cls) -> AppConfig:
         return cls()
+
+
+#: 真正落盘的字段。其余字段（wows_type / bin_folder / game_version /
+#: game_data_state / keep_split_json）都是**运行时状态**：由 import 或
+#: `_bootstrap()` 现场计算，写进 config.json 只会在换客户端后变成脏数据。
+PERSISTED_FIELDS = ("game_path_lesta", "game_path_wargaming")
 
 
 class ConfigManager:
@@ -176,62 +173,6 @@ class ConfigManager:
         self._config.bin_folder = value
         self.save()
 
-    @property
-    def theme_mode(self) -> str:
-        return self._config.theme_mode
-
-    @theme_mode.setter
-    def theme_mode(self, value: str) -> None:
-        self._config.theme_mode = value
-        self.save()
-
-    @property
-    def auto_check_update(self) -> bool:
-        return self._config.auto_check_update
-
-    @auto_check_update.setter
-    def auto_check_update(self, value: bool) -> None:
-        self._config.auto_check_update = bool(value)
-        self.save()
-
-    @property
-    def include_prerelease(self) -> bool:
-        return self._config.include_prerelease
-
-    @include_prerelease.setter
-    def include_prerelease(self, value: bool) -> None:
-        self._config.include_prerelease = bool(value)
-        self.save()
-
-    # ── 资源解包器独立记录 ───────────────────────────────
-
-    @property
-    def unpacker_game_path(self) -> str:
-        return self._config.unpacker_game_path
-
-    @unpacker_game_path.setter
-    def unpacker_game_path(self, value: str) -> None:
-        self._config.unpacker_game_path = str(value or "")
-        self.save()
-
-    @property
-    def unpacker_bin_folder(self) -> str:
-        return self._config.unpacker_bin_folder
-
-    @unpacker_bin_folder.setter
-    def unpacker_bin_folder(self, value: str) -> None:
-        self._config.unpacker_bin_folder = str(value or "")
-        self.save()
-
-    @property
-    def unpacker_output_dir(self) -> str:
-        return self._config.unpacker_output_dir
-
-    @unpacker_output_dir.setter
-    def unpacker_output_dir(self, value: str) -> None:
-        self._config.unpacker_output_dir = str(value or "")
-        self.save()
-
     # ── 供 Application 内部使用 ─────────────────────────
 
     @property
@@ -259,17 +200,6 @@ class ConfigManager:
             raw["game_path_lesta"] = legacy
         return raw
 
-    @staticmethod
-    def _migrate_legacy_skin(raw: dict) -> dict:
-        """迁移早期的皮肤命名：theme_mode="anime" -> 皮肤 id（cyrene）。"""
-        mode = str(raw.get("theme_mode", "") or "")
-        if mode and mode not in ("auto", "light", "dark") and mode not in skin_ids():
-            # 旧的 "anime" 就是第一套皮肤（昔涟）
-            raw["theme_mode"] = "cyrene" if mode == "anime" else "auto"
-        raw.pop("anime_art", None)
-        raw.pop("skin_art", None)
-        return raw
-
     def _load(self) -> AppConfig:
         """从磁盘加载配置，缺失字段用默认值填充"""
         default = AppConfig.default()
@@ -284,11 +214,8 @@ class ConfigManager:
                 return default
             # 旧版配置迁移：把单一 game_path 拆到对应服务器的专用路径字段
             raw = self._migrate_legacy_paths(raw)
-            # 旧版皮肤命名迁移（anime -> cyrene），并清掉已废弃的立绘字段
-            raw = self._migrate_legacy_skin(raw)
-            # 只取 dataclass 定义的字段，抛弃多余字段
-            valid_keys = {f.name for f in default.__dataclass_fields__.values()}
-            filtered = {k: v for k, v in raw.items() if k in valid_keys}
+            # 只保留落盘字段（旧版遗留的 theme_mode / unpacker_* 等直接丢弃）
+            filtered = {k: v for k, v in raw.items() if k in PERSISTED_FIELDS}
             # 用 default 的字段值补全缺失项
             merged = asdict(default) | filtered
             return AppConfig(**merged)
@@ -305,8 +232,9 @@ class ConfigManager:
     def _write(self, config: AppConfig) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            data = {k: getattr(config, k) for k in PERSISTED_FIELDS}
             with open(self._path, "w", encoding="utf-8") as f:
-                json.dump(asdict(config), f, indent=4, ensure_ascii=False)
+                json.dump(data, f, indent=4, ensure_ascii=False)
         except Exception as e:
             from app.signals import bus
             bus.log_message.emit(f"⚠️ 保存配置失败: {e}")
