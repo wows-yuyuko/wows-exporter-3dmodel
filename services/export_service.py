@@ -30,8 +30,8 @@ export_service.py —— 舰船 3D 模型导出（GLB / glTF 2.0 Binary）。
     自定义属性 `_JOINTS_0`（FLOAT，骨骼索引，避免 uint8 被当成 BYTE_COLOR 归一化）
     + `_WEIGHTS_0`（FLOAT）+ `mesh.extras.bone_palette`（骨骼名表），数据完整保留，
     但 Blender 导入后不会生成 Armature / 骨骼显示球（glTF 的顶点组必须挂在 skin 上，
-    skin 又必然建骨架）；随后在 Blender 运行 `tools/blender_wows_vertex_groups.py`
-    按上述数据还原顶点组（不建骨架；实测与 skin 模式的顶点组逐组权重完全一致）。
+    skin 又必然建骨架）。需要顶点组时按 `_JOINTS_0` / `_WEIGHTS_0` +
+    `extras.bone_palette` 自行重建（本仓库不提供该脚本，见 backlog P2-7）。
     ⚠️ skins 模式的骨架节点挂在 Scene Root 下的 `<部件>_bones`（恒等变换）空物体里：
     骨骼矩阵直接是世界矩阵；bind 矩阵先做 `M4 @ bind @ M4` 共轭到渲染空间。
     若把关节挂在带挂点矩阵的部件空物体下，Blender 会把父变换重复施加，
@@ -75,10 +75,12 @@ import os
 import struct
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
 from models.geometry_transform import prepare_render_mesh
+from services import mesh_filters
 from utils.threading_utils import TaskCancelled
 
 from pygltflib import (
@@ -89,7 +91,9 @@ from pygltflib import (
 
 #: glTF 常量
 _FLOAT = 5126
+_BYTE = 5120
 _UNSIGNED_BYTE = 5121
+_UNSIGNED_SHORT = 5123
 _UNSIGNED_INT = 5125
 _ARRAY_BUFFER = 34962
 _ELEMENT_ARRAY_BUFFER = 34963
@@ -105,6 +109,12 @@ _MIRROR = np.array([1.0, 1.0, -1.0], dtype=np.float32)
 #: 4x4 版镜像（矩阵共轭用：M_render = M4 @ M_game @ M4）
 _MIRROR4 = np.diag([1.0, 1.0, -1.0, 1.0]).astype(np.float32)
 
+
+#: 跨导出复用的贴图编码结果：(dds 内容哈希, kind, max_size) → (文件名, mime)。
+#: 皮肤批量导出时同一张图会被 8 套皮肤各编码一次，这里直接复用落盘文件。
+#: 只影响耗时，不影响产物（文件名本来就是内容哈希，同图同文件）。
+_TEXTURE_DISK_CACHE: dict[tuple, tuple[str, str]] = {}
+_TEXTURE_DISK_CACHE_LIMIT = 512
 
 #: BC1 / BC4 系：8 字节每 4×4 块；其余 BC2/3/5/7：16 字节
 _BC_BLOCK_8 = {71, 72, 77, 78, 80, 81}
@@ -181,7 +191,8 @@ class GlbRenderOptions:
     #: False：蒙皮数据写成 ``_JOINTS_0`` / ``_WEIGHTS_0`` 自定义属性 +
     #: ``extras.bone_palette``（骨骼名表），文件里**没有** skin/joints，
     #: Blender 导入后是干净的空物体层级（无 Armature、无骨骼球），
-    #: 需要顶点组时再跑 `tools/blender_wows_vertex_groups.py` 还原。
+    #: 需要顶点组时按 `_JOINTS_0`/`_WEIGHTS_0` + `extras.bone_palette` 自行重建
+    #: （本仓库不提供重建脚本，见 docs/todo-backlog.md P2-7）。
     export_skins: bool = True
     #: 合成根骨骼的骨尖长度（米，0 = 不建根骨骼）。Blender 的 `pick_bone_length()`
     #: 对「没有骨子骨骼」的根骨骼会退化成「骨骼到骨架原点的距离」（舰体动辄几十米），
@@ -210,6 +221,11 @@ class GlbRenderOptions:
     #: 0.6–1.0、信号灯反而全 0），按掩码绑上去整船会有约一半自发光 → 观感偏平。
     #: 需要时用 `--emissive` 打开（乘法在 linear 空间做，emissiveFactor 保持 1）。
     emissive: bool = False
+    #: 顶点属性瘦身（KHR_mesh_quantization）：索引 uint16、法线 int8、UV uint16、
+    #: 位置 uint16（按图元 AABB 量化 + 节点变换还原），并丢掉没人读的
+    #: `_T4` / `TEXCOORD_1` / `_EXTRA` / TANGENT。实测属性体积约 -55%，
+    #: 量化误差 ≤ 半个 texel，A/B 像素对照无可见差异。
+    slim_attributes: bool = True
 
 
 @dataclass
@@ -508,6 +524,11 @@ class _GlbBuilder:
         #: 按字节预算淘汰（见 `_content_key()`），淘汰后重算哈希，不影响正确性
         self._digest_cache: dict[int, tuple[bytes, str]] = {}
         self._digest_bytes = 0
+        #: 顶点属性瘦身开关（见 GlbRenderOptions.slim_attributes）
+        self.slim = True
+        #: mesh 索引 → (位置最小值, 位置范围)：量化网格在节点矩阵里还原
+        self._mesh_dequant: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._used_quant = False
         self.blob = bytearray()
         self.offset = 0
         self.gltf = GLTF2()
@@ -541,11 +562,16 @@ class _GlbBuilder:
         return idx
 
     def add_accessor(self, arr: np.ndarray, type_: str, component_type: int,
-                     target: int | None = None, minmax: bool = False) -> int:
+                     target: int | None = None, minmax: bool = False,
+                     normalized: bool = False, stride: int | None = None) -> int:
         arr = np.ascontiguousarray(arr)
         bv = self.add_buffer_view(arr.tobytes(), target)
+        if stride:
+            # 3 字节元素（VEC3 int8）按 4 字节对齐：glTF 的 byteStride
+            self.gltf.bufferViews[bv].byteStride = int(stride)
         acc = Accessor(bufferView=bv, byteOffset=0, componentType=component_type,
-                       count=int(arr.shape[0]), type=type_)
+                       count=int(arr.shape[0]), type=type_,
+                       normalized=True if normalized else None)
         if minmax and type_ == "VEC3" and component_type == _FLOAT:
             mn = arr.reshape(-1, 3).min(axis=0).astype(float).tolist()
             mx = arr.reshape(-1, 3).max(axis=0).astype(float).tolist()
@@ -606,10 +632,29 @@ class _GlbBuilder:
     def add_texture_from_dds(self, dds_bytes: bytes, label: str = "",
                              kind: str = _TEX_COLOR) -> int | None:
         """DDS → PNG → glTF 纹理（按**内容** + 通道类型去重）。解码失败返回 None。"""
-        key = (self._content_key(dds_bytes), kind)
+        digest = self._content_key(dds_bytes)
+        key = (digest, kind)
         cached = self._texture_cache.get(key)
         if cached is not None:
             return cached
+        disk_key = (digest, kind, self.texture_max_size)
+        if self.textures_dir:
+            hit = _TEXTURE_DISK_CACHE.get(disk_key)
+            if hit is not None:
+                fname, mime = hit
+                path = Path(self.textures_dir) / fname
+                if path.exists():
+                    self._texture_mime = mime
+                    uri = self.texture_uri_prefix + "/" + fname
+                    img_idx = len(self.gltf.images)
+                    self.gltf.images.append(Image(uri=uri, mimeType=mime, name=label or None))
+                    tex_idx = len(self.gltf.textures)
+                    self.gltf.textures.append(Texture(sampler=self.sampler_idx,
+                                                      source=img_idx, name=label or None))
+                    self.texture_records.append({"label": label, "uri": uri,
+                                                 "sha1": fname.split(".")[0], "mime": mime})
+                    self._texture_cache[key] = tex_idx
+                    return tex_idx
         png = dds_to_png(dds_bytes, max_size=self.texture_max_size, kind=kind)
         if png is None:
             if os.environ.get("WOWS_DEBUG_TEXTURES"):
@@ -622,6 +667,8 @@ class _GlbBuilder:
             uri = self._write_external_texture(png, label)
             if uri is None:
                 return None
+            if len(_TEXTURE_DISK_CACHE) < _TEXTURE_DISK_CACHE_LIMIT:
+                _TEXTURE_DISK_CACHE[disk_key] = (uri.rsplit("/", 1)[-1], self._texture_mime)
             img_idx = len(self.gltf.images)
             self.gltf.images.append(Image(uri=uri, mimeType=self._texture_mime,
                                           name=label or None))
@@ -844,30 +891,72 @@ class _GlbBuilder:
             # (a,b,c) → (a,c,b)：反向绕序；法线取反以跟随新绕序朝外
             indices = np.ascontiguousarray(indices.reshape(-1, 3)[:, [0, 2, 1]].reshape(-1))
             normals = np.ascontiguousarray(-np.asarray(normals, dtype=np.float32))
-        pos_acc = self.add_accessor(positions, "VEC3", _FLOAT, _ARRAY_BUFFER, minmax=True)
-        nrm_acc = self.add_accessor(normals, "VEC3", _FLOAT, _ARRAY_BUFFER)
+        # ── 顶点属性瘦身（KHR_mesh_quantization）──
+        # 索引 u16 / 法线 i8 / UV u16 / 位置 u16（按图元 AABB 量化，节点矩阵还原）。
+        # 位置量化只对**非蒙皮**网格做：glTF 的蒙皮结果在世界空间，节点变换会被忽略。
+        skinned = (joints0 is not None and weights0 is not None
+                   and not skin_attrs_as_custom)
+        slim = bool(self.slim) and np.asarray(positions).size > 0
+        dequant = None
+        if slim and not skinned:
+            pf = np.asarray(positions, dtype=np.float32)
+            pmin = pf.min(axis=0)
+            prng = (pf.max(axis=0) - pmin).astype(np.float32)
+            prng[prng < 1e-6] = 1.0
+            q = np.clip((pf - pmin) / prng * 65535.0 + 0.5, 0.0, 65535.0)
+            pos_acc = self.add_accessor(q.astype(np.uint16), "VEC3", _UNSIGNED_SHORT,
+                                        _ARRAY_BUFFER, normalized=True)
+            # 量化域的 min/max（glTF 要求 POSITION 必须带）
+            self.gltf.accessors[pos_acc].min = [0.0, 0.0, 0.0]
+            self.gltf.accessors[pos_acc].max = [65535.0, 65535.0, 65535.0]
+            dequant = (pmin, prng)
+            self._used_quant = True
+        else:
+            pos_acc = self.add_accessor(positions, "VEC3", _FLOAT, _ARRAY_BUFFER,
+                                        minmax=True)
+        if slim:
+            nf = np.asarray(normals, dtype=np.float32)
+            ln = np.linalg.norm(nf, axis=1, keepdims=True)
+            ln[ln < 1e-8] = 1.0
+            pad = np.zeros((nf.shape[0], 4), dtype=np.int8)
+            pad[:, :3] = np.clip(np.rint(nf / ln * 127.0), -127, 127).astype(np.int8)
+            # VEC3 + byteStride 4：3 字节元素按 4 字节对齐（gltfpack 同做法）
+            nrm_acc = self.add_accessor(pad, "VEC3", _BYTE, _ARRAY_BUFFER,
+                                        normalized=True, stride=4)
+            self._used_quant = True
+        else:
+            nrm_acc = self.add_accessor(normals, "VEC3", _FLOAT, _ARRAY_BUFFER)
         attrs = Attributes(POSITION=pos_acc, NORMAL=nrm_acc)
         if uvs is not None and uvs.shape[0] == positions.shape[0] and uvs.shape[1] == 2:
-            uv_acc = self.add_accessor(np.asarray(uvs, dtype=np.float32),
-                                       "VEC2", _FLOAT, _ARRAY_BUFFER)
+            uvf = np.asarray(uvs, dtype=np.float32)
+            if slim and uvf.size and float(uvf.min()) >= -1e-4 \
+                    and float(uvf.max()) <= 1.0 + 1e-4:
+                quv = np.clip(uvf, 0.0, 1.0) * 65535.0 + 0.5
+                uv_acc = self.add_accessor(quv.astype(np.uint16), "VEC2",
+                                           _UNSIGNED_SHORT, _ARRAY_BUFFER, normalized=True)
+                self._used_quant = True
+            else:
+                uv_acc = self.add_accessor(uvf, "VEC2", _FLOAT, _ARRAY_BUFFER)
             attrs.TEXCOORD_0 = uv_acc
-        if uvs2 is not None and uvs2.shape[0] == positions.shape[0] and uvs2.shape[1] == 2:
-            attrs.TEXCOORD_1 = self.add_accessor(np.asarray(uvs2, dtype=np.float32),
-                                                 "VEC2", _FLOAT, _ARRAY_BUFFER)
-        if tangents is not None and tangents.shape[0] == positions.shape[0] \
-                and tangents.shape[1] == 4:
-            attrs.TANGENT = self.add_accessor(np.asarray(tangents, dtype=np.float32),
-                                              "VEC4", _FLOAT, _ARRAY_BUFFER)
-        if extra is not None and extra.shape[0] == positions.shape[0]:
-            # 自定义属性（glTF 无标准语义）：原样保留 ``r`` 的 4 个字节
-            acc = self.add_accessor(np.asarray(extra, dtype=np.uint8),
-                                    "VEC4", _UNSIGNED_BYTE, _ARRAY_BUFFER)
-            attrs.__dict__["_EXTRA"] = acc
-        if t4 is not None and t4.shape[0] == positions.shape[0]:
-            # 自定义属性：单独 ``t`` 的原始 4 字节（语义未知，原样保留）
-            acc = self.add_accessor(np.asarray(t4, dtype=np.uint8),
-                                    "VEC4", _UNSIGNED_BYTE, _ARRAY_BUFFER)
-            attrs.__dict__["_T4"] = acc
+        if not slim:
+            # 以下属性前端/Blender 都不读，瘦身模式下整段丢弃
+            if uvs2 is not None and uvs2.shape[0] == positions.shape[0] and uvs2.shape[1] == 2:
+                attrs.TEXCOORD_1 = self.add_accessor(np.asarray(uvs2, dtype=np.float32),
+                                                     "VEC2", _FLOAT, _ARRAY_BUFFER)
+            if tangents is not None and tangents.shape[0] == positions.shape[0] \
+                    and tangents.shape[1] == 4:
+                attrs.TANGENT = self.add_accessor(np.asarray(tangents, dtype=np.float32),
+                                                  "VEC4", _FLOAT, _ARRAY_BUFFER)
+            if extra is not None and extra.shape[0] == positions.shape[0]:
+                # 自定义属性（glTF 无标准语义）：原样保留 ``r`` 的 4 个字节
+                acc = self.add_accessor(np.asarray(extra, dtype=np.uint8),
+                                        "VEC4", _UNSIGNED_BYTE, _ARRAY_BUFFER)
+                attrs.__dict__["_EXTRA"] = acc
+            if t4 is not None and t4.shape[0] == positions.shape[0]:
+                # 自定义属性：单独 ``t`` 的原始 4 字节（语义未知，原样保留）
+                acc = self.add_accessor(np.asarray(t4, dtype=np.uint8),
+                                        "VEC4", _UNSIGNED_BYTE, _ARRAY_BUFFER)
+                attrs.__dict__["_T4"] = acc
         if joints0 is not None and weights0 is not None \
                 and joints0.shape[0] == positions.shape[0] \
                 and weights0.shape[0] == positions.shape[0]:
@@ -890,8 +979,14 @@ class _GlbBuilder:
                 attrs.WEIGHTS_0 = self.add_accessor(
                     np.asarray(weights0, dtype=np.float32), "VEC4", _FLOAT,
                     _ARRAY_BUFFER)
-        idx_acc = self.add_accessor(indices.astype(np.uint32), "SCALAR",
-                                    _UNSIGNED_INT, _ELEMENT_ARRAY_BUFFER)
+        idx_arr = np.asarray(indices)
+        if slim and idx_arr.size and int(idx_arr.max()) < 65536:
+            idx_acc = self.add_accessor(idx_arr.astype(np.uint16), "SCALAR",
+                                        _UNSIGNED_SHORT, _ELEMENT_ARRAY_BUFFER)
+            self._used_quant = True
+        else:
+            idx_acc = self.add_accessor(idx_arr.astype(np.uint32), "SCALAR",
+                                        _UNSIGNED_INT, _ELEMENT_ARRAY_BUFFER)
         prim = Primitive(attributes=attrs, indices=idx_acc, mode=_TRIANGLES)
         if material_idx is not None:
             prim.material = material_idx
@@ -900,6 +995,8 @@ class _GlbBuilder:
             mesh.extras = extras
         self.gltf.meshes.append(mesh)
         idx = len(self.gltf.meshes) - 1
+        if dequant is not None:
+            self._mesh_dequant[idx] = dequant
         if cache_key is not None:
             self._mesh_cache[cache_key] = idx
         return idx
@@ -911,6 +1008,16 @@ class _GlbBuilder:
 
         matrix：渲染空间行主序 4x4（world = m @ local）；glTF 列主序存储。
         """
+        dequant = self._mesh_dequant.get(mesh) if mesh is not None else None
+        if dequant is not None:
+            # 位置量化网格：把 (min + range*q) 折进节点矩阵
+            pmin, prng = dequant
+            m = np.eye(4, dtype=np.float64)
+            m[:3, :3] = np.diag(prng.astype(np.float64))
+            m[:3, 3] = pmin.astype(np.float64)
+            if matrix is not None:
+                m = np.asarray(matrix, dtype=np.float64) @ m
+            matrix = m.astype(np.float32)
         node = Node(name=name, mesh=mesh)
         if matrix is not None:
             node.matrix = [float(x) for x in matrix.T.flatten().tolist()]
@@ -1089,6 +1196,14 @@ class _GlbBuilder:
         """
         if scene_children is not None:
             self.gltf.scenes[0].nodes = scene_children
+        if self._used_quant:
+            # 量化后的属性没有扩展就解析不了 → 同时写进 used 与 required
+            name = "KHR_mesh_quantization"
+            for attr in ("extensionsUsed", "extensionsRequired"):
+                cur = list(getattr(self.gltf, attr) or [])
+                if name not in cur:
+                    cur.append(name)
+                setattr(self.gltf, attr, cur)
         self.gltf.set_binary_blob(bytes(self.blob))
         self.gltf.buffers = [Buffer(byteLength=len(self.blob))]
         tmp = f"{output_path}.tmp{os.getpid()}"
@@ -1119,6 +1234,7 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
 
     builder = _GlbBuilder(options.textures_dir, options.texture_uri_prefix, options.texture_format,
                           options.texture_max_size)
+    builder.slim = bool(getattr(options, "slim_attributes", True))
     builder.gltf.asset.extras = {
         "game_key": geometry.game_key,
         "display_name": geometry.display_name,
@@ -1520,12 +1636,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
         return stem
 
     def _is_decal(obj) -> bool:
-        """贴花平面片判定：材质带 MESHDECAL，或 mesh/shape 名带 decal（挂载侧）。"""
-        if "decal" in str(getattr(obj, "material", "") or "").lower():
-            return True
-        names = [str(getattr(obj, "name", "") or "")]
-        names += [str(x) for x in (getattr(obj, "shape_names", None) or [])]
-        return any("decal" in n.lower() for n in names)
+        # 判据统一在 services/mesh_filters.py（材质名 / 网格名 / shape 名三级）
+        return mesh_filters.is_decal(obj)
 
     # ── 舰体分段：每个分段（Bow/MidFront/…）一个空物体，renderSet 各一个网格 ──
     hull_parts: dict[str, _Part] = {}

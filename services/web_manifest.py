@@ -36,17 +36,30 @@ def _asset_uris(materials: dict) -> list[str]:
     return sorted(uris)
 
 
+def _root_uri(uri: str) -> str:
+    """GLB 内的贴图 URI（相对 GLB 所在目录）→ 相对输出根目录的 URI。
+
+    GLB 在 geometry/<ship>/ 下，贴图前缀是 ../../textures；manifest 统一用
+    以输出根为基准的路径（textures/…），前端拼 ROOT 就能取到。
+    """
+    if not uri:
+        return uri
+    while uri.startswith("../"):
+        uri = uri[3:]
+    return uri
+
+
 def _slot_uri(gltf: GLTF2, info):
     if info is None:
         return None
     tex = gltf.textures[info.index]
     img = gltf.images[tex.source]
-    uri = img.uri or ""
-    return uri.replace("../textures/", "textures/")
+    return _root_uri(img.uri or "")
 
 
 def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: str,
-                       armor_ref: str | None = None, skins: list[str] | None = None) -> dict:
+                       armor_ref: str | None = None, skins: list[str] | None = None,
+                       base_skin: str | None = None) -> dict:
     gltf = GLTF2().load(str(glb_path))
     mat_keys: dict[int, str] = {}
     materials: dict[str, dict] = {}
@@ -81,19 +94,19 @@ def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: st
             if isinstance(val, dict):
                 meta = dict(val)
                 if meta.get("uri"):
-                    meta["uri"] = meta["uri"].replace("../textures/", "textures/")
+                    meta["uri"] = _root_uri(meta["uri"])
                 idx_tex[slot] = meta
             else:
                 tex = gltf.textures[val]
                 img = gltf.images[tex.source]
                 if img.uri:
-                    idx_tex[slot] = img.uri.replace("../textures/", "textures/")
+                    idx_tex[slot] = _root_uri(img.uri)
         if idx_tex:
             indexed["textures"] = idx_tex
         if indexed.get("arrays"):
             for meta in indexed["arrays"].values():
                 if meta.get("bin"):
-                    meta["bin"] = meta["bin"].replace("../textures/", "textures/")
+                    meta["bin"] = _root_uri(meta["bin"])
         wows_tex = extras.get("wows_textures") or {}
         # 显式 wows_mode 优先：`--bake-indexed` 出来的材质虽然还留着 arrays 的路径
         # 记录，实际已经是普通 PBR（arrays 不再下发给前端）。
@@ -104,7 +117,7 @@ def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: st
             tex = gltf.textures[tex_idx]
             img = gltf.images[tex.source]
             if img.uri:
-                layers[slot] = img.uri.replace("../textures/", "textures/")
+                layers[slot] = _root_uri(img.uri)
         materials[key] = {
             "id": key,
             "name": str(mat.name or ""),
@@ -143,17 +156,18 @@ def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: st
     tex_hash = hashlib.sha1()
     for uri in assets:
         tex_hash.update(uri.encode("utf-8"))
-        p = manifest_path.parent.parent / uri
+        # manifests/<ship>/x.json → 输出根是上两级
+        p = manifest_path.parents[2] / uri
         if p.is_file():
             tex_hash.update(_sha1_file(p).encode("ascii"))
     doc = {
         "schema": "wows-web/1",
         "ship": ship,
         "build": build,
-        "geometry": "geometry/" + ship + ".glb",
+        "geometry": "geometry/%s/%s.glb" % (ship, ship),
         "materials": materials,
         "meshes": meshes,
-        "skins": skins or ["default"],
+        "skins": list(skins or []),
         "hashes": {
             "geometry": _sha1_file(glb_path),
             "materials": hashlib.sha1(json.dumps(materials, sort_keys=True).encode("utf-8")).hexdigest(),
@@ -162,6 +176,9 @@ def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: st
     }
     if armor_ref:
         doc["armor"] = armor_ref
+    if base_skin:
+        # 这份几何本身就带着某套模型皮肤（--model-skin），前端不需要再切
+        doc["base_skin"] = str(base_skin)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
     return doc

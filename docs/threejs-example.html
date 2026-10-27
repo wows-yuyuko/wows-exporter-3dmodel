@@ -86,14 +86,20 @@ function texture(uri, srgb) {
   return t;
 }
 
-async function textureAsync(uri, srgb) {
+async function textureAsync(uri, srgb, point) {
   if (!uri) return null;
   const t = await texLoader.loadAsync(ROOT + uri);
   t.flipY = false;
   t.wrapS = THREE.RepeatWrapping;
   t.wrapT = THREE.RepeatWrapping;
   t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  if (point) {
+    // 数据图（materialIdMap）必须点采样：线性过滤会在材质块边界插出不存在的 id
+    t.minFilter = t.magFilter = THREE.NearestFilter;
+    t.generateMipmaps = false;
+  } else {
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  }
   return t;
 }
 
@@ -130,11 +136,13 @@ function indexedShader() {
       '}',
       'void main(){',
       '  vec2 texel = 1.0 / uMatIdSize;',
+      // 先量化到 texel 中心再取四邻域：否则块边界处会采到插值出来的中间 id
+      '  vec2 uvq = (floor(vUv * uMatIdSize) + 0.5) * texel;',
       '  vec4 m4 = vec4(',
-      '    texture2D(uMatId, vUv + vec2(-0.5,-0.5)*texel).r,',
-      '    texture2D(uMatId, vUv + vec2( 0.5,-0.5)*texel).r,',
-      '    texture2D(uMatId, vUv + vec2(-0.5, 0.5)*texel).r,',
-      '    texture2D(uMatId, vUv + vec2( 0.5, 0.5)*texel).r);',
+      '    texture2D(uMatId, uvq + vec2(-0.5,-0.5)*texel).r,',
+      '    texture2D(uMatId, uvq + vec2( 0.5,-0.5)*texel).r,',
+      '    texture2D(uMatId, uvq + vec2(-0.5, 0.5)*texel).r,',
+      '    texture2D(uMatId, uvq + vec2( 0.5, 0.5)*texel).r);',
       '  vec4 mid4 = min(floor(m4*255.0 + 0.5), 195.0);',
       '  float d0 = abs(mid4.x-mid4.y)+abs(mid4.x-mid4.z)+abs(mid4.x-mid4.w);',
       '  float d1 = abs(mid4.y-mid4.x)+abs(mid4.y-mid4.z)+abs(mid4.y-mid4.w);',
@@ -193,7 +201,7 @@ async function buildIndexedMaterial(m) {
     arrays.artStrengthMatIdArr ? loadArrayTex(arrays.artStrengthMatIdArr.bin) : null,
   ]);
   // materialIdMap 走可等待载入：着色器要用它的真实像素尺寸做四邻域抖动
-  const matId = await textureAsync((m.layers || {}).materialIdMap, false);
+  const matId = await textureAsync((m.layers || {}).materialIdMap, false, true);
   window.__idxDiag = { matId: !!matId, alb: !!alb, nrm: !!nrm, mg: !!mg, art: !!art,
                        tile: !!tile, offs: !!offs, rot: !!rot, tint: !!tint, rem: !!rem,
                        artStr: !!artStr };
@@ -262,7 +270,8 @@ let root = null;
 
 async function loadShip(ship) {
   status.textContent = 'loading manifest…';
-  const manifest = await (await fetch(ROOT + 'manifests/' + ship + '.json')).json();
+  // 布局：manifests/<ship>/<ship>.json（manifests 与 geometry 都按船分目录）
+  const manifest = await (await fetch(ROOT + 'manifests/' + ship + '/' + ship + '.json')).json();
   document.getElementById('ship').value = ship;
   status.textContent = 'loading geometry…';
   const gltf = await gltfLoader.loadAsync(ROOT + manifest.geometry);
@@ -334,9 +343,15 @@ async function loadShip(ship) {
   // skin selector
   const sel = document.getElementById('skin');
   sel.innerHTML = '';
-  const skins = manifest.skins || ['default'];
-  for (const id of skins) { const o = document.createElement('option'); o.value = id; o.textContent = id; sel.appendChild(o); }
-  sel.onchange = () => applySkin(manifest, sel.value).catch(fail);
+  // 皮肤不是默认产物：没有 skins 时把下拉禁掉，直接看基础材质
+  const skins = manifest.skins || [];
+  if (skins.length) {
+    for (const id of skins) { const o = document.createElement('option'); o.value = id; o.textContent = id; sel.appendChild(o); }
+    sel.onchange = () => applySkin(manifest, sel.value).catch(fail);
+  } else {
+    sel.disabled = true;
+    const o = document.createElement('option'); o.textContent = '(no skins)'; sel.appendChild(o);
+  }
 
   // armor
   armorData = null; armorMesh = null;
@@ -346,7 +361,7 @@ async function loadShip(ship) {
   if (armorData) buildArmor(manifest, armorData).catch(e => console.warn('armor', e));
 
   const wantSkin = params.get('skin');
-  await applySkin(manifest, wantSkin || 'default');
+  if (wantSkin || skins.length) await applySkin(manifest, wantSkin || skins[0]);
   status.textContent = 'ready · ' + root.children.length + ' top nodes';
 }
 

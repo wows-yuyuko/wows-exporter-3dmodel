@@ -82,7 +82,7 @@ def write_armor_files(out_dir: Path, ship_key: str, build: str, scene, armor_mes
             for zone in scene.zones
         },
         "buffers": {
-            "bin": "armor/" + ship_key + ".bin",
+            "bin": "armor/%s/%s.bin" % (ship_key, ship_key),
             "positions": {"offset": 0, "count": int(pos.size)},
             "normals": {"offset": len(pos_bytes), "count": int(nrm.size)},
             "plate_ids": {"offset": len(pos_bytes) + len(nrm_bytes), "count": int(plate_ids.size)},

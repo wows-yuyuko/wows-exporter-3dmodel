@@ -80,14 +80,48 @@ def _export_ship(ship, args, out: Path):
     info = ShipInfo(game_key=ship.key, display_name=ship.key,
                     model_folder=ship.model_folder, model_path=ship.model,
                     nation=ship.nation, ship_type=ship.ship_type, tier=ship.tier)
+    # ── --model-skin：把某套模型皮肤当作**基准外观**导出 ──
+    # 有些船的默认模型是原版（ARP 大和 = JSB039_Yamato_1945），特殊外观在
+    # permoflage 的 model skin 里（换 hull_config.model）。默认导出只能得到原版，
+    # 这里把指定/第一套 skin 直接当 base 加载，产物仍是 <ship>.glb。
+    skin_sel = None
+    skin_arg = str(getattr(args, "model_skin", "") or "").strip()
+    if skin_arg:
+        from services.camo_service import CamoService
+        gs0 = GeometryService.instance()
+        svc = CamoService(extractor=gs0.get_extractor(), cache=gs0._get_assets_cache(),
+                          bin_folder=app.config.bin_folder)
+        svc._ensure_loaded()
+        candidates = [c for c in svc.list_camos({ship.key}, set(ship.permoflages or []))
+                      if c.origin == "model" and c.skin]
+        if not candidates:
+            raise SystemExit("%s 没有模型皮肤（model skin），--model-skin 不适用" % ship.key)
+        if skin_arg.lower() == "auto":
+            skin_sel = candidates[0]
+        else:
+            for c in candidates:
+                ids = {str(c.ext_index or ""), str(getattr(c, "raw_name", "") or ""),
+                       str(getattr(c, "display_name", "") or "")}
+                if skin_arg in ids:
+                    skin_sel = c
+                    break
+            if skin_sel is None:
+                raise SystemExit("找不到模型皮肤 %s；可用：%s" % (
+                    skin_arg, ", ".join("%s(%s)" % (c.ext_index, c.display_name or "")
+                                        for c in candidates)))
+        print("[model-skin] 基准外观 = %s %s" % (skin_sel.ext_index, skin_sel.display_name or ""))
     snap = {}
     geom = GeometryService.instance().load_ship(
         info, progress_cb=lambda p, m: None,
         partial_cb=lambda g: snap.setdefault("g", g),
+        skin=skin_sel.skin if skin_sel else None,
+        model_replace=(skin_sel.model_replace or None) if skin_sel else None,
         lod=getattr(args, "lod", 2))
-    geom_dir = out / "geometry"
-    armor_dir = out / "armor"
-    manifest_dir = out / "manifests"
+    # 布局：geometry/<ship>/、manifests/<ship>/、armor/<ship>/ 各一层船名目录，
+    # textures/ 保持扁平（按内容哈希命名，跨船共享）
+    geom_dir = out / "geometry" / ship.key
+    armor_dir = out / "armor" / ship.key
+    manifest_dir = out / "manifests" / ship.key
     for d in (geom_dir, armor_dir, manifest_dir):
         d.mkdir(parents=True, exist_ok=True)
     textures_dir = out / "textures"
@@ -95,7 +129,7 @@ def _export_ship(ship, args, out: Path):
     options = GlbRenderOptions(
         embed_textures=not args.no_textures,
         textures_dir=str(textures_dir) if not args.no_textures else "",
-        texture_uri_prefix="../textures",
+        texture_uri_prefix="../../textures",
         texture_format="webp",
         texture_max_size=getattr(args, "texture_size", 1024),
         split_shapes=(getattr(args, "split_shapes", False)
@@ -105,6 +139,7 @@ def _export_ship(ship, args, out: Path):
         bake_indexed=getattr(args, "bake_indexed", False),
         bake_size=getattr(args, "bake_size", 0),
         emissive=getattr(args, "emissive", False),
+        slim_attributes=getattr(args, "slim", True),
     )
     report = export_render_glb(geom, str(glb), options)
     print(report)
@@ -133,15 +168,19 @@ def _export_ship(ship, args, out: Path):
                 print("wrote", zst)
             doc = write_armor_files(armor_dir, ship.key, app.config.bin_folder, scene, geom.armor_meshes)
             if doc:
-                armor_ref = "armor/" + ship.key + ".json"
+                armor_ref = "armor/%s/%s.json" % (ship.key, ship.key)
                 print("wrote", armor_dir / (ship.key + ".json"))
             print("wrote", armor_glb)
         else:
             print("[warn] no armor triangles")
     from services.skin_export import write_default_skin, export_mat_skins, export_model_skins
-    skin_path = write_default_skin(out, ship.key)
-    print("wrote", skin_path)
-    skins = ["default"]
+    # 皮肤不是默认产物：只有显式要皮肤时才写 skins/ 与 manifest.skins
+    want_skins = bool(getattr(args, "skins", False) or getattr(args, "model_skins", False))
+    skins: list[str] = []
+    if want_skins:
+        skin_path = write_default_skin(out, ship.key)
+        print("wrote", skin_path)
+        skins = ["default"]
     if getattr(args, "skins", False):
         extra_skins = export_mat_skins(out, ship, app.config.bin_folder,
                                         gameparams_path=str(_gameparams_path(Path(args.game), args.server, args.gp)),
@@ -154,8 +193,22 @@ def _export_ship(ship, args, out: Path):
         skins += model_skins
         print("[model-skins]", len(model_skins), model_skins[:8])
     from services.web_manifest import write_web_manifest
-    write_web_manifest(glb, manifest_dir / (ship.key + ".json"), ship.key,
-                       app.config.bin_folder, armor_ref=armor_ref, skins=skins)
+    # 同一输出根只应放一个服务器/版本的产物：船 key 相同会互相覆盖（Lesta 与 WG
+    # 的 PJSB018_Yamato_1944 就是同名不同内容），这里显式提醒
+    man_path = manifest_dir / (ship.key + ".json")
+    if man_path.is_file():
+        try:
+            import json as _json
+            old_build = str(_json.loads(man_path.read_text(encoding="utf-8")).get("build") or "")
+        except Exception:
+            old_build = ""
+        if old_build and old_build != str(app.config.bin_folder):
+            print("[warn] %s 已存在于该输出目录（build %s → %s），将被覆盖；"
+                  "不同服务器请用不同的 --out 根目录"
+                  % (ship.key, old_build, app.config.bin_folder))
+    write_web_manifest(glb, man_path, ship.key,
+                       app.config.bin_folder, armor_ref=armor_ref, skins=skins,
+                       base_skin=(skin_sel.ext_index if skin_sel else None))
     print("wrote", manifest_dir / (ship.key + ".json"))
     return glb
 
@@ -193,6 +246,8 @@ def cmd_batch(args):
         extra.append("--no-bake-indexed")
     if getattr(args, "emissive", False):
         extra.append("--emissive")
+    if not getattr(args, "slim", True):
+        extra.append("--no-slim")
     if getattr(args, "bake_size", 0):
         extra += ["--bake-size", str(args.bake_size)]
     if getattr(args, "texture_size", 1024) != 1024:
@@ -205,22 +260,52 @@ def cmd_batch(args):
         extra.append("--permoflage")
     if getattr(args, "model_skins", False):
         extra.append("--model-skins")
+    if getattr(args, "model_skin", ""):
+        extra += ["--model-skin", str(args.model_skin)]
     if args.gp:
         extra += ["--gp", str(args.gp)]
 
+    # 增量指纹：batch 以前只看 glb 是否存在，改参数后仍跳过（只能 --force 全量）。
+    # 现在按「build + 这组参数 + 船模型路径」算签名，签名变了就重导。
+    from services.export_index import ExportIndex, export_signature
+    from core.build_info import imported_build
+    flags = {
+        "no_textures": bool(args.no_textures), "zstd": bool(args.zstd),
+        "armor": bool(args.armor), "damage": bool(getattr(args, "damage", False)),
+        "decals": bool(getattr(args, "decals", False)),
+        "bake_indexed": bool(getattr(args, "bake_indexed", True)),
+        "emissive": bool(getattr(args, "emissive", False)),
+        "bake_size": int(getattr(args, "bake_size", 0) or 0),
+        "merge_shapes": bool(getattr(args, "merge_shapes", False)),
+        "skins": bool(getattr(args, "skins", False)),
+        "permoflage": bool(getattr(args, "permoflage", False)),
+        "model_skins": bool(getattr(args, "model_skins", False)),
+        "model_skin": str(getattr(args, "model_skin", "") or ""),
+    }
+    build = imported_build(args.server) or ""
+    index = ExportIndex(out)
+
     def run_one(ship):
-        target = out / "geometry" / (ship.key + ".glb")
-        if target.is_file() and not args.force:
+        target = out / "geometry" / ship.key / (ship.key + ".glb")
+        # model 不进签名：同一 build 内模型不会变，而并行分支拿不到 ship 对象
+        sig = export_signature(args.server, build, ship.key, "",
+                               int(getattr(args, "lod", 2)),
+                               int(getattr(args, "texture_size", 1024)), flags)
+        if not args.force and target.is_file() and index.matches(ship.key, sig):
             return ("skip", ship.key)
         cmd = [sys.executable, str(Path(__file__).resolve()), "ship",
                "--game", str(args.game), "--server", args.server,
                "--ship", ship.key, "--out", str(out)] + extra
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
+            index.forget(ship.key)
             return ("fail", ship.key + ": " + (proc.stderr or proc.stdout)[-300:])
+        index.record(ship.key, sig)
         return ("ok", ship.key)
 
-    if args.jobs and args.jobs > 1:
+    # 并行/串行都走 batch-worker：GameParams 与 DB 只初始化一次（以前每船一个
+    # `ship` 子进程，每条船都要重新加载 GameParams/数据库）。--jobs 0 保留旧行为。
+    if args.jobs and args.jobs >= 1:
         import tempfile
         keys_file = out / ".keys.txt"
         subprocess.run([sys.executable, str(Path(__file__).resolve()), "export-keys",
@@ -228,6 +313,18 @@ def cmd_batch(args):
                         "--filter", args.filter, "--out", str(keys_file)]
                        + (["--gp", args.gp] if args.gp else []), check=True)
         keys = keys_file.read_text(encoding="utf-8").splitlines()
+        # 并行分支同样吃增量指纹：先剔掉签名一致的，跑完再按产物登记
+        sig_by_key = {k: export_signature(args.server, build, k, "", int(getattr(args, "lod", 2)),
+                                          int(getattr(args, "texture_size", 1024)), flags)
+                      for k in keys}
+        if not args.force:
+            pending = [k for k in keys
+                       if not ((out / "geometry" / k / (k + ".glb")).is_file()
+                               and index.matches(k, sig_by_key[k]))]
+            skipped = len(keys) - len(pending)
+            if skipped:
+                print("[skip]", skipped, "unchanged ships")
+            keys = pending
         chunks = [keys[i::args.jobs] for i in range(args.jobs)]
         child_extra = [a for a in extra if a != "--armor"]
         procs = []
@@ -249,7 +346,10 @@ def cmd_batch(args):
         keys_file.unlink(missing_ok=True)
         for i in range(len(chunks)):
             (out / (".chunk%d.txt" % i)).unlink(missing_ok=True)
-        ok = sum(1 for k in keys if (out / "geometry" / (k + ".glb")).is_file())
+        ok = sum(1 for k in keys if (out / "geometry" / k / (k + ".glb")).is_file())
+        for k in keys:
+            if (out / "geometry" / k / (k + ".glb")).is_file():
+                index.record(k, sig_by_key[k])
         print("[done]", ok, "exported to", out)
         return
 
@@ -347,6 +447,11 @@ def main(argv=None):
                         "(needed for live camo switching; bigger, shader-only)")
     p.add_argument("--bake-size", type=int, default=0, metavar="PX",
                    help="max edge of baked textures (default: 0 = materialIdMap native size)")
+    p.add_argument("--slim", dest="slim", action="store_true", default=True,
+                   help="quantize vertex attributes (KHR_mesh_quantization) and drop "
+                        "unused _T4/TEXCOORD_1/TANGENT (default)")
+    p.add_argument("--no-slim", dest="slim", action="store_false",
+                   help="keep float32 attributes and every extra attribute (bigger files)")
     p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
                    help="export emissive = baseColor x _mg.B (default off: B is a "
                         "continuous channel on live assets, not a clean mask)")
@@ -360,6 +465,9 @@ def main(argv=None):
     p.add_argument("--permoflage", action="store_true",
                    help="also export permoflage (needs --skins)")
     p.add_argument("--model-skins", action="store_true", help="export model-replacement skins")
+    p.add_argument("--model-skin", default="", metavar="ID|auto",
+                   help="use a model skin as the base geometry (ARP Yamato: auto = first "
+                        "permoflage skin); output stays <ship>.glb")
     p.add_argument("--gp", default=None, help="explicit GameParams file")
     p.set_defaults(func=cmd_ship)
 
@@ -383,6 +491,7 @@ def main(argv=None):
     p.add_argument("--permoflage", action="store_true",
                    help="also export permoflage (needs --skins)")
     p.add_argument("--model-skins", action="store_true")
+    p.add_argument("--model-skin", default="", metavar="ID|auto")
     gb = p.add_mutually_exclusive_group()
     gb.add_argument("--merge-shapes", action="store_true")
     gb.add_argument("--split-shapes", action="store_true",
@@ -400,6 +509,11 @@ def main(argv=None):
                         "(needed for live camo switching; bigger, shader-only)")
     p.add_argument("--bake-size", type=int, default=0, metavar="PX",
                    help="max edge of baked textures (default: 0 = materialIdMap native size)")
+    p.add_argument("--slim", dest="slim", action="store_true", default=True,
+                   help="quantize vertex attributes (KHR_mesh_quantization) and drop "
+                        "unused _T4/TEXCOORD_1/TANGENT (default)")
+    p.add_argument("--no-slim", dest="slim", action="store_false",
+                   help="keep float32 attributes and every extra attribute (bigger files)")
     p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
                    help="export emissive = baseColor x _mg.B (default off: B is a "
                         "continuous channel on live assets, not a clean mask)")
@@ -444,6 +558,11 @@ def main(argv=None):
                         "(needed for live camo switching; bigger, shader-only)")
     p.add_argument("--bake-size", type=int, default=0, metavar="PX",
                    help="max edge of baked textures (default: 0 = materialIdMap native size)")
+    p.add_argument("--slim", dest="slim", action="store_true", default=True,
+                   help="quantize vertex attributes (KHR_mesh_quantization) and drop "
+                        "unused _T4/TEXCOORD_1/TANGENT (default)")
+    p.add_argument("--no-slim", dest="slim", action="store_false",
+                   help="keep float32 attributes and every extra attribute (bigger files)")
     p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
                    help="export emissive = baseColor x _mg.B (default off: B is a "
                         "continuous channel on live assets, not a clean mask)")
@@ -456,6 +575,7 @@ def main(argv=None):
     p.add_argument("--skins", action="store_true")
     p.add_argument("--permoflage", action="store_true")
     p.add_argument("--model-skins", action="store_true")
+    p.add_argument("--model-skin", default="", metavar="ID|auto")
     p.add_argument("--merge-shapes", action="store_true")
     p.add_argument("--gp", default=None)
     p.set_defaults(func=cmd_batch_worker)
