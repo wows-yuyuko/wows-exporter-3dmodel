@@ -72,6 +72,44 @@ def _bootstrap(game: Path, server: str):
     return app
 
 
+#: `--model-skin` 的默认值：智能套用（仅当首个 permoflage 就是模型皮肤）
+AUTO_MODEL_SKIN = "auto"
+
+
+def _resolve_model_skin(ship, skin_arg: str, build: str):
+    """解析 `--model-skin`：返回 CamoInfo 或 None。
+
+    - ""            → 不套（--no-model-skin）
+    - "auto"        → **仅当 `permoflages[0]` 是模型皮肤**时套用那一套。
+      科技树船（大和/北风）首个 permoflage 是 Permoflage（换贴图涂装），
+      那些 model skin 只是可选外观，不能当默认；联动/PR 船（ARP 大和、
+      星之北风）首个 permoflage 就是 Skin，那才是这艘船本来的样子。
+    - 具体 ID       → 按 ext_index / raw_name / display_name 精确匹配。
+    """
+    from services.camo_service import CamoService
+    from services.geometry_service import GeometryService
+    gs = GeometryService.instance()
+    svc = CamoService(extractor=gs.get_extractor(), cache=gs._get_assets_cache(),
+                      bin_folder=build)
+    svc._ensure_loaded()
+    candidates = [c for c in svc.list_camos({ship.key}, set(ship.permoflages or []))
+                  if c.origin == "model" and c.skin]
+    if skin_arg.lower() == AUTO_MODEL_SKIN:
+        if not candidates:
+            return None
+        first_idx = str((ship.permoflages or [""])[0]).split("_")[0]
+        return next((c for c in candidates if str(c.ext_index or "") == first_idx), None)
+    if not candidates:
+        raise SystemExit("%s 没有模型皮肤（model skin），--model-skin 不适用" % ship.key)
+    for c in candidates:
+        ids = {str(c.ext_index or ""), str(getattr(c, "raw_name", "") or ""),
+               str(getattr(c, "display_name", "") or "")}
+        if skin_arg in ids:
+            return c
+    raise SystemExit("找不到模型皮肤 %s；可用：%s" % (
+        skin_arg, ", ".join("%s(%s)" % (c.ext_index, c.display_name or "") for c in candidates)))
+
+
 def _export_ship(ship, args, out: Path):
     from app.application import app
     from services.geometry_service import GeometryService, ShipInfo
@@ -81,34 +119,10 @@ def _export_ship(ship, args, out: Path):
                     model_folder=ship.model_folder, model_path=ship.model,
                     nation=ship.nation, ship_type=ship.ship_type, tier=ship.tier)
     # ── --model-skin：把某套模型皮肤当作**基准外观**导出 ──
-    # 有些船的默认模型是原版（ARP 大和 = JSB039_Yamato_1945），特殊外观在
-    # permoflage 的 model skin 里（换 hull_config.model）。默认导出只能得到原版，
-    # 这里把指定/第一套 skin 直接当 base 加载，产物仍是 <ship>.glb。
-    skin_sel = None
-    skin_arg = str(getattr(args, "model_skin", "") or "").strip()
-    if skin_arg:
-        from services.camo_service import CamoService
-        gs0 = GeometryService.instance()
-        svc = CamoService(extractor=gs0.get_extractor(), cache=gs0._get_assets_cache(),
-                          bin_folder=app.config.bin_folder)
-        svc._ensure_loaded()
-        candidates = [c for c in svc.list_camos({ship.key}, set(ship.permoflages or []))
-                      if c.origin == "model" and c.skin]
-        if not candidates:
-            raise SystemExit("%s 没有模型皮肤（model skin），--model-skin 不适用" % ship.key)
-        if skin_arg.lower() == "auto":
-            skin_sel = candidates[0]
-        else:
-            for c in candidates:
-                ids = {str(c.ext_index or ""), str(getattr(c, "raw_name", "") or ""),
-                       str(getattr(c, "display_name", "") or "")}
-                if skin_arg in ids:
-                    skin_sel = c
-                    break
-            if skin_sel is None:
-                raise SystemExit("找不到模型皮肤 %s；可用：%s" % (
-                    skin_arg, ", ".join("%s(%s)" % (c.ext_index, c.display_name or "")
-                                        for c in candidates)))
+    # 默认 auto：只有「首个 permoflage 就是模型皮肤」时才套用（见 _resolve_model_skin）。
+    skin_arg = str(getattr(args, "model_skin", AUTO_MODEL_SKIN) or "").strip()
+    skin_sel = _resolve_model_skin(ship, skin_arg, app.config.bin_folder) if skin_arg else None
+    if skin_sel is not None:
         print("[model-skin] 基准外观 = %s %s" % (skin_sel.ext_index, skin_sel.display_name or ""))
     snap = {}
     geom = GeometryService.instance().load_ship(
@@ -260,8 +274,11 @@ def cmd_batch(args):
         extra.append("--permoflage")
     if getattr(args, "model_skins", False):
         extra.append("--model-skins")
-    if getattr(args, "model_skin", ""):
-        extra += ["--model-skin", str(args.model_skin)]
+    _mskin = str(getattr(args, "model_skin", AUTO_MODEL_SKIN) or "")
+    if not _mskin:
+        extra.append("--no-model-skin")
+    elif _mskin != AUTO_MODEL_SKIN:
+        extra += ["--model-skin", _mskin]
     if args.gp:
         extra += ["--gp", str(args.gp)]
 
@@ -280,7 +297,7 @@ def cmd_batch(args):
         "skins": bool(getattr(args, "skins", False)),
         "permoflage": bool(getattr(args, "permoflage", False)),
         "model_skins": bool(getattr(args, "model_skins", False)),
-        "model_skin": str(getattr(args, "model_skin", "") or ""),
+        "model_skin": str(getattr(args, "model_skin", AUTO_MODEL_SKIN) or ""),
     }
     build = imported_build(args.server) or ""
     index = ExportIndex(out)
@@ -465,9 +482,12 @@ def main(argv=None):
     p.add_argument("--permoflage", action="store_true",
                    help="also export permoflage (needs --skins)")
     p.add_argument("--model-skins", action="store_true", help="export model-replacement skins")
-    p.add_argument("--model-skin", default="", metavar="ID|auto",
-                   help="use a model skin as the base geometry (ARP Yamato: auto = first "
-                        "permoflage skin); output stays <ship>.glb")
+    p.add_argument("--model-skin", default=AUTO_MODEL_SKIN, metavar="ID|auto|none",
+                   help="base appearance from a model skin (default: auto = use it only "
+                        "when the ship's first permoflage is a model skin, e.g. ARP "
+                        "Yamato / Kitakaze PR); output stays <ship>.glb")
+    p.add_argument("--no-model-skin", dest="model_skin", action="store_const", const="",
+                   help="never apply a model skin (export the plain ship.model)")
     p.add_argument("--gp", default=None, help="explicit GameParams file")
     p.set_defaults(func=cmd_ship)
 
@@ -491,7 +511,8 @@ def main(argv=None):
     p.add_argument("--permoflage", action="store_true",
                    help="also export permoflage (needs --skins)")
     p.add_argument("--model-skins", action="store_true")
-    p.add_argument("--model-skin", default="", metavar="ID|auto")
+    p.add_argument("--model-skin", default=AUTO_MODEL_SKIN, metavar="ID|auto|none")
+    p.add_argument("--no-model-skin", dest="model_skin", action="store_const", const="")
     gb = p.add_mutually_exclusive_group()
     gb.add_argument("--merge-shapes", action="store_true")
     gb.add_argument("--split-shapes", action="store_true",
@@ -575,7 +596,8 @@ def main(argv=None):
     p.add_argument("--skins", action="store_true")
     p.add_argument("--permoflage", action="store_true")
     p.add_argument("--model-skins", action="store_true")
-    p.add_argument("--model-skin", default="", metavar="ID|auto")
+    p.add_argument("--model-skin", default=AUTO_MODEL_SKIN, metavar="ID|auto|none")
+    p.add_argument("--no-model-skin", dest="model_skin", action="store_const", const="")
     p.add_argument("--merge-shapes", action="store_true")
     p.add_argument("--gp", default=None)
     p.set_defaults(func=cmd_batch_worker)
