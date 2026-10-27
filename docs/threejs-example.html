@@ -86,6 +86,17 @@ function texture(uri, srgb) {
   return t;
 }
 
+async function textureAsync(uri, srgb) {
+  if (!uri) return null;
+  const t = await texLoader.loadAsync(ROOT + uri);
+  t.flipY = false;
+  t.wrapS = THREE.RepeatWrapping;
+  t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
 async function loadArrayTex(uri) {
   const buf = await (await fetch(ROOT + uri)).arrayBuffer();
   const data = new Float32Array(buf);
@@ -108,7 +119,7 @@ function indexedShader() {
     ].join('\n'),
     fragment: [
       'uniform sampler2D uMatId, uAlb, uArt, uNrm, uMg;',
-      'uniform sampler2D uTile, uOffset, uRot, uTint, uRemove;',
+      'uniform sampler2D uTile, uOffset, uRot, uTint, uRemove, uArtStr;',
       'uniform vec2 uGrid;',
       'uniform vec2 uMatIdSize;',
       'varying vec2 vUv;',
@@ -147,7 +158,7 @@ function indexedShader() {
       '  float k = clamp((diff + 0.001) / max(tint4.a, 1e-4), 0.0, 1.0);',
       '  vec3 c = mix(tint, albedo, k);',
       '  vec4 art = texture2D(uArt, vUv);',
-      '  float am = clamp(art.a * rot.y, 0.0, 1.0);',
+      '  float am = clamp(art.a * texture2D(uArtStr, coord).r, 0.0, 1.0);',
       '  c = mix(c, art.rgb, am);',
       '  vec3 ntex = texture2D(uNrm, atlasUV(tile.y, uv)).rgb * 2.0 - 1.0;',
       '  vec3 N = normalize(vN + vec3(ntex.xy * 0.6, 0.0));',
@@ -169,7 +180,7 @@ async function buildIndexedMaterial(m) {
   const idx = m.indexed || {};
   const tex = idx.textures || {};
   const arrays = idx.arrays || {};
-  const [alb, nrm, mg, art, tile, offs, rot, tint, rem] = await Promise.all([
+  const [alb, nrm, mg, art, tile, offs, rot, tint, rem, artStr] = await Promise.all([
     texture(tex.albedoArray && tex.albedoArray.uri, true),
     texture(tex.normalArray && tex.normalArray.uri, false),
     texture(tex.mgArray && tex.mgArray.uri, false),
@@ -179,10 +190,13 @@ async function buildIndexedMaterial(m) {
     arrays.rotationMatIdArr ? loadArrayTex(arrays.rotationMatIdArr.bin) : null,
     arrays.albedoTintMatIdArr ? loadArrayTex(arrays.albedoTintMatIdArr.bin) : null,
     arrays.albedoToRemoveTintMatIdArr ? loadArrayTex(arrays.albedoToRemoveTintMatIdArr.bin) : null,
+    arrays.artStrengthMatIdArr ? loadArrayTex(arrays.artStrengthMatIdArr.bin) : null,
   ]);
-  const matId = texture((m.layers || {}).materialIdMap, false);
+  // materialIdMap 走可等待载入：着色器要用它的真实像素尺寸做四邻域抖动
+  const matId = await textureAsync((m.layers || {}).materialIdMap, false);
   window.__idxDiag = { matId: !!matId, alb: !!alb, nrm: !!nrm, mg: !!mg, art: !!art,
-                       tile: !!tile, offs: !!offs, rot: !!rot, tint: !!tint, rem: !!rem };
+                       tile: !!tile, offs: !!offs, rot: !!rot, tint: !!tint, rem: !!rem,
+                       artStr: !!artStr };
   const sh = indexedShader();
   const dbg = params.get('debug');
   if (dbg === 'red') sh.fragment = 'void main(){ gl_FragColor = vec4(1.0,0.0,0.0,1.0); }';
@@ -212,9 +226,13 @@ async function buildIndexedMaterial(m) {
       uMatId: { value: matId }, uAlb: { value: alb }, uNrm: { value: nrm },
       uMg: { value: mg }, uArt: { value: art },
       uTile: { value: tile }, uOffset: { value: offs }, uRot: { value: rot },
-      uTint: { value: tint }, uRemove: { value: rem },
+      uTint: { value: tint }, uRemove: { value: rem }, uArtStr: { value: artStr },
       uGrid: { value: new THREE.Vector2(col[0], col[1]) },
-      uMatIdSize: { value: new THREE.Vector2(2048, 1024) },
+      // 必须用实际的 materialIdMap 尺寸：`--texture-size` 会把它缩到 1024×512，
+      // 写死 2048×1024 会让四邻域偏移错一倍（材质块边缘串色）
+      uMatIdSize: { value: new THREE.Vector2(
+        (matId && matId.image && matId.image.width) || 2048,
+        (matId && matId.image && matId.image.height) || 1024) },
     },
     vertexShader: sh.vertex, fragmentShader: sh.fragment,
     side: THREE.DoubleSide,
