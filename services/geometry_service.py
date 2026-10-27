@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import struct
+import contextlib
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,8 @@ from models.geometry_parser import parse_geometry, ArmorModel, GeometryError
 from models.collision_materials import collision_material_name, thickness_to_color
 from services.fx_mapping import tech_family as fx_tech_family
 from utils.threading_utils import TaskCancelled
+
+from services import mesh_filters
 
 
 @dataclass
@@ -491,6 +494,8 @@ class GeometryService:
         self._texture_bytes_cache: dict = {}
         #: 材质完整信息缓存 {mfm_path: dict}（技术族 + 贴图集 + INDEXED 分块参数）
         self._material_full_cache: dict = {}
+        #: 批量导出皮肤时不清上面这批按路径索引的缓存（见 keep_load_caches()）
+        self._keep_load_caches: bool = False
         #: 全局渲染集索引 {murmur3(shape.vertices): {shape, material, mfm, damage}}
         #: 整合模型的高模 shape 渲染集可能在别的分段记录里，需全局扫描一次
         self._global_rs_index: dict | None = None
@@ -649,7 +654,27 @@ class GeometryService:
                                         model_replace=model_replace, skin=skin,
                                         partial_cb=partial_cb, lod=lod)
         finally:
-            self._clear_per_load_caches()
+            if not self._keep_load_caches:
+                self._clear_per_load_caches()
+
+    @contextlib.contextmanager
+    def keep_load_caches(self):
+        """批量导出皮肤时跨次复用已解码的贴图 / 材质信息 / 挂载模型。
+
+        皮肤（尤其 `--model-skins`）每套都要 `load_ship` 一遍，而它们之间大部分
+        贴图与挂载模型是同一份：清缓存会让 pkg 解包 + BC7 解码从头再来一遍
+        （实测 ARP 大和第二次 load 14.2s → 8.4s）。这里只是**不清**这些按路径
+        索引的缓存，正确性不变（键都是 vfs 路径，内容随 build 固定）。
+        退出时若外层没嵌套再统一清一次，避免把重内存留在服务里。
+        """
+        prev = self._keep_load_caches
+        self._keep_load_caches = True
+        try:
+            yield
+        finally:
+            self._keep_load_caches = prev
+            if not prev:
+                self._clear_per_load_caches()
 
     @staticmethod
     def _snapshot_without_mounts(geom: ShipGeometry) -> ShipGeometry:
@@ -1037,9 +1062,9 @@ class GeometryService:
                                                   instance_matrices=inst)
                             if real is not None:
                                 hm.material = real
-                            if mat_key == '__wire__' or mat_key == 'WIRE':
+                            if mesh_filters.is_wire_material(mat_key):
                                 hm.is_wire = True
-                            if isinstance(mat_key, str) and mat_key.startswith('__crack__'):
+                            if mesh_filters.is_crack_material(mat_key):
                                 hm.is_crack = True
                             if real is not None:
                                 # 完整材质信息：技术族 + 贴图集 + INDEXED 分块参数（fx 区分渲染）
@@ -2129,7 +2154,7 @@ class GeometryService:
                                               node_names=g.get('node_names', []),
                                               instance_matrices=g.get('instance_matrices') or [])
                         hm.material = mat
-                        hm.is_wire = (mat == '__wire__' or mat == 'WIRE')
+                        hm.is_wire = mesh_filters.is_wire_material(mat)
                         hm.is_crack = bool(g.get('damage'))
                         hm.skinned_applied = bool(g.get('skinned_applied'))
                         if mfm:
@@ -2440,23 +2465,10 @@ class GeometryService:
                 tri_by_base_lod[_k] = tri_by_base_lod.get(_k, 0) + _n
 
         def _lod_skip(name: str) -> bool:
-            if not name:
-                return False
-            base, lv = GeometryService._shape_lod(name)
-            if lod < 0 or not levels_by_base:
-                return lv > 0
-            want = lod if lod in levels_by_base.get(base, ()) else 0
-            if want:
-                # 辅助几何（线材/补丁/穿孔/玻璃/网格）面数天然少，不参与面数保护，
-                # 否则会把 LOD2 的 623 面线材换成 LOD0 的 13,015 面（船壳被线框盖住）。
-                low = (name or "").lower()
-                if not any(k in low for k in ("wire", "patch", "perforation", "glass", "_net")):
-                    tri0 = tri_by_base_lod.get((base, 0), 0)
-                    tri_want = tri_by_base_lod.get((base, want), 0)
-                    # 目标级几乎是占位几何（< LOD0 的 5% 且 < 50 面）→ 回退 LOD0
-                    if tri0 and tri_want < max(50, tri0 * 0.05):
-                        want = 0
-            return lv != want
+            # 判据统一在 services/mesh_filters.py（LOD 级别 + 面数保护 + 辅助几何豁免）
+            return mesh_filters.should_skip_lod(name, lod, levels_by_base,
+                                                tri_by_base_lod,
+                                                GeometryService._shape_lod)
 
         def _annotate(p) -> None:
             """写入该 primitive 的 .visual 形状名与绑定节点名（GLB 导出命名用）。
