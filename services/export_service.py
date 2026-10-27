@@ -198,6 +198,18 @@ class GlbRenderOptions:
     tip_bones: bool = False
     #: 是否按 shape_spans 拆分网格；关闭后每个 hull 分段一次性导出，避免拆点接缝
     split_shapes: bool = True
+    #: 把 INDEXED 材质（materialIdMap + 图集数组 + LUT + artMap）烘成标准
+    #: baseColor/normal/MR 三图，让 Blender / 标准 glTF 查看器直接看到正确颜色。
+    #: 烘焙发生在 UV 空间（shader 的输入全是 vUv 的函数），无需光栅化几何。
+    #: 代价：烘焙后的材质**丢失实时换涂装能力**（artMap 已混进底色）。
+    bake_indexed: bool = False
+    #: 烘焙输出最长边上限（像素）；0 = 跟随 materialIdMap 原生尺寸（4096×2048）
+    bake_size: int = 0
+    #: 导出自发光（`_mg.B` × 底色 → emissiveTexture）。**默认关闭**：参考文档说
+    #: B 是 emissive 掩码，但实测 ARP/普通大和的 B 是连续值（船体均值≈0.5、绞盘
+    #: 0.6–1.0、信号灯反而全 0），按掩码绑上去整船会有约一半自发光 → 观感偏平。
+    #: 需要时用 `--emissive` 打开（乘法在 linear 空间做，emissiveFactor 保持 1）。
+    emissive: bool = False
 
 
 @dataclass
@@ -411,9 +423,72 @@ def dds_to_png(data: bytes, max_size: int = 4096, kind: str = _TEX_COLOR) -> byt
         return None
 
 
+def _emissive_texture(builder, base_dds: bytes, mg_dds: bytes, power, name: str,
+                      max_size: int = 1024) -> int | None:
+    """`底色 × _mg.B` → emissive 贴图（B 无信号时返回 None，不产生额外贴图）。"""
+    base = dds_to_rgba(base_dds)
+    mg = dds_to_rgba(mg_dds)
+    if base is None or mg is None:
+        return None
+    from PIL import Image
+    if mg.shape[:2] != base.shape[:2]:
+        mg = np.asarray(Image.fromarray(mg, "RGBA").resize(
+            (base.shape[1], base.shape[0]), Image.BILINEAR))
+    mask = mg[:, :, 2].astype(np.float32) / 255.0
+    if float(mask.max()) < 0.03:
+        return None
+    mask = np.clip(mask * float(power or 1.0), 0.0, 1.0)[:, :, None]
+    from services.indexed_bake import _SRGB_TO_LINEAR, _linear_to_srgb
+    lin = _SRGB_TO_LINEAR[base[:, :, :3]] * mask
+    out = np.empty_like(base)
+    out[:, :, :3] = (_linear_to_srgb(lin) * 255.0 + 0.5).astype(np.uint8)
+    out[:, :, 3] = 255
+    if max_size and max(out.shape[:2]) > max_size:
+        im = Image.fromarray(out, "RGBA")
+        im.thumbnail((max_size, max_size), Image.LANCZOS)
+        out = np.asarray(im, dtype=np.uint8)
+    return builder.add_texture_from_rgba(out, name + "_emissive")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # GLB 构建器
 # ────────────────────────────────────────────────────────────────────────────
+
+def _bake_indexed_material(builder, src, mtexs: dict, ip: dict,
+                           options, report) -> dict | None:
+    """把一份 INDEXED 材质烘成 albedo/normal/mr 三张贴图（按材质缓存）。
+
+    同一材质被上千个网格共用，烘焙一次即可；键里带 `bake_size` 便于同一进程
+    用不同分辨率导出时不会串。
+    """
+    name = getattr(src, "material", None) or ""
+    # 键必须能区分「没有材质名」的网格：这类网格共用空名，只按名字缓存会串图。
+    # 用 materialIdMap 的**内容哈希**当身份（不能用 id(ip)：ip 被回收后 id 会复用）
+    # 身份 = 烘焙的全部输入（mask + 图集 + artMap + 6 组 LUT）的内容哈希
+    key = (builder._material_identity(mtexs, ip), options.bake_size)
+    if key in builder._bake_cache:
+        if os.environ.get("WOWS_DEBUG_BAKE"):
+            print("[BAKE] hit  %-34s %s" % (name or "-", key[0][:8]), flush=True)
+        return builder._bake_cache[key]
+    if os.environ.get("WOWS_DEBUG_BAKE"):
+        print("[BAKE] MISS %-34s %s" % (name or "-", key[0][:8]), flush=True)
+    from services.indexed_bake import bake_indexed
+    result = None
+    try:
+        baked = bake_indexed(mtexs, ip, options.bake_size)
+    except Exception as exc:  # noqa: BLE001
+        report.warnings.append(f"INDEXED 烘焙异常（{name or '?'}）：{exc}")
+        baked = None
+    if baked is not None:
+        idx = {slot: builder.add_texture_from_rgba(baked[slot], f"{name}_baked_{slot}")
+               for slot in ("albedo", "normal", "mr")}
+        if all(v is not None for v in idx.values()):
+            result = dict(idx, size=baked["size"], notes=baked["notes"])
+    if result is None:
+        report.warnings.append(f"INDEXED 烘焙失败（{name or '?'}）：回退到图集数组路径")
+    builder._bake_cache[key] = result
+    return result
+
 
 class _GlbBuilder:
     """增量构建 GLB：单一二进制 blob + glTF 图（bufferView/accessor/…/node）。"""
@@ -425,7 +500,14 @@ class _GlbBuilder:
         self.texture_format = texture_format
         self.texture_max_size = max(64, int(texture_max_size))
         self.texture_records: list[dict] = []
-        self._array_texture_cache: dict[int, dict | None] = {}
+        self._array_texture_cache: dict[str, dict | None] = {}
+        #: INDEXED 烘焙结果按 materialIdMap 内容哈希缓存 —— 同一材质被上千个网格共用，
+        #: 每次都重烘 4096² 会慢到不可用
+        self._bake_cache: dict[tuple, dict | None] = {}
+        #: id(bytes) → (bytes, sha1)：**保留 bytes 引用**，id 才不会被回收复用。
+        #: 按字节预算淘汰（见 `_content_key()`），淘汰后重算哈希，不影响正确性
+        self._digest_cache: dict[int, tuple[bytes, str]] = {}
+        self._digest_bytes = 0
         self.blob = bytearray()
         self.offset = 0
         self.gltf = GLTF2()
@@ -436,8 +518,8 @@ class _GlbBuilder:
                                           minFilter=_LINEAR_MIPMAP_LINEAR,
                                           wrapS=_REPEAT, wrapT=_REPEAT))
         self.sampler_idx = 0
-        #: 去重缓存：id(dds_bytes) -> texture index；material 键 -> index；mesh 键 -> index
-        self._texture_cache: dict[int, int] = {}
+        #: 去重缓存：(内容哈希, 通道类型) -> texture index；material 键 -> index
+        self._texture_cache: dict[tuple, int] = {}
         self._material_cache: dict[tuple, int] = {}
         self._mesh_cache: dict[object, int] = {}
 
@@ -474,10 +556,57 @@ class _GlbBuilder:
 
     # ── 贴图 / 材质 ─────────────────────────────────────
 
+    #: 哈希缓存的内存预算（字节）。贴图动辄几十 MB，只按条数限制会吃爆内存
+    _DIGEST_CACHE_BYTES = 96 << 20
+
+    def _material_identity(self, mtexs: dict, ip: dict) -> str:
+        """INDEXED 材质的身份 = 图集/索引图/artMap 的内容 + 6 组 LUT 的内容。
+
+        只按 `materialIdMap` 会串图：不同材质可能共用同一张 mask，但换图集或换
+        LUT（例如几个炮塔共用 mask、贴图不同）。身份必须是「烘焙的全部输入」。
+        """
+        import hashlib
+        parts = []
+        for name in ("materialIdMap", "albedoArray", "normalArray", "MGArray", "artMap"):
+            tx = mtexs.get(name)
+            if tx and len(tx) > 1 and tx[1]:
+                parts.append(name + ":" + self._content_key(tx[1]))
+        for name in sorted(ip.get("arrays") or {}):
+            arr = (ip.get("arrays") or {})[name]
+            try:
+                parts.append(name + ":" + hashlib.sha1(
+                    np.ascontiguousarray(arr).tobytes()).hexdigest()[:16])
+            except Exception:  # noqa: BLE001
+                parts.append(name + ":?")
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+    def _content_key(self, data: bytes) -> str:
+        """字节内容 → sha1（按对象身份缓存，避免重复哈希几十 MB 的贴图）。
+
+        **不能用 `id(bytes)` 当去重键**：bytes 一旦被回收，`id` 会被下一块内存复用，
+        缓存命中就返回了另一张贴图的索引，且不报错（P0-2，实测串图）。
+        这里以内容哈希为键；`id` 只用来跳过重复计算，并**同时保留 bytes 引用**
+        （对象活着，`id` 就不会被复用），超出上限整体清空、下次重算。
+        """
+        import hashlib
+        cid = id(data)
+        hit = self._digest_cache.get(cid)
+        if hit is not None and hit[0] is data:
+            return hit[1]
+        # 按字节预算淘汰（FIFO）：只影响命中率，不影响正确性——被淘汰后再来会重算
+        while self._digest_bytes + len(data) > self._DIGEST_CACHE_BYTES \
+                and self._digest_cache:
+            old_id = next(iter(self._digest_cache))
+            self._digest_bytes -= len(self._digest_cache.pop(old_id)[0])
+        digest = hashlib.sha1(data).hexdigest()
+        self._digest_cache[cid] = (data, digest)
+        self._digest_bytes += len(data)
+        return digest
+
     def add_texture_from_dds(self, dds_bytes: bytes, label: str = "",
                              kind: str = _TEX_COLOR) -> int | None:
-        """DDS → PNG → glTF 纹理（按 dds 字节对象 + 通道类型去重）。解码失败返回 None。"""
-        key = (id(dds_bytes), kind)
+        """DDS → PNG → glTF 纹理（按**内容** + 通道类型去重）。解码失败返回 None。"""
+        key = (self._content_key(dds_bytes), kind)
         cached = self._texture_cache.get(key)
         if cached is not None:
             return cached
@@ -512,7 +641,7 @@ class _GlbBuilder:
         return tex_idx
 
     def add_texture_array_from_dds(self, dds_bytes: bytes, label: str = "") -> dict | None:
-        key = id(dds_bytes)
+        key = self._content_key(dds_bytes)
         if key in self._array_texture_cache:
             return self._array_texture_cache[key]
         meta = self._array_texture_impl(dds_bytes, label)
@@ -578,6 +707,40 @@ class _GlbBuilder:
             return {"uri": self.texture_uri_prefix + "/" + rel, "tile": tile,
                     "cols": cols, "rows": rows, "count": len(tiles)}
         except Exception:
+            return None
+
+    def add_texture_from_rgba(self, rgba: np.ndarray, label: str = "") -> int | None:
+        """RGBA uint8 数组 → 外部贴图（webp），返回 texture 索引。
+
+        烘焙输出专用：**不按 `texture_max_size` 再缩一次** —— 烘焙分辨率是
+        调用方按源数据算好的（`--bake-size` / materialIdMap 原生尺寸），
+        再压一轮只会把刚补回来的细节又糊掉。
+        """
+        try:
+            import io
+            import hashlib
+            from pathlib import Path
+            from PIL import Image as PILImage
+            im = PILImage.fromarray(np.ascontiguousarray(rgba), "RGBA")
+            out = io.BytesIO()
+            im.save(out, "WEBP", quality=90, method=3)
+            data = out.getvalue()
+            digest = hashlib.sha1(data).hexdigest()
+            out_dir = Path(self.textures_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / (digest + ".webp")
+            if not path.exists():
+                path.write_bytes(data)
+            uri = self.texture_uri_prefix + "/" + digest + ".webp"
+            img_idx = len(self.gltf.images)
+            self.gltf.images.append(Image(uri=uri, mimeType="image/webp", name=label or None))
+            tex_idx = len(self.gltf.textures)
+            self.gltf.textures.append(Texture(sampler=self.sampler_idx, source=img_idx,
+                                              name=label or None))
+            self.texture_records.append({"label": label, "uri": uri,
+                                         "sha1": digest, "mime": "image/webp"})
+            return tex_idx
+        except Exception:  # noqa: BLE001
             return None
 
     def _write_external_texture(self, png: bytes, label: str) -> str | None:
@@ -1171,9 +1334,19 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
             return None
 
         normal_idx = mr_idx = ao_idx = None
+        ip = getattr(src, "indexed_params", None) or {}
+        bake_meta = None
+        if (options.bake_indexed and options.embed_textures
+                and getattr(src, "tech_family", "pbs") == "indexed" and ip):
+            bake_meta = _bake_indexed_material(builder, src, mtexs, ip, options, report)
+            if bake_meta is not None:
+                tex_idx = bake_meta["albedo"]
+                normal_idx = bake_meta["normal"]
+                mr_idx = bake_meta["mr"]
         # INDEXED 族的 normalMap 是 alpha 法线叠加层（见 renderer/scene.py），
         # 贴图集也要逐材质分块才能取到正确结果 → 仅标准 PBS 材质接 PBR 通道。
-        if options.embed_textures and getattr(src, "tech_family", "pbs") != "indexed":
+        if (bake_meta is None and options.embed_textures
+                and getattr(src, "tech_family", "pbs") != "indexed"):
             for kind, keys, slot in (
                 (_TEX_NORMAL, ("normalMap", "g_normalMap"), "normal"),
                 (_TEX_MR, ("metallicGlossMap", "g_mgMap"), "mr"),
@@ -1192,8 +1365,19 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
                     mr_idx = slot_idx
                 else:
                     ao_idx = slot_idx
+        emissive_idx = None
+        if (bake_meta is None and options.emissive and options.embed_textures
+                and getattr(src, "tech_family", "pbs") != "indexed"):
+            mg_pick = _pick("metallicGlossMap", "g_mgMap")
+            if mg_pick and tex and not _is_dds_array(mg_pick[1]):
+                try:
+                    emissive_idx = _emissive_texture(
+                        builder, tex, mg_pick[1], getattr(src, "emissive_power", None),
+                        name, max_size=options.texture_max_size)
+                except Exception as exc:  # noqa: BLE001
+                    report.warnings.append(f"自发光贴图生成失败（{name}）：{exc}")
         layer_tex = {}
-        if options.embed_textures:
+        if bake_meta is None and options.embed_textures:
             for slot, keys in (
                 ("composite", ("compositeMap", "composite", "g_compositeMap")),
                 ("artMap", ("artMap", "g_artMap")),
@@ -1206,7 +1390,8 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
                 if slot_idx is not None:
                     layer_tex[slot] = slot_idx
         indexed_tex = {}
-        if options.embed_textures and getattr(src, "tech_family", "pbs") == "indexed":
+        if (bake_meta is None and options.embed_textures
+                and getattr(src, "tech_family", "pbs") == "indexed"):
             for slot, keys, kind in (
                 ("albedoArray", ("albedoArray", "g_albedoMap"), _TEX_COLOR),
                 ("normalArray", ("normalArray", "g_normalMap"), _TEX_NORMAL),
@@ -1219,8 +1404,7 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
                 if meta:
                     indexed_tex[slot] = meta
         indexed_meta = {}
-        ip = getattr(src, "indexed_params", None) or {}
-        if options.embed_textures and ip:
+        if bake_meta is None and options.embed_textures and ip:
             arrays = ip.get("arrays") or {}
             for aname, arr in arrays.items():
                 try:
@@ -1247,19 +1431,26 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
                 if isinstance(v, (int, float, str, bool, list, tuple)):
                     indexed_meta[k] = v
         alpha_mode = _OPAQUE if getattr(src, "opaque", True) else _BLEND
+        extras = {"component": component,
+                  "texture_path": getattr(src, "texture_path", ""),
+                  "wows_textures": {k: (v[0] if isinstance(v, (tuple, list)) else "")
+                                    for k, v in mtexs.items()},
+                  "wows_layer_textures": layer_tex,
+                  "wows_indexed": indexed_meta,
+                  "wows_indexed_textures": indexed_tex}
+        if bake_meta is not None:
+            # 烘焙后材质就是普通 PBR：告诉 web manifest 别再按 arrays 走 INDEXED 路径
+            extras["wows_mode"] = "pbs"
+            extras["wows_baked"] = {"from": "indexed", "size": list(bake_meta["size"]),
+                                    "notes": bake_meta["notes"]}
         mat_idx = builder.add_material(
             getattr(src, "material", None) or name,
             base_color=(1.0, 1.0, 1.0, 1.0), texture_idx=tex_idx,
             alpha_mode=alpha_mode,
             double_sided=options.double_sided,
-            extras={"component": component,
-                    "texture_path": getattr(src, "texture_path", ""),
-                    "wows_textures": {k: (v[0] if isinstance(v, (tuple, list)) else "")
-                                      for k, v in mtexs.items()},
-                    "wows_layer_textures": layer_tex,
-                    "wows_indexed": indexed_meta,
-                    "wows_indexed_textures": indexed_tex},
-            normal_tex=normal_idx, mr_tex=mr_idx, occlusion_tex=ao_idx)
+            extras=extras,
+            normal_tex=normal_idx, mr_tex=mr_idx, occlusion_tex=ao_idx,
+            emissive_tex=emissive_idx)
         # ── 顶点组 / 权重（iiiww 属性）──
         if p.size == 0 or p.size % 3:
             report.skipped_meshes += 1

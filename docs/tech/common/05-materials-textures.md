@@ -61,11 +61,11 @@ ambientOcclusionMap / detailMap`。
 | 数组 | 语义 | 用法 |
 |---|---|---|
 | `offsetScaleMatIdArr` | xy = UV 偏移，zw = UV 缩放 | `uv = uv * zw + xy` |
-| `rotationMatIdArr` | x = UV 旋转角（弧度）；**y = art 叠加强度** | 先旋转，再取 `rotation.y` 当 `artStrength` |
+| `rotationMatIdArr` | x = UV 旋转角（弧度）；y/z/w 实测恒 0 | 只用 `x` 旋转 |
 | `tileIdxMatIdArr` | x / y / z = albedo / normal / MG 的数组层号 | 图集选层 |
 | `albedoTintMatIdArr` | rgb = tint 颜色，w = 褪色阈值（含 999 特殊值） | tint 混合 |
 | `albedoToRemoveTintMatIdArr` | rgb = 参考色 | 算曼哈顿距离决定混合权重 |
-| `artStrengthMatIdArr` | x = BaseStrength | **与 `rotation.y` 合成一个 vec4 传入**（省寄存器） |
+| `artStrengthMatIdArr` | x = BaseStrength（实测恒 1.0；洋红占位时置 0） | art 叠加强度取 `x` |
 
 上色公式（与游戏/查看器一致）：
 
@@ -122,10 +122,42 @@ textures/<sha1>.webp
 manifest 里记录 `{uri, tile: 256, cols, rows, count}`，网页用
 `atlasUV(slice, uv) = (cell + fract(uv)) / grid` 换算。
 
-> 判"是不是数组"必须只看 DX10 的 `arraySize` 字段。
-> 现行 `_is_dds_array()` 有一条 `len > 8MB → True` 的快捷判据，
-> 会把 4096×2048 的单图（artMap 8,388,756 B）误判成数组 ——
-> 见 [../../todo-backlog.md](../../todo-backlog.md) P0-1。
+> 判"是不是数组"只看结构：无 DX10 头 → 单图；`arraySize > 1` → 数组；
+> 否则按「单层字节 × 2」兜底。**不能用文件大小**——4096×2048 的单图
+> artMap 就有 8 MB，按大小判会把它当数组丢掉（已修，见
+> [../../todo-backlog.md](../../todo-backlog.md) P0-1）。
+
+## 7.5 烘焙成标准 PBR（默认开启，`--no-bake-indexed` 关闭）
+
+INDEXED 的正确颜色只有那套 shader 算得出来，Blender / 标准 glTF 查看器打开就是
+没有底色的灰模。`--bake-indexed` 把它烘成 baseColor / normal / MR 三张常规贴图
+（`services/indexed_bake.py`）。
+
+**不需要光栅化几何**：shader 的每个输入（materialIdMap、artMap、图集采样）都只是
+`vUv` 的函数，所以烘焙就是 UV 栅格上的逐像素运算，分辨率可任意选。
+
+| 输出 | 来源 |
+|---|---|
+| baseColor | 图集 `tile.x` 层 → `offsetScale`/`rotation` 变换 → tint 混合（`albedoTintMatIdArr` 阈值）→ artMap 叠加（`art × artStrength.x`） |
+| normal | 图集 `tile.y` 层，保持 XY、补 Z（切线空间） |
+| MR | 图集 `tile.z` 层，G=1-gloss、B=F0 权重 |
+
+实现要点：
+
+- **按 matId 分块**：196 个 id 各自一套 UV 缩放，按 id 分组做向量化采样；
+- **mip 按采样密度选**：`38` 次平铺 → 一个输出像素跨约 9.5 个源纹素，
+  直接用 1024² 原图会摩尔纹，所以按 `1024 / footprint` 先缩对应层再双线性采；
+- **materialIdMap 用最近邻缩放**：ID 图做插值会造出不存在的材质 id；
+- **分辨率**：默认跟随 materialIdMap 原生尺寸（Waterloo = 4096×2048，实测 13 s），
+  `--bake-size 1024` 可降到 1024×512（3 s）；
+- 三张图**不再被 `--texture-size` 二次压缩**；材质在 manifest 里变成
+  `mode: "pbs"` + `baked: {from: "indexed", size, notes}`。
+
+**代价**：artMap 已混进底色 → 失去实时换涂装能力；shader 末尾的手搓光照
+（`×1.65`、`mix(white, 0.06)`）属于渲染，不烘。
+
+**默认开启**（`--no-bake-indexed` 回到图集数组路线）。非 INDEXED 材质不受影响，
+`--no-textures` 时不烘。
 
 ## 8. 其它技术族
 

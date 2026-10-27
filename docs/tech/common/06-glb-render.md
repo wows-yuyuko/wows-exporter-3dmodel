@@ -79,6 +79,8 @@ Scene Root                                wows_export_version = 5
 | `detailMap` / `artMap` / 图集数组 | ❌ 只记 extras | glTF 无等价物 |
 
 **INDEXED 族例外**：整块 PBR 通道（normal / MR / AO）**全部跳过**，不是只跳 normal。
+需要标准 PBR 时改用 `--bake-indexed`（烘出 baseColor/normal/MR，见
+`05-materials-textures.md` §7.5）—— 那时不再走"跳过"分支。
 原因是这些贴图是 `*Array` 图集，必须按 `materialIdMap` 逐像素选层才能取对，
 硬套 `normalTexture` 只会得到错误的一层。所以 INDEXED 材质的
 `slots` 是**空对象**（实测 Waterloo 的 `TL2_SHIPMAT_INDEXED_PBS_Hull`：`slots = {}`），

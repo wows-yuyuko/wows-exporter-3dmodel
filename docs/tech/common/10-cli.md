@@ -21,6 +21,7 @@
 --game DIR  --server {lesta,wg}  --ship KEY  --out DIR
 [--no-textures] [--zstd] [--armor]
 [--damage] [--decals]
+[--bake-indexed | --no-bake-indexed] [--bake-size PX=0]
 [--texture-size N=1024] [--lod N=2]
 [--merge-shapes | --split-shapes]   # 互斥；默认就是拆分
 [--skins] [--permoflage] [--model-skins]
@@ -33,6 +34,9 @@
 | `--armor` | 关 | 额外导 `armor/*.glb` + `.json` + `.bin` |
 | `--damage` | 关 | 保留破损断面（默认剔除） |
 | `--decals` | 关 | 保留平面贴花（默认剔除） |
+| `--bake-indexed` | **开** | 把 INDEXED 材质烘成标准 baseColor/normal/MR（关闭后丢失实时换涂装换不回来，见下） |
+| `--no-bake-indexed` | — | 保留原始图集数组 + 6 LUT（只有自带 shader 的页面能画对，可实时换涂装） |
+| `--bake-size` | **0** | 烘焙贴图最长边；`0` = 跟随 materialIdMap 原生尺寸（4096×2048） |
 | `--texture-size` | **1024** | 贴图最大边长（PX），小图不放大 |
 | `--lod` | **2** | `-1` = LOD0；`0–3` 指定级别，缺级部件回退 LOD0 |
 | `--merge-shapes` | 关 | 每段合成一个网格（会丢面，见 known-issues） |

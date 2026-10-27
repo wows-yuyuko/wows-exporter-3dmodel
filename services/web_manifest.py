@@ -95,7 +95,10 @@ def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: st
                 if meta.get("bin"):
                     meta["bin"] = meta["bin"].replace("../textures/", "textures/")
         wows_tex = extras.get("wows_textures") or {}
-        mode = "indexed" if any("Array" in str(k) for k in wows_tex) else "pbs"
+        # 显式 wows_mode 优先：`--bake-indexed` 出来的材质虽然还留着 arrays 的路径
+        # 记录，实际已经是普通 PBR（arrays 不再下发给前端）。
+        mode = str(extras.get("wows_mode") or "") or (
+            "indexed" if any("Array" in str(k) for k in wows_tex) else "pbs")
         layers = {}
         for slot, tex_idx in (extras.get("wows_layer_textures") or {}).items():
             tex = gltf.textures[tex_idx]
@@ -114,6 +117,9 @@ def write_web_manifest(glb_path: Path, manifest_path: Path, ship: str, build: st
             "double_sided": bool(mat.doubleSided),
             "alpha_mode": str(mat.alphaMode or "OPAQUE"),
         }
+        baked = extras.get("wows_baked")
+        if baked:
+            materials[key]["baked"] = baked
 
     meshes = []
     for node in gltf.nodes or []:

@@ -102,6 +102,9 @@ def _export_ship(ship, args, out: Path):
                       or not getattr(args, "merge_shapes", False)),
         include_damage=getattr(args, "damage", False),
         include_decals=getattr(args, "decals", False),
+        bake_indexed=getattr(args, "bake_indexed", False),
+        bake_size=getattr(args, "bake_size", 0),
+        emissive=getattr(args, "emissive", False),
     )
     report = export_render_glb(geom, str(glb), options)
     print(report)
@@ -186,6 +189,12 @@ def cmd_batch(args):
         extra.append("--damage")
     if getattr(args, "decals", False):
         extra.append("--decals")
+    if not getattr(args, "bake_indexed", True):
+        extra.append("--no-bake-indexed")
+    if getattr(args, "emissive", False):
+        extra.append("--emissive")
+    if getattr(args, "bake_size", 0):
+        extra += ["--bake-size", str(args.bake_size)]
     if getattr(args, "texture_size", 1024) != 1024:
         extra += ["--texture-size", str(args.texture_size)]
     if getattr(args, "lod", 2) != 2:
@@ -329,6 +338,20 @@ def main(argv=None):
                    help="include damage/crack geometry (default: excluded)")
     p.add_argument("--decals", action="store_true",
                    help="include SHIP_MESHDECAL flat decals (default: excluded)")
+    p.add_argument("--bake-indexed", dest="bake_indexed", action="store_true",
+                   default=True,
+                   help="bake INDEXED materials (materialIdMap + atlas arrays + artMap) "
+                        "into standard baseColor/normal/MR textures (default)")
+    p.add_argument("--no-bake-indexed", dest="bake_indexed", action="store_false",
+                   help="keep the raw INDEXED arrays instead of baking "
+                        "(needed for live camo switching; bigger, shader-only)")
+    p.add_argument("--bake-size", type=int, default=0, metavar="PX",
+                   help="max edge of baked textures (default: 0 = materialIdMap native size)")
+    p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
+                   help="export emissive = baseColor x _mg.B (default off: B is a "
+                        "continuous channel on live assets, not a clean mask)")
+    p.add_argument("--no-emissive", dest="emissive", action="store_false",
+                   help="skip emissive (default)")
     p.add_argument("--texture-size", type=int, default=1024,
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,
@@ -368,6 +391,20 @@ def main(argv=None):
                    help="include damage/crack geometry (default: excluded)")
     p.add_argument("--decals", action="store_true",
                    help="include SHIP_MESHDECAL flat decals (default: excluded)")
+    p.add_argument("--bake-indexed", dest="bake_indexed", action="store_true",
+                   default=True,
+                   help="bake INDEXED materials (materialIdMap + atlas arrays + artMap) "
+                        "into standard baseColor/normal/MR textures (default)")
+    p.add_argument("--no-bake-indexed", dest="bake_indexed", action="store_false",
+                   help="keep the raw INDEXED arrays instead of baking "
+                        "(needed for live camo switching; bigger, shader-only)")
+    p.add_argument("--bake-size", type=int, default=0, metavar="PX",
+                   help="max edge of baked textures (default: 0 = materialIdMap native size)")
+    p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
+                   help="export emissive = baseColor x _mg.B (default off: B is a "
+                        "continuous channel on live assets, not a clean mask)")
+    p.add_argument("--no-emissive", dest="emissive", action="store_false",
+                   help="skip emissive (default)")
     p.add_argument("--texture-size", type=int, default=1024,
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,
@@ -398,6 +435,20 @@ def main(argv=None):
                    help="include damage/crack geometry (default: excluded)")
     p.add_argument("--decals", action="store_true",
                    help="include SHIP_MESHDECAL flat decals (default: excluded)")
+    p.add_argument("--bake-indexed", dest="bake_indexed", action="store_true",
+                   default=True,
+                   help="bake INDEXED materials (materialIdMap + atlas arrays + artMap) "
+                        "into standard baseColor/normal/MR textures (default)")
+    p.add_argument("--no-bake-indexed", dest="bake_indexed", action="store_false",
+                   help="keep the raw INDEXED arrays instead of baking "
+                        "(needed for live camo switching; bigger, shader-only)")
+    p.add_argument("--bake-size", type=int, default=0, metavar="PX",
+                   help="max edge of baked textures (default: 0 = materialIdMap native size)")
+    p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
+                   help="export emissive = baseColor x _mg.B (default off: B is a "
+                        "continuous channel on live assets, not a clean mask)")
+    p.add_argument("--no-emissive", dest="emissive", action="store_false",
+                   help="skip emissive (default)")
     p.add_argument("--texture-size", type=int, default=1024,
                    help="max texture dimension in pixels (default: 1024)")
     p.add_argument("--lod", type=int, default=2,

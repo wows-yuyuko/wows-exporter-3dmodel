@@ -35,6 +35,10 @@
     # 贴图分辨率 / LOD 可调（默认 1024 像素 / LOD2；--lod -1 回到 LOD0 高模）
     python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --texture-size 2048 --lod -1
 
+    # Lesta INDEXED 材质（视觉 2.0）默认烘成 baseColor/normal/MR，标准查看器直接可看；
+    # 需要实时换涂装（原始图集 + 6 数组）时加 --no-bake-indexed
+    python cli.py ship --game D:\Games\Korabli --ship PBSD511_Waterloo --out out --no-bake-indexed
+
 产物：
 
     geometry/<key>.glb            渲染模型
