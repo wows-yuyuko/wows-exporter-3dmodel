@@ -16,6 +16,7 @@
 | mat 皮肤 | 完成 |
 | model 皮肤导出 | 完成 |
 | INDEXED 数组 + atlas + materialIdMap + artMap | 完成 |
+| INDEXED → 标准 PBR 烘焙 | 完成，**默认开启**（`--no-bake-indexed` 关闭） |
 | three.js 示例 | 完成 |
 | skipped_textures | 0 |
 | 白色主题 / 水下光照黑块 | 已修 |
@@ -26,7 +27,7 @@
 | 增量导出 | 未实现 |
 | batch 启动性能 | 每船重新加载 DB |
 | 数据库体积 | game_data 已精简（318→157 MB）；assets_data 待精简（619 MB） |
-| 自动化测试 / CI / NOTICE | 未做 |
+| 自动化测试 / CI / NOTICE | 未做（已有 `tools/ab_render_compare.py` 做 A/B 像素对照） |
 
 ## P0：Waterloo 舰体深色 / 透视块
 
@@ -189,17 +190,31 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 - `manifest.hashes.textures` 只统计 `slots`，INDEXED 船换涂装（artMap）/换图集时指纹不变，
   前端缓存读旧图。改为覆盖 `slots + layers + indexed 图集 + 数组 bin`（`_asset_uris()`）。
   实测 Waterloo：geometry / materials 哈希不变，textures 从 `ac2839a2…` → `f4491ec4…`；
+- 贴图去重键原本是 `id(bytes)`：bytes 被回收后 `id` 会被下一张贴图复用 → 假命中、
+  **静默返回另一张纹理的索引**。现在统一走 `_GlbBuilder._content_key()`（sha1 内容），
+  `_texture_cache` / `_array_texture_cache` / `_bake_cache` 全部换键；`id` 只用于跳过
+  重复哈希（缓存同时持 bytes 引用防 id 复用，按 96 MB 预算 FIFO 淘汰，命中时校验
+  `hit[0] is data`）。回归：`probe_p02.py` 5 passed；
 - `GeometryService.load_ship` docstring 写 `lod=-1` 默认，实际签名是 `2`（导出默认 LOD2）；
+- INDEXED 涂装叠加层在页面里**永远不生效**：`threejs-example.html` 的
+  `am = clamp(art.a * rot.y, 0, 1)` 取的是 `rotationMatIdArr.y`，实测该列恒 0，
+  真正的强度在 `artStrengthMatIdArr.x`（洋红占位时被置 0 的也是这一列）。
+  已改绑 `uArtStr`；`docs/tech/common/05-materials-textures.md` 里"存在 rotation.y"
+  的旧描述同步纠正。实测 art 贡献不小（Waterloo：平均 |Δ| 5.5/255，23.7% 像素 >8，
+  峰值 150）；
+- 同一处 `uMatIdSize` 写死 `2048×1024`，而 `--texture-size 1024` 导出的 matId 是
+  1024×512 → 四邻域偏移错一倍（材质块边缘串色）。改为读 `materialIdMap` 实际尺寸；
+- INDEXED 材质默认烘成 baseColor/normal/MR（`--no-bake-indexed` 关闭）。数值对拍与实测见
+  [todo-backlog.md](todo-backlog.md) P2-1；关闭时才是原始图集数组路线（可实时换涂装）；
 
 ## 测试样本
 
 ```text
 docs/sample/                         默认参数（texture 1024 / LOD2）
-  PBSD511_Waterloo/                    24 MB   Lesta，主 glb 18.0 MiB（已剔除 decal）
+  PBSD511_Waterloo/                    25 MB   Lesta，**烘焙版**（默认输出），主 glb 18.7 MiB
   PJSB018_Yamato_1944/                 93 MB   Lesta，主 glb 17.2 MiB（含 4 套 model skin）
   PJSB018_Yamato_1944_WG/             256 MB   WG，主 glb 22.8 MiB（含 8 套 model skin
                                                + before.glb 37.2 MiB，剔除 crack 前的对照件）
-  PBSD511_Waterloo_before_array_fix/   23 MB   修复前的 Waterloo（无 artMap），对照用，可删
 ```
 
 2026-10-26：数组误判修完后三份样本按「复现命令」重导（`--armor --skins`，大和另加

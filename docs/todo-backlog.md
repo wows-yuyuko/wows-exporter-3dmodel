@@ -108,9 +108,9 @@ normalMap 或贴图小于阈值，不受影响。INDEXED 船的 `layers` 恢复
 本仓库没有测试框架（见 known-issues P2 工程化），暂靠上表的人工实测，
 探针脚本留在 `.workbuddy/tmp/probe_dim.py`（未纳入 git）。
 
-### P0-2 贴图去重按 `id(bytes)` —— 假命中会静默串图
+### P0-2 贴图去重按 `id(bytes)` —— 假命中会静默串图 ✅ 已修复（2026-10-27）
 
-**位置**：`export_service.py:465 _GlbBuilder.add_texture_from_dds()`
+**位置**：`export_service.py _GlbBuilder.add_texture_from_dds()`
 
 ```python
 key = (id(dds_bytes), kind)
@@ -121,17 +121,47 @@ key = (id(dds_bytes), kind)
 专门写了这个坑（"实测阿基坦另有 8 对贴图内容相同但签名不同被漏去重，其中一对
 各 20 MB"），我们是同一类实现。
 
-**做法**：键改成内容签名 —— `(len(dds), hashlib.sha1(dds).digest(), kind)`；
-`dds` 动辄几 MB，`sha1` 一次几十毫秒可接受，或先取 `(len, 首尾 4KB)` 做粗筛。
+**修复**：新增 `_GlbBuilder._content_key()`，键改为 **sha1(内容)**：
 
-**验收**：同一船连续导两次，贴图文件数与 manifest 引用数一致；随机抽 5 个材质
-把 GLB 里的 image 与源 DDS 解码后逐像素比对（MAE ≤ 2/255）。
+- `_texture_cache`：`(sha1(dds), kind)`（原来是 `(id(dds), kind)`）
+- `_array_texture_cache`：`sha1(dds)`（原来是 `id(dds)`）
+- `_bake_cache`：`(sha1(materialIdMap), bake_size)`（原来带 `id(indexed_params)`，
+  同一类隐患：`ip` 被回收后 id 复用 → 两个不同材质共用一份烘焙结果）
+
+`id` 仍留着，但只用来**跳过重复哈希**（贴图动辄几 MB，每网格重算 sha1 会慢到
+不可用）：缓存里同时存 `(bytes, sha1)`，**持有对象引用**，对象活着 `id` 就不会
+被复用；命中时再校验 `hit[0] is data`。上限 512 条，超了整体清空重算
+（不影响正确性）。
+
+**验收**（`probe_p02.py`，5 passed / 0 failed）：
+
+| 断言 | 结果 |
+|---|---|
+| 内容相同、对象不同 → 命中同一纹理 | PASS（idx 0/0） |
+| 人为塞一条指向别的对象的陈旧 id 条目 → 不被命中，重算 | PASS |
+| 缓存持有 bytes 引用（`hit[0] is data`） | PASS |
+| 数组纹理：内容相同→同一结果 / 内容不同→不同结果 | PASS / PASS |
+
+真实导出（Waterloo 默认烘焙版，3m46s）：
+
+| 指标 | 结果 |
+|---|---|
+| manifest 引用 / 磁盘文件 | 64 / 64（孤儿 0、缺失 0） |
+| 同内容不同文件名的贴图 | 0 张 |
+| 烘焙缓存 | 11 MISS / 639 hit（同一材质被上百个网格共用） |
+| 材质数 | 24（旧 31：wire/pinst 等变体烘焙结果完全相同的被合并，网格数 731 不变） |
+| GLB | 18.71 MiB（旧 18.72 MiB） |
+
+**注意一个连带修正**：烘焙缓存键一开始只用了 `materialIdMap` 的哈希，结果把
+「共用 mask 但图集/LUT 不同」的材质合并了（烘焙数 17 → 11 里混着真合并且误合并）。
+已改为 `_material_identity()`：mask + albedo/normal/mg 图集 + artMap + 6 组 LUT
+的**全量**内容哈希 —— 烘焙的全部输入都进身份，才不会串图。
 
 ---
 
 ## 三、P1：保真度 / 数据正确性
 
-### P1-1 自发光通道 `_mg.B` 完全没导出
+### P1-1 自发光通道 `_mg.B` 完全没导出 🔶 已实现但默认关闭（2026-10-27）
 
 参考 `New_function_of_d3d11_renderer.md` §5.4 定版语义：
 
@@ -150,6 +180,26 @@ key = (id(dds_bytes), kind)
 
 **验收**：`PBSD511_Waterloo` 的舱室窗/航行灯在 three.js 里自发光（关掉环境光仍可见）。
 
+#### 实测结论（2026-10-27）：B 不是干净的掩码，默认关闭
+
+已实现 `_emissive_texture()`（`底色 × _mg.B`，linear 空间相乘、输出 sRGB 贴图，
+`emissiveFactor=[1,1,1]`）+ `--emissive` 开关。**但实测数据不支持「B=emissive」**：
+
+| 对象 | `_mg.B` 分布 |
+|---|---|
+| 船体 `JSB039_Yamato_1945_Hull_mg` | 0.47 的像素 < 0.05，0.23 落在 0.9–1.0（连续分布） |
+| `JM032_Electric_Deck_Winch` | 0.67 落在 0.6–0.9、0.28 落在 0.9–1.0 |
+| `JM010_Deck_Lamp` | 0.53 落在 0.9–1.0（像灯） |
+| `JM124_Signal_Lamp_2` | **全 0**（信号灯反而不发光） |
+
+按掩码绑上去，船体自发光亮度是底色的 **52%**（DeckHouse 24%），整船会被抬成半自发光、
+丢阴影层次；而真正的信号灯是 0。所以判定：**B 更像「反射/高光强度」之类的连续通道**，
+参考文档 §5.4 的「B=emissive」在本批资产上不成立。
+
+处理：`--emissive` 保留为**可选**（默认关），需要时能一键试；语义确认后再改默认。
+ARP 大和（`PJSB700_ARP_Yamato`）也不靠这条通道发光——它的两套 ARP 皮肤
+（`PJES340` / `PJES512`，model skin）才是涂装差异来源，`--skins` 对它返回 0 条。
+
 ### P1-2 `--skins` 对 INDEXED 船体只导纹理，不导数组覆盖
 
 参考 `New_function_of_camo_switcher.md` §2.1 的 P-A3：**tint / artStrength 是否随
@@ -166,7 +216,19 @@ separately" —— **没有别处处理**。结果：INDEXED 船体换涂装时�
 **做法**：先做 P1-3 的探针确认真实数据行为，再决定皮肤 json 是否加
 `indexed_overrides: { artMapLayer, artStrength, tint }`。
 
-### P1-3 涂装数据探针（参考的 P0 清单，直接可用）
+**实测结论（2026-10-27，见 [camo-probe.md](camo-probe.md)）：P1-2 降级为「不做」**。
+同船所有 INDEXED mfm 的 6 组数组哈希完全一致，DB 里没有 camo 专属数组可覆盖；
+涂装真正能覆盖的是 **artMap 贴图 + color scheme**，而 `--skins` 现在导出的是按部件的
+diffuse 替换，对 INDEXED 船体没有对应槽位。若将来要做「INDEXED 换涂装图案」，
+正确形状是给 skin json 加 `indexed: {artMap, artStrength, tint}` 并由前端替换
+`layers.artMap`（且与默认开启的烘焙互斥，需重烘）。
+
+### P1-3 涂装数据探针（参考的 P0 清单，直接可用）✅ 已完成（2026-10-27）
+
+报告：[camo-probe.md](camo-probe.md)。要点：涂装是**按部件换贴图**，DB 里没有
+camo 专属的 INDEXED 材质，同船所有 INDEXED mfm 的数组哈希完全一致 —— 所以
+「换涂装时 tint/artStrength 会变」不成立。
+
 
 | 编号 | 问题 | 为什么要它 |
 |---|---|---|
@@ -180,7 +242,7 @@ separately" —— **没有别处处理**。结果：INDEXED 船体换涂装时�
 **产出**：`docs/` 下一份探针报告（可直接查 `assets_data.db` 的 `material_full` /
 `camouflages`，不需要开客户端）。
 
-### P1-4 wire 网格（栏杆 / 索具 / 天线）完全不导出
+### P1-4 wire 网格（栏杆 / 索具 / 天线）完全不导出 ❌ 实测不成立（2026-10-27）
 
 `export_service.py:1077`：
 
@@ -200,7 +262,20 @@ Blender / three.js 都能显示。现在 Waterloo 甲板栏杆、拉索全没了
 
 **验收**：`?debug=wire` 下栏杆可见，且不与船体重叠闪烁。
 
-### P1-5 导出验收缺一条硬标准
+#### 实测结论：没有丢，导出的就是薄三角形
+
+- 判定条件是 `hm.is_wire = (mat == '__wire__' or mat == 'WIRE')`，而现网资产用的是
+  `TL2_SHIPWIRE_*` 命名 → **不会命中**，这些网格一直按普通三角面导出；
+- WG 大和有 6 个 `TL2_SHIPWIRE_PBS_Hull` 网格（3422/547/2178/4169 顶点等），
+  实测**退化三角形占比 0.000**，面积均值 6e-5 ~ 4e-4 m²（0.06–0.4 mm²）——是薄带，
+  不是 line list；截图里也能看到桅索；
+- Waterloo（Lesta 2.0）在 LOD0/LOD2 都**没有** wire 网格（366 个网格里 0 个）。
+
+所以 P1-4 的「栏杆/索具完全没导出」不成立（应是旧版本现象）。真要更锐利可以后续
+把 `*WIRE*` 识别出来改导 `LINES`，但当前薄带已经能看，且改 LINES 会丢掉 UV/材质，
+收益不大 —— 先不动。
+
+### P1-5 导出验收缺一条硬标准 ✅ 已完成（2026-10-27）
 
 参考 `d3d11_renderer.md` §7.4（渲染行为锁定表）+ §7.5（A/B 像素规范：
 
@@ -215,27 +290,74 @@ Blender / three.js 都能显示。现在 Waterloo 甲板栏杆、拉索全没了
 | decal 剔除前 / 后（`--decals`） | 只少贴花片，船体不变化 |
 | `--lod 0` / `--lod 2` | 轮廓不塌陷（Bow/Stern 面数保护生效） |
 
+#### 实现：`tools/ab_render_compare.py`
+
+无头 Chrome + CDP 打开两个 URL（各自等「mapped」+ 网络静默 2 秒再截），出
+`a.png` / `b.png` / `diff.png` 并给判定：
+
+- **MAE ≤ 2/255** 且 **显著差异像素（|Δ|>24）≤ 0.5%** 才算一致
+- 只看 MAE 不够：贴花消失这类变化面积小、MAE 很低（实测换 4° 机位 MAE 才 1.55，
+  但显著差异像素 1.68%）→ 必须叠第二条判据
+- 「预期会变」的对照加 `--expect-change`：只出报告与 diff，不判 PASS/FAIL
+
+自校验：A=B 时 MAE 0.000 / 显著差异 0.000% → PASS；把 `pitch` 从 -22 改成 -18
+→ MAE 1.551 / 显著差异 1.68% → FAIL（脚本对几何级差异敏感）。
+
+用法：
+
+```bash
+python tools/ab_render_compare.py \
+  --a "http://127.0.0.1:8767/threejs-example.html?ship=X&root=sample/X_before/&zoom=1.8&yaw=90&pitch=-22" \
+  --b "http://127.0.0.1:8767/threejs-example.html?ship=X&root=sample/X/&zoom=1.8&yaw=90&pitch=-22" \
+  --out .workbuddy/tmp/ab_lod
+```
+
+依赖 `websocket-client`（`pip install websocket-client`）+ 本机 Chrome/Edge。
+三组真实对照（damage / decals / lod）需要先各导一份变体，尚未跑。
+
 ---
 
 ## 四、P2：能力与性能（按需推进）
 
-### P2-1 INDEXED → 标准 PBR 烘焙（`--bake-indexed`）
+### P2-1 INDEXED → 标准 PBR 烘焙（`--bake-indexed`）✅ 已实现（2026-10-27）
 
 这是参考文档 P2 的核心诉求：**让 Blender 打开就能看到正确颜色**。我方走的是
 "图集 + 6 数组 + 自带 shader"路线，代价是：**INDEXED 船体在标准 glTF 查看器里没有
 baseColor**。实测 Waterloo 15 个材质，唯一 `baseColorTexture` 为空的就是
 `TL2_SHIPMAT_INDEXED_PBS_Hull`。
 
-烘焙规则（与页面 shader 必须一致，否则"看到的 ≠ 导出的"）：
+落地：`services/indexed_bake.py` + `GlbRenderOptions.bake_indexed / bake_size`
++ `--bake-indexed / --bake-size`。**默认开启**（2026-10-27 用户要求「以后默认给烘焙版」），
+`--no-bake-indexed` 回到图集数组路线。
+
+**不需要光栅化** —— shader 的每个输入都只是 `vUv` 的函数，烘焙就是 UV 栅格上的逐像素
+运算，分辨率任意。
 
 | 输出 | 来源 |
 |---|---|
-| baseColor | `albedoArray[tileIdx.x]`（经 offsetScale+rotation 变换）→ tint 混合（用 `albedoToRemoveTintMatIdArr` 算权重）→ artMap 叠加（`art.a × artStrength`） |
-| normal | `normalArray[tileIdx.y]` + `_alpha_n` 叠加 |
-| MR | `MGArray[tileIdx.z]`（G→roughness=1-gloss，R→metallic） |
+| baseColor | `albedoArray[tileIdx.x]`（经 offsetScale+rotation 变换，按 matId 分块）→ tint 混合（`albedoToRemoveTintMatIdArr` 距离 / `albedoTintMatIdArr.w` 阈值）→ artMap 叠加（`art.a × artStrengthMatIdArr.x`） |
+| normal | `normalArray[tileIdx.y]`，保持 XY 补 Z（切线空间） |
+| MR | `MGArray[tileIdx.z]`（G→roughness=1-gloss，B→metallic=F0） |
 
-代价：4096×2048 matId 逐像素 + 30 层图集采样，单船几十秒；输出 2048² 控制体积。
-建议作为**可选开关**，默认仍走 arrays 路线（体积小、可实时换涂装）。
+实测（Waterloo，Lesta）：
+
+- 4096×2048（跟 materialIdMap 原生一致）**12.9 s**；`--bake-size 1024` → 1024×512 **3.0 s**；
+- 数值对拍：GLSL 字面标量实现 vs 向量化烘焙，4000 随机像素 **max |Δ| = 1/255**（100% 落在 ≤2）；
+- 导出：17 个 INDEXED 材质全部变 `mode: "pbs"`，GLB 18.72 MiB（arrays 版 18.02 MiB）；
+- 页面 A/B：烘焙版与图集版结构一致（迷彩带/甲板/水线），烘焙版是标准 PBR 光照。
+
+坑与差异：
+
+- **art 强度必须取 `artStrengthMatIdArr.x`**（实测恒 1.0）。技术文档原先写"存在
+  `rotationMatIdArr.y`"是被 `threejs-example.html` 的错误实现带偏的 —— 实测
+  `rotation.y` 恒 0，照它算 art 永远不叠加。示例页已改，并顺带把写死的
+  `uMatIdSize=2048×1024` 改成读实际图像尺寸（`--texture-size 1024` 下 matId 是
+  1024×512，写死会让四邻域偏移错一倍）。
+- **ID 图不能插值**：materialIdMap 缩放必须最近邻；
+- **mip 要按采样密度选**：38 次平铺下一个输出像素跨约 9.5 个源纹素，
+  直接采 1024² 原图会摩尔纹；
+- 法线只能输出切线空间（shader 里是 `normalize(vN + ntex.xy*0.6)` 的视图空间近似）；
+- **丢失实时换涂装**（artMap 已混进底色）；`_alpha_n` 法线叠加层仍未参与烘焙。
 
 ### P2-2 decal 的处理策略（当前：默认整片丢弃）
 
