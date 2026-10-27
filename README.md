@@ -39,6 +39,12 @@
     # 需要实时换涂装（原始图集 + 6 数组）时加 --no-bake-indexed
     python cli.py ship --game D:\Games\Korabli --ship PBSD511_Waterloo --out out --no-bake-indexed
 
+    # 联动/PR 船（ARP 大和、星之北风）的本来样子在模型皮肤里 —— 默认 auto 已自动套上；
+    # 想强制原版模型、或指定某一套皮肤：
+    python cli.py ship --server wg --game D:\Games\World_of_Warships       --ship PJSB700_ARP_Yamato --out out\wg            # auto → PJES340（ARP 外观）
+    python cli.py ship --server wg --game D:\Games\World_of_Warships       --ship PJSB700_ARP_Yamato --out out\wg --no-model-skin      # 原版大和
+    python cli.py ship --server wg --game D:\Games\World_of_Warships       --ship PJSB700_ARP_Yamato --out out\wg --model-skin PJES512 # 指定另一套
+
 产物（除 `textures/` 外都按船名分一层目录）：
 
     geometry/<ship>/<ship>.glb            渲染模型（顶点属性已量化，见下）

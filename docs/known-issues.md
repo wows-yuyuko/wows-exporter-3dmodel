@@ -176,16 +176,18 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 
 ```text
 docs/sample/                       一个服务器一个输出根（船 key 同名会互相覆盖）
-  lesta/                          29 MB   Lesta build 8867689
+  lesta/                          34 MB   Lesta build 8867689
     geometry/PBSD511_Waterloo/PBSD511_Waterloo.glb        8.8 MiB（烘焙 + 量化）
     geometry/PJSB018_Yamato_1944/PJSB018_Yamato_1944.glb  8.5 MiB
+    geometry/PJSD889_Kitakaze_PR/PJSD889_Kitakaze_PR.glb  3.9 MiB（--model-skin auto，
+                                                          base_skin = PJES509「星之北风」）
     armor/…  manifests/…           装甲 1.7 MB / manifest 276 KB
-    textures/                     248 张 / 8.1 MB
+    textures/                     396 张 / 9.1 MB
   wg/                             26 MB   WG build 13357625
     geometry/PJSB018_Yamato_1944/PJSB018_Yamato_1944.glb  9.0 MiB
     geometry/PJSB700_ARP_Yamato/PJSB700_ARP_Yamato.glb    9.1 MiB（--model-skin auto，
                                                           base_skin = PJES340）
-    textures/                     273 张 / 5.7 MB
+    textures/                     205 张 / 4.7 MB
 ```
 
 样本用默认参数（`--texture-size 1024 --lod 2`，烘焙开、`--slim` 开），**不含皮肤**

@@ -25,7 +25,7 @@
 [--slim | --no-slim]
 [--texture-size N=1024] [--lod N=2]
 [--merge-shapes | --split-shapes]   # 互斥；默认就是拆分
-[--skins] [--permoflage] [--model-skins] [--model-skin ID|auto]
+[--skins] [--permoflage] [--model-skins] [--model-skin ID|auto|none] [--no-model-skin]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -48,9 +48,11 @@
 | `--skins` | 关 | 导出 mskin/skin 材质皮肤 |
 | `--permoflage` | 关 | 追加永久涂装（需同时给 `--skins`） |
 | `--model-skins` | 关 | 导出换模型皮肤（各一套 GLB） |
-| `--model-skin` | 空 | 把某套**模型皮肤当基准外观**导出（产物仍是 `<ship>.glb`）。
-`auto` = 该船 permoflages 里第一套 model skin。用于 ARP 大和这类「默认模型是原版、
-特殊外观在皮肤里」的船；manifest 会记 `base_skin` |
+| `--model-skin` | **auto** | 把某套**模型皮肤当基准外观**导出（产物仍是 `<ship>.glb`）。
+`auto` = **仅当 `permoflages[0]` 是模型皮肤时才套用那一套**：科技树船（大和/北风）首个是
+Permoflage 涂装 → 保持原版；联动/PR 船（ARP 大和、星之北风 PR）首个就是 Skin → 自动
+还原它本来的样子。manifest 记 `base_skin` |
+| `--no-model-skin` | — | 永不套模型皮肤，直接用 `ship.model`（原版模型） |
 
 `--ship` 既接受 GameParams key（`PJSB018_Yamato_1944`），也接受模型目录名
 （`JSB039_Yamato_1945`），取第一个匹配。
@@ -98,7 +100,7 @@ batch --game DIR --filter TEXT --out DIR [--jobs N=1] [--limit N] [--force]
 batch-worker --game DIR --keys-file FILE --out DIR
              [--no-textures] [--zstd] [--armor] [--damage] [--decals]
              [--texture-size] [--lod] [--skins] [--permoflage]
-             [--model-skins] [--model-skin ID|auto] [--merge-shapes] [--gp]
+             [--model-skins] [--model-skin ID|auto|none] [--no-model-skin] [--merge-shapes] [--gp]
 ```
 
 只为 `batch --jobs` 服务，一般不手跑。**历史坑**：`--skins / --permoflage /
