@@ -213,7 +213,7 @@ http://127.0.0.1:8767/threejs-example.html?ship=PJSB018_Yamato_1944&root=sample/
 Waterloo：
 
 ```bash
-python cli.py ship --game D:\Games\Korabli --ship PBSD511_Waterloo \
+python cli.py ship --server lesta --game D:\Games\Korabli --ship PBSD511_Waterloo \
   --out out/lesta --armor
 ```
 
@@ -227,6 +227,6 @@ python cli.py ship --server wg --game D:\Games\World_of_Warships \
 Lesta 大和：
 
 ```bash
-python cli.py ship --game D:\Games\Korabli --ship PJSB018_Yamato_1944 \
+python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB018_Yamato_1944 \
   --out out/lesta --armor
 ```

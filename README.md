@@ -15,35 +15,41 @@
 
 会生成 data/game_data*.db 和 data/assets_data*.db（挂载/材质用）。
 
+`config.json` 只存两个游戏路径；build 号（`bin/` 下的版本目录）不落盘，每次自动取
+**数字最大**的那个目录，所以客户端更新后不需要改配置。`--server` 必须显式给，没有默认值。
+
 ## 使用
 
     # 列船
-    python cli.py list --game D:\Games\Korabli --filter Yamato
+    python cli.py list --server lesta --game D:\Games\Korabli --filter Yamato
 
     # 单船：渲染 + 装甲 + zst
-    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --armor --zstd
+    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --armor --zstd
 
     # 材质皮肤（默认只导 mskin / skin；加 --permoflage 连同永久涂装）
-    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --skins --permoflage
+    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --skins --permoflage
 
     # 批量（分片并行）
-    python cli.py batch --game D:\Games\Korabli --filter 10 --jobs 2 --out out --armor --zstd --skins
+    python cli.py batch --server lesta --game D:\Games\Korabli --filter 10 --jobs 2 --out out --armor --zstd --skins
 
     # 需要沉没状态的断面几何时加 --damage（默认剔除）
-    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --damage
+    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --damage
 
     # 贴图分辨率 / LOD 可调（默认 1024 像素 / LOD2；--lod -1 回到 LOD0 高模）
-    python cli.py ship --game D:\Games\Korabli --ship PJSB520_Raiju --out out --texture-size 2048 --lod -1
+    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --texture-size 2048 --lod -1
 
     # Lesta INDEXED 材质（视觉 2.0）默认烘成 baseColor/normal/MR，标准查看器直接可看；
     # 需要实时换涂装（原始图集 + 6 数组）时加 --no-bake-indexed
-    python cli.py ship --game D:\Games\Korabli --ship PBSD511_Waterloo --out out --no-bake-indexed
+    python cli.py ship --server lesta --game D:\Games\Korabli --ship PBSD511_Waterloo --out out --no-bake-indexed
 
     # 联动/PR 船（ARP 大和、星之北风）的本来样子在模型皮肤里 —— 默认 auto 已自动套上；
     # 想强制原版模型、或指定某一套皮肤：
-    python cli.py ship --server wg --game D:\Games\World_of_Warships       --ship PJSB700_ARP_Yamato --out out\wg            # auto → PJES340（ARP 外观）
-    python cli.py ship --server wg --game D:\Games\World_of_Warships       --ship PJSB700_ARP_Yamato --out out\wg --no-model-skin      # 原版大和
-    python cli.py ship --server wg --game D:\Games\World_of_Warships       --ship PJSB700_ARP_Yamato --out out\wg --model-skin PJES512 # 指定另一套
+    python cli.py ship --server wg --game D:\Games\World_of_Warships \
+      --ship PJSB700_ARP_Yamato --out out\wg                        # auto → PJES340（ARP 外观）
+    python cli.py ship --server wg --game D:\Games\World_of_Warships \
+      --ship PJSB700_ARP_Yamato --out out\wg --no-model-skin        # 原版大和
+    python cli.py ship --server wg --game D:\Games\World_of_Warships \
+      --ship PJSB700_ARP_Yamato --out out\wg --model-skin PJES512   # 指定另一套
 
 产物（除 `textures/` 外都按船名分一层目录）：
 

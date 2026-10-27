@@ -19,10 +19,10 @@ from core.gameparams import ships as gp_ships  # noqa: E402
 
 def _auto_extract(game: Path, server: str) -> Path:
     from data_extractor import GameExtractor
-    bins = sorted(p.name for p in (game / "bin").iterdir() if p.is_dir())
-    if not bins:
+    build = _latest_bin(game)
+    if not build:
         raise SystemExit("no game build under %s/bin" % game)
-    ex = GameExtractor(str(game), bin_folder=bins[-1])
+    ex = GameExtractor(str(game), bin_folder=build)
     try:
         entries = [e for e in ex.list_files(["content/GameParams*.data"]) if not e.is_directory]
         if not entries:
@@ -55,6 +55,19 @@ def cmd_list(args):
         print("%s\t%s\tT%d\t%s" % (ship.key, ship.model_folder, ship.tier, ship.nation))
 
 
+def _latest_bin(game: Path) -> str:
+    """`<game>/bin` 下**数字最大**的目录名（客户端版本号）。
+
+    不能用字符串排序：`8867689` 与 `999999` 这类会按字典序排错，且旧版本里
+    可能存在非数字目录（如 `tmp`）。没有数字目录时返回空串。
+    """
+    bin_root = game / "bin"
+    if not bin_root.is_dir():
+        return ""
+    nums = [p.name for p in bin_root.iterdir() if p.is_dir() and p.name.isdigit()]
+    return max(nums, key=int) if nums else ""
+
+
 def _bootstrap(game: Path, server: str):
     from app.application import app
     if server == "lesta":
@@ -66,8 +79,7 @@ def _bootstrap(game: Path, server: str):
     from core.build_info import imported_build
     build = imported_build(server)
     if not build or not (game / "bin" / build).is_dir():
-        bins = sorted(p.name for p in (game / "bin").iterdir() if p.is_dir())
-        build = bins[-1] if bins else ""
+        build = _latest_bin(game)
     app.config.bin_folder = build
     return app
 
@@ -328,6 +340,7 @@ def cmd_batch(args):
         subprocess.run([sys.executable, str(Path(__file__).resolve()), "export-keys",
                         "--game", str(args.game), "--server", args.server,
                         "--filter", args.filter, "--out", str(keys_file)]
+                       + (["--limit", str(args.limit)] if args.limit else [])
                        + (["--gp", args.gp] if args.gp else []), check=True)
         keys = keys_file.read_text(encoding="utf-8").splitlines()
         # 并行分支同样吃增量指纹：先剔掉签名一致的，跑完再按产物登记
@@ -385,8 +398,7 @@ def cmd_import(args):
     data_dir.mkdir(parents=True, exist_ok=True)
     gp_src = _gameparams_path(Path(args.game), args.server, args.gp)
     shutil.copy2(gp_src, data_dir / gp_src.name)
-    bins = sorted((Path(args.game) / "bin").iterdir()) if (Path(args.game) / "bin").is_dir() else []
-    bin_folder = args.bin or (bins[-1].name if bins else "")
+    bin_folder = args.bin or _latest_bin(Path(args.game))
     app.config.bin_folder = bin_folder
     app.config.game_version = args.version or bin_folder
     print("importing", gp_src.name, "bin", bin_folder)
@@ -407,6 +419,8 @@ def cmd_import(args):
 
 def cmd_export_keys(args):
     keys = [s.key for s in gp_ships(str(_gameparams_path(Path(args.game), args.server, args.gp)), args.filter)]
+    if getattr(args, "limit", 0):
+        keys = keys[:args.limit]
     Path(args.out).write_text("\n".join(keys), encoding="utf-8")
     print(len(keys), "keys ->", args.out)
 
@@ -433,14 +447,16 @@ def main(argv=None):
 
     p = sub.add_parser("list")
     p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), default="lesta")
+    p.add_argument("--server", choices=("lesta", "wg"), required=True,
+                   help="which client the --game path points at (no default)")
     p.add_argument("--filter", default="")
     p.add_argument("--gp", default=None, help="explicit GameParams file")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("ship")
     p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), default="lesta")
+    p.add_argument("--server", choices=("lesta", "wg"), required=True,
+                   help="which client the --game path points at (no default)")
     p.add_argument("--ship", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--no-textures", action="store_true")
@@ -493,7 +509,8 @@ def main(argv=None):
 
     p = sub.add_parser("import")
     p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), default="lesta")
+    p.add_argument("--server", choices=("lesta", "wg"), required=True,
+                   help="which client the --game path points at (no default)")
     p.add_argument("--gp", default=None)
     p.add_argument("--bin", default=None)
     p.add_argument("--version", default=None)
@@ -501,7 +518,8 @@ def main(argv=None):
 
     p = sub.add_parser("batch")
     p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), default="lesta")
+    p.add_argument("--server", choices=("lesta", "wg"), required=True,
+                   help="which client the --game path points at (no default)")
     p.add_argument("--filter", default="")
     p.add_argument("--out", required=True)
     p.add_argument("--no-textures", action="store_true")
@@ -552,15 +570,18 @@ def main(argv=None):
 
     p = sub.add_parser("export-keys")
     p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), default="lesta")
+    p.add_argument("--server", choices=("lesta", "wg"), required=True,
+                   help="which client the --game path points at (no default)")
     p.add_argument("--filter", default="")
     p.add_argument("--out", required=True)
+    p.add_argument("--limit", type=int, default=0)
     p.add_argument("--gp", default=None)
     p.set_defaults(func=cmd_export_keys)
 
     p = sub.add_parser("batch-worker")
     p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), default="lesta")
+    p.add_argument("--server", choices=("lesta", "wg"), required=True,
+                   help="which client the --game path points at (no default)")
     p.add_argument("--keys-file", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--no-textures", action="store_true")

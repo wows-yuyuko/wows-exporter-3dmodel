@@ -171,7 +171,10 @@ def detect_wows_type(game_dir) -> str:
     bin_dir = os.path.join(root, "bin")
     if os.path.isdir(bin_dir):
         try:
-            for sub in sorted(os.listdir(bin_dir), reverse=True):
+            # 与 find_latest_bin_folder 同口径：只认数字目录、按数值从新到旧
+            subs = [f for f in os.listdir(bin_dir)
+                    if f.isdigit() and os.path.isdir(os.path.join(bin_dir, f))]
+            for sub in sorted(subs, key=int, reverse=True):
                 hit = _probe(os.path.join(bin_dir, sub, "bin64"))
                 if hit:
                     return hit

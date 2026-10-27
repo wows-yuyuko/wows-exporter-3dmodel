@@ -39,7 +39,7 @@ cli.py
 `_bootstrap` 里的 build 解析顺序（`cli.py:58-73`）：
 
 1. `core.build_info.imported_build(server)` 读 `game_data*.db` 的 `meta_import_state`；
-2. 该目录不存在时，退到 `bin/` 下**字典序最后一个**目录。
+2. 该目录不存在时，退到 `bin/` 下**数字最大**的目录。
 
 > 第 2 步是坑：客户端更新后 `bin/` 会多出新目录，而库里的 build 是旧的
 > （WG 现况：库 13488861、实际 13187581 / 13357625）。`assets_data*.db` 的
