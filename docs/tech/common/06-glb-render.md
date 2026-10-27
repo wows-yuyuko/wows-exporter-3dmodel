@@ -112,13 +112,27 @@ Scene Root                                wows_export_version = 5
 
 ## 6. 顶点属性
 
-| 属性 | 说明 |
-|---|---|
-| `POSITION` / `NORMAL` | f32×3 |
-| `TEXCOORD_0` | f32×2（主 UV） |
-| `TEXCOORD_1` | 格式含第二套 UV 时 |
-| `TANGENT` | 格式含 `tb` 时（f32×4，W 由法线×切线×副法线符号算出） |
-| `_T4` / `_EXTRA` | 原始 4 字节按 VEC4 uint8 原样保留（glTF 无语义，供追溯） |
+默认 `--slim`（`GlbRenderOptions.slim_attributes`）走 `KHR_mesh_quantization`：
+
+| 属性 | 默认（slim） | `--no-slim` | 说明 |
+|---|---|---|---|
+| `POSITION` | u16×3（归一化） | f32×3 | 按**图元 AABB** 量化，还原变换折进该网格的节点矩阵 |
+| `NORMAL` | i8×3（归一化，`byteStride=4`） | f32×3 | 着色器会归一化，实际方向误差 ≈0.05° |
+| `TEXCOORD_0` | u16×2（UV 全在 [0,1] 时） | f32×2 | 超出 [0,1]（平铺）自动退回 f32 |
+| `TEXCOORD_1` | **丢弃** | f32×2 | 前端/Blender 都不读 |
+| `TANGENT` | **丢弃** | f32×4 | three.js 用屏幕空间导数算 TBN |
+| `_T4` / `_EXTRA` | **丢弃** | VEC4 u8 | 无语义，没人读 |
+| `JOINTS_0` / `WEIGHTS_0` | u8×4 / f32×4 | 同 | 蒙皮必需；**蒙皮网格不做位置量化**（glTF 的蒙皮结果在世界空间，节点变换被忽略） |
+
+实测（Waterloo，297,425 tri / 364,492 顶点）：
+
+| | 属性合计 | GLB |
+|---|---|---|
+| `--no-slim` | 17.1 MiB（60.1 B/tri） | 18.6 MiB |
+| 默认 | **7.25 MiB（25.6 B/tri）** | **8.8 MiB（-53%）** |
+
+精度：位置往返最大误差 1.5 mm（199 m 范围，等于 1 LSB）；法线方向误差
+（归一化后）最大 0.05°；同机位 A/B 像素对照 MAE **0.11/255**、显著差异 0.005%。
 
 ## 7. 跳过规则与统计
 

@@ -39,16 +39,24 @@
     # 需要实时换涂装（原始图集 + 6 数组）时加 --no-bake-indexed
     python cli.py ship --game D:\Games\Korabli --ship PBSD511_Waterloo --out out --no-bake-indexed
 
-产物：
+产物（除 `textures/` 外都按船名分一层目录）：
 
-    geometry/<key>.glb            渲染模型
-    geometry/<key>.glb.zst
-    armor/<key>.glb               装甲模型（可选预览）
-    armor/<key>.glb.zst
-    armor/<key>.json              装甲板块数据（zone/material/thickness/component/bounds）
-    armor/<key>.bin               装甲三角形（positions/normals/plate_ids）
-    manifests/<key>.json          materials / meshes / skins / hashes
-    textures/<sha1>.webp          外置贴图（去重；geometry.glb 内不再嵌图）
+    geometry/<ship>/<ship>.glb            渲染模型（顶点属性已量化，见下）
+    geometry/<ship>/<ship>.glb.zst
+    geometry/<ship>/<ship>__<skin>.glb    模型皮肤（仅 --skins / --model-skins）
+    armor/<ship>/<ship>.glb               装甲模型（可选预览）
+    armor/<ship>/<ship>.glb.zst
+    armor/<ship>/<ship>.json              装甲板块数据（zone/material/thickness/component/bounds）
+    armor/<ship>/<ship>.bin               装甲三角形（positions/normals/plate_ids）
+    manifests/<ship>/<ship>.json          materials / meshes / skins / hashes
+    manifests/<ship>/<ship>__<skin>.json
+    skins/<ship>/*.json                   皮肤元数据（仅 --skins / --model-skins）
+    textures/<sha1>.webp                  外置贴图（扁平、按内容哈希去重、跨船共享）
+
+`--slim`（默认开）把顶点属性量化成 glTF 扩展 `KHR_mesh_quantization`：索引 u16、
+法线 i8、UV u16、位置 u16（按图元 AABB 量化 + 节点变换还原），并丢掉没人读的
+`_T4` / `TEXCOORD_1` / `TANGENT`。实测 Waterloo 的 GLB 18.7 → 8.8 MiB（-53%），
+画面 A/B 对照 MAE 0.11/255。需要原始 float 顶点时加 `--no-slim`。
 
 ## 说明
 

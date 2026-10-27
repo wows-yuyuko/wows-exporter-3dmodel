@@ -21,59 +21,13 @@
 | skipped_textures | 0 |
 | 白色主题 / 水下光照黑块 | 已修 |
 | 破损断面几何（`*_crack_*`） | 已修：默认剔除，`--damage` 恢复 |
-| 舰体深色/透视块 | 未解决 |
+| 舰体深色/透视块 | 已解决（2026-10-27） |
 | 颜色还原 | 偏灰，未对齐游戏 |
 | 贴图格式 | WebP（定稿，不做 KTX2） |
 | 增量导出 | 未实现 |
 | batch 启动性能 | 每船重新加载 DB |
 | 数据库体积 | game_data 已精简（318→157 MB）；assets_data 待精简（619 MB） |
 | 自动化测试 / CI / NOTICE | 未做（已有 `tools/ab_render_compare.py` 做 A/B 像素对照） |
-
-## P0：Waterloo 舰体深色 / 透视块
-
-### 现象
-
-- `PBSD511_Waterloo` 舰体侧面有一块深色/像透明洞的区域；
-- 近看仍能看到纹理，不是完全空白；
-- 其他船水下区域也曾出现类似黑块。
-
-### 已排除
-
-- 不是背景透出（背景白色，洞应该是白色）；
-- 不是 alphaMode（manifest 全部 OPAQUE）；
-- 不是 AO / 法线 / UV；
-- 不是合并 hull 后的缺面（已回退到分段导出，问题仍在）。
-
-### 当前判断
-
-- 更可能是 Hull albedo 中黑色占位区，或 camo/colorScheme mask；
-- 也可能是分段边界重叠面在同一位置反复遮挡，视觉上像透明；
-- **2026-10-26 补：只在 Lesta 客户端「视觉 2.0」的船上出现**——即 Lesta 的
-  **INDEXED 材质体系**（`TL2_SHIPMAT_INDEXED_PBS_*`），WG 侧目前没有这套。
-  INDEXED 船体只有分段外壳（Bow/MidFront/…），内部空腔没有任何遮挡，
-  从船首视角会一路看穿到船尾（能看到尾部螺旋桨）。游戏另有一个 `Full_*` 低模
-  （整船封闭体，通常只有 LOD4 一份）负责挡这条视线。
-
-### 试过但已回退：`Full_*` 当内部遮挡体
-
-思路是把主 geometry 的 `Full_*` 一起导出当作遮挡体。试过三种做法，都不成立：
-
-1. **直接导出** —— `Full_lod4` 在平坦处比分段外壳大，且 UV 是远景那套，
-   结果整船被深色多边形盖住（涂装消失）；
-2. **沿法线内缩 0.12** —— 仍然露出大半，LOD4 与 LOD2 外壳的偏差不止这个量级；
-3. **单面材质 + 反绕序**（本意「从外看不见、从内挡视线」）—— 几何上有效，
-   但 `docs/threejs-example.html` 把所有材质强制改成了 `THREE.DoubleSide`，
-   把单面设置覆盖掉了；换任何同样强制的查看器都会失效。
-
-已全部撤回，导出回到只含分段外壳的干净版本。真要解决得在前端做（尊重 GLB
-的 `doubleSided`、或限制相机/用背面剔除渲染遮挡体），不在导出侧。
-
-### 下一步
-
-- crack 断面面已在导出时默认剔除，先重导一份排除该因素；
-- 按材质名逐个隐藏，定位覆盖该区域的 mesh/material；
-- 检查该 material 的 albedo 在对应 UV 区域是否本来就是黑色；
-- 如果是 colorScheme mask，需要导出默认涂装或烘焙。
 
 ## P1：颜色还原
 
@@ -91,21 +45,20 @@
 - PBS 的 composite/artMap 叠加公式需要完整实现；
 - INDEXED 的 tint/remove/art 强度需要校准。
 
-## P1：增量导出
+## P1：增量导出 ✅ 已实现（2026-10-27）
 
-尚未实现：
+`services/export_index.py` + `<out>/.export_index.json`：签名 =
+`sha1(server | build | ship | lod | texture_size | 开关集合)`，签名一致且产物存在才跳过。
+实测同参数复跑 3m14s → **2.3 s**，改参数会重导。
 
-- 没有 `data/export_manifest.db`；
-- 没有单船 geom_fp / tex_fp / skin_fp；
-- `batch` 目前只按“文件是否存在”跳过；
-- 没有把 assets.bin / GameParams / build 变化作为总闸。
+仍是**输入级**增量：签名只含 build 与参数，不含产物内容哈希。要「资产变了也能感知」
+还需把 geom/tex 指纹写进 manifest 再比对（未做）。
 
-## P1：batch 性能
+## P1：batch 性能 ✅ 已实现（2026-10-27）
 
-- 每艘船都是独立 Python 进程；
-- 每次都重新加载 GameParams、DB、VFS 索引；
-- 四艘串行导出需要数分钟到十几分钟；
-- 可在同一进程内批量导出，省掉重复初始化。
+- ~~每艘船都是独立 Python 进程~~ → `--jobs 1`（默认）改走 `batch-worker`，
+  一个进程跑完整批，GameParams / DB 只初始化一次；`--jobs 0` 保留旧的每船子进程；
+- 每次加载仍会重开 VFS 索引（按船必需），但不再重复 bootstrap。
 
 ## P1：数据库精简（剩余）
 
@@ -155,11 +108,23 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 
 - 没有自动化测试 / CI；
 - 没有 NOTICE（kraken.py 为 GPLv3）；
-- `docs/sample` 约 111 MB，未纳入 git（.gitignore 已忽略）；
+- `docs/sample` 约 43 MB，未纳入 git（.gitignore 已忽略）；
 - 文档中的样本清单需要随导出更新。
 
 ## 已修复（备查）
 
+- 顶点属性不压缩：GLB 里 POSITION/NORMAL 全 f32、索引全 u32，还带着没人读的
+  `_T4` / `TEXCOORD_1` / `TANGENT`（Waterloo 属性合计 17.1 MiB / 60.1 B/tri）。
+  现在默认 `--slim` 走 `KHR_mesh_quantization`：位置 u16（按图元 AABB + 节点矩阵还原）、
+  法线 i8、UV u16、索引 u16，并丢掉上述属性 → 7.25 MiB / 25.6 B/tri，**GLB 18.7 → 8.8 MiB**；
+  位置往返误差 1.5 mm、法线方向误差 0.05°、同机位 A/B MAE 0.11/255。`--no-slim` 可退回；
+- 输出目录扁平：`geometry/<ship>.glb`、`manifests/<ship>.json`… 多船混在一起，
+  与设计文档的 `web/<server>/<build>/` 也对不上。改为除 `textures/` 外**每类产物一层船名目录**
+  （`geometry/<ship>/<ship>.glb`），GLB 内贴图 URI 变成 `../../textures/…`，manifest 里
+  仍统一用相对输出根的路径；示例页同步改到 `manifests/<ship>/<ship>.json`；
+- 默认导出会写 `skins/<ship>/default.json` 并在 manifest 里列 `skins: ["default"]`，
+  即使根本没要皮肤。现在皮肤**不是默认产物**：只有 `--skins` / `--model-skins` 才写
+  `skins/`，`manifest.skins` 为空数组，页面把皮肤下拉置灰。
 - `exteriors` 表恒为 0 行：入库原本读 `data/split/Exterior/*.json`，而 split 是导入临时产物
   （`keep_split_json=False` 会清）且后台任务与主流程写 split 有竞态，失败还被 `except: pass`
   吞掉 → 每次导出都要现场解 GameParams。改为直接从 GameParams 解析
@@ -210,37 +175,33 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 ## 测试样本
 
 ```text
-docs/sample/                         默认参数（texture 1024 / LOD2）
-  PBSD511_Waterloo/                    25 MB   Lesta，**烘焙版**（默认输出），主 glb 18.7 MiB
-  PJSB018_Yamato_1944/                 93 MB   Lesta，主 glb 17.2 MiB（含 4 套 model skin）
-  PJSB018_Yamato_1944_WG/             256 MB   WG，主 glb 22.8 MiB（含 8 套 model skin
-                                               + before.glb 37.2 MiB，剔除 crack 前的对照件）
+docs/sample/                       一个服务器一个输出根（船 key 同名会互相覆盖）
+  lesta/                          29 MB   Lesta build 8867689
+    geometry/PBSD511_Waterloo/PBSD511_Waterloo.glb        8.8 MiB（烘焙 + 量化）
+    geometry/PJSB018_Yamato_1944/PJSB018_Yamato_1944.glb  8.5 MiB
+    armor/…  manifests/…           装甲 1.7 MB / manifest 276 KB
+    textures/                     248 张 / 8.1 MB
+  wg/                             26 MB   WG build 13357625
+    geometry/PJSB018_Yamato_1944/PJSB018_Yamato_1944.glb  9.0 MiB
+    geometry/PJSB700_ARP_Yamato/PJSB700_ARP_Yamato.glb    9.1 MiB（--model-skin auto，
+                                                          base_skin = PJES340）
+    textures/                     273 张 / 5.7 MB
 ```
 
-2026-10-26：数组误判修完后三份样本按「复现命令」重导（`--armor --skins`，大和另加
-`--model-skins`，因此比旧的「不含皮肤」样本大不少；想要小样本就去掉这两个开关）。
-Waterloo 的 `layers` 恢复 `artMap`（1024×512）+ `materialIdMap`；
-两份大和各多出 2 个材质的 4K 法线（59→61 / 58→60）。
+样本用默认参数（`--texture-size 1024 --lod 2`，烘焙开、`--slim` 开），**不含皮肤**
+（皮肤已改为非默认，需要时加 `--skins` / `--model-skins`）。整套样本 374 MB → **43 MB**：
+一半来自去掉模型皮肤，一半来自顶点属性量化（GLB -53%）。
 
 本地预览：
 
-```powershell
+```text
 cd docs
 python -m http.server 8767
 ```
 
 ```text
-http://127.0.0.1:8767/threejs-example.html?ship=PBSD511_Waterloo&root=sample/PBSD511_Waterloo/
-```
-
-WG 大和新旧对照（`before` 用的是备份的 manifest/glb，`geometry` 字段已指向 `*.before.glb`）：
-
-```text
-# 剔除 crack 后
-http://127.0.0.1:8767/threejs-example.html?ship=PJSB018_Yamato_1944&root=sample/PJSB018_Yamato_1944_WG/
-
-# 剔除前（含断面）
-http://127.0.0.1:8767/threejs-example.html?ship=PJSB018_Yamato_1944.before&root=sample/PJSB018_Yamato_1944_WG/
+http://127.0.0.1:8767/threejs-example.html?ship=PBSD511_Waterloo&root=sample/lesta/
+http://127.0.0.1:8767/threejs-example.html?ship=PJSB018_Yamato_1944&root=sample/wg/
 ```
 
 ## 复现命令
@@ -251,19 +212,19 @@ Waterloo：
 
 ```bash
 python cli.py ship --game D:\Games\Korabli --ship PBSD511_Waterloo \
-  --out out --armor --skins
+  --out out/lesta --armor
 ```
 
 WG 大和：
 
 ```bash
 python cli.py ship --server wg --game D:\Games\World_of_Warships \
-  --ship PJSB018_Yamato_1944 --out out --armor --skins --model-skins
+  --ship PJSB018_Yamato_1944 --out out/wg --armor
 ```
 
 Lesta 大和：
 
 ```bash
 python cli.py ship --game D:\Games\Korabli --ship PJSB018_Yamato_1944 \
-  --out out --armor --skins --model-skins
+  --out out/lesta --armor
 ```

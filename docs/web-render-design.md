@@ -11,20 +11,29 @@ geometry.glb 和 manifest.json **不放进单船目录**，按类型平铺，按
 ~~~
 web/<server>/<build>/
   geometry/
-    PJSB520_Raiju.glb
+    PJSB520_Raiju/
+      PJSB520_Raiju.glb
+      PJSB520_Raiju__camo_01.glb   # 模型皮肤（可选）
   manifests/
-    PJSB520_Raiju.json
+    PJSB520_Raiju/
+      PJSB520_Raiju.json
+      PJSB520_Raiju__camo_01.json
   armor/
-    PJSB520_Raiju.json
-    PJSB520_Raiju.bin          # 可选：装甲三角形二进制
+    PJSB520_Raiju/
+      PJSB520_Raiju.json
+      PJSB520_Raiju.bin            # 可选：装甲三角形二进制
+      PJSB520_Raiju.glb
   textures/
-    <sha1>.webp
-    <sha1>.webp                # 兜底
-  skins/
+    <sha1>.webp                    # 扁平，跨船共享
+  skins/                           # 只在 --skins / --model-skins 时存在
     PJSB520_Raiju/
       default.json
       camo_01.json
 ~~~
+
+除 `textures/` 外，每类产物都按船名分一层目录；manifest 里的路径统一相对
+**输出根**（`geometry/<ship>/<ship>.glb`、`textures/<sha1>.webp`），
+GLB 内部的贴图 URI 则是相对 GLB 的 `../../textures/<sha1>.webp`。
 
 - 每艘船的文件名统一用 GameParams 的 ship key（例如 PJSB520_Raiju），不用显示名；
 - <build> 用 bin 目录名（例如 8867689），换版本后可整体切换/回滚；

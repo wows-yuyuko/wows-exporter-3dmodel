@@ -374,29 +374,98 @@ baseColor**。实测 Waterloo 15 个材质，唯一 `baseColorTexture` 为空的
   查看器侧加 `polygonOffset` / 排序，节点名带 `decal` 便于单独开关；
 - **C**：烘焙进 baseColor（需要把 decal 投影到船体 UV，成本最高，不推荐首版）。
 
-### P2-3 `--model-skins` 每套皮肤重新 `load_ship`
+### P2-8 跨皮肤/跨船的几何复用（内容哈希池）
+
+**实测（WG 大和 10 份皮肤 GLB，逐图元按 attributes+indices 哈希）**：
+
+| | 字节 |
+|---|---|
+| 几何合计 | 214.5 MiB |
+| 去重后唯一（674 个图元） | **69.9 MiB** |
+| 可省 | **144.6 MiB（67%）** |
+
+也就是皮肤之间约 2/3 的几何逐字节相同（炮塔、防空、救生艇、弹射器、飞机），只有
+舰体/涂装部位不同；跨船同理（同一门 127 mm 炮被几十条船引用）。
+
+做法：`geometry/<ship>/` 只放该船独有几何，共用件按
+`sha1(attributes+indices) + build` 落到 `geometry/pool/<sha1>.glb`，manifest 增加
+`parts: [{hash, node, transform, material}]`，前端加载时按 hash 取并缓存（同船多处
+可 `InstancedMesh`）。
+
+前置：跨船命中率还没实测（手上只有 3 条船，且 Lesta/WG build 不同、字节天然不同）；
+建议先写一个「只统计不导出」的探针，在同 build 的 20 条船上量一遍再决定值不值得做。
+
+### P2-3 `--model-skins` 每套皮肤重新 `load_ship` 🔶 已优化 26%（2026-10-27）
 
 实测 8 套换模型皮肤耗时 **3 分 01 秒**，瓶颈是每套都完整加载一次几何
 （与数据源无关）。做法：按 `(ship_key, lod, include_damage)` 缓存 `ShipGeometry`，
 皮肤只替换 mfm / 纹理 / 模型替换节点。预期降到 1 分钟内。
 
-### P2-4 batch 每船重启进程 / 无增量导出
+**实测结论：几何无法复用，只能省「重复解码/编码」**。ARP 大和的 model skin 会换
+`hull_config.model`（`JSB015_Yamato_ARP2020` / `JSB402_Yamato_ARP2024`）以及一批
+`peculiarity_models` / `nodes_config` 挂载模型 —— 几何本身就不一样，缓存 ShipGeometry
+没有意义。于是改成两处缓存：
+
+1. `GeometryService.keep_load_caches()`：皮肤批量导出期间**不清**按路径索引的
+   缓存（贴图字节 / 材质信息 / 挂载模型 / 骨架 / 渲染集），退出时统一清一次。
+   实测单次 load 14.2 s → **8.4 s**；
+2. `export_service._TEXTURE_DISK_CACHE`：`(dds 内容哈希, kind, max_size) → 已落盘文件名`，
+   跨 builder 复用已编码好的 webp。单测：同内容两次导出只编码一次、文件名一致；
+   不同内容仍重新编码。
+
+实测（WG 大和，3 套 model skin，同进程 A/B）：
+
+| | 用时 | 每套 |
+|---|---|---|
+| 关缓存 | 84.9 s | 28.3 s |
+| 开缓存 | 62.7 s | **20.9 s** |
+
+8 套按此推算约 **226 s → 167 s**，**没到「1 分钟内」**：剩下的 20.9 s/套 里
+load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是每套皮肤**独有的**
+贴图编码 + 几何组装，不是重复劳动。要继续压只能并行导出多套（内存换时间），暂不做。
+
+### P2-4 batch 每船重启进程 / 无增量导出 ✅ 已完成（2026-10-27）
 
 已在 [known-issues.md](known-issues.md) 的 P1 里记录（每船重新打开 DB、
 `--force` 只能全量重导）。参考项目无此需求，无参考实现。这里只做交叉引用。
 
-### P2-5 参考页 INDEXED shader 的 5 处近似
+**已落地**：
+
+1. **增量导出**：新增 `services/export_index.py`，在输出目录写
+   `.export_index.json`，键 = 船，值 = 签名
+   `sha1(server | build | ship | lod | texture_size | 开关集合)`。
+   batch 只有当「产物存在 **且** 签名一致」才跳过；任一参数或 build 变了就重导。
+   `--force` 仍然强制全量。实测（Waterloo，Lesta）：
+   | 场景 | 结果 |
+   |---|---|
+   | 首次 | `[ok]` 3m14s |
+   | 同参数再跑 | `[skip]` **2.3 s** |
+   | 加 `--no-textures` | 重导（签名变） |
+   | 改回原参数 | 重导（签名又变回另一组） |
+2. **不再每船重启进程**：`--jobs` 默认 1 现在也走 `batch-worker`（一个进程跑完整批，
+   GameParams / 数据库只初始化一次）；`--jobs 0` 保留旧的「每船一个 `ship` 子进程」。
+   并行分支同样吃增量指纹（先剔掉 unchanged，跑完按产物登记）。
+
+**局限（写清楚免得误用）**：签名只看**输入**（build + 参数），不看产物内容。
+同一 build 内游戏资产若被改动（例如换了个 mod 包但版本号没变），不会自动重导；
+真正的「内容级增量」需要把 geom/tex 指纹写进 manifest 并由 index 比对，暂未做。
+
+### P2-5 参考页 INDEXED shader 的 5 处近似 🔶 已修 3 处（2026-10-27）
 
 `docs/threejs-example.html::indexedShader()`：
 
-1. `uMatIdSize` 写死 `2048×1024`，而 `--texture-size 1024` 导出的 matIdMap 实际是
-   **1024×512** → 四邻采样偏移错一倍（材质块边缘会串色）
-2. 缺 matId 采样前的**噪声抖动 + texel 中心量化**（HLSL 是 `uv*48` 抖动 + `floor(x*size+0.5)`）
-3. 缺 `_alpha_n` 法线叠加层
-4. artMap 未下发（= P0-1）
-5. 光照是手搓近似（`col *= 1.65`、混 6% 白），不是参考的 `pbr_light` / `studio_light`
+1. ✅ `uMatIdSize` 写死 `2048×1024` → 改为读 materialIdMap 实际尺寸
+2. 🔶 texel 中心量化已做（`uv = (floor(vUv*size)+0.5)/size`），matId 贴图改成
+   **NearestFilter**（原来线性过滤会在块边界插出不存在的 id）；**噪声抖动未做**
+   —— 参考文档只写了"缺噪声抖动"，没给公式（`uv*48` 是我们自己的记录，无出处）
+3. ❌ `_alpha_n` 叠加层未做：实测这张 2048×4096 图 RG 像法线 XY，但 **B/A 均值
+   95/86，语义无出处**；照猜混进法线只会更糊，等拿到游戏 shader 再动
+4. ✅ artMap 未下发（= P0-1，已随 P0-1 修复）
+5. ❌ 光照仍是手搓近似（`×1.65` + 混 6% 白）：参考的 `pbr_light` 只有名字没有实现；
+   而且**烘焙默认开启后这条路径只影响 `--no-bake-indexed`**（烘焙材质走
+   MeshStandardMaterial），优先级已降低
 
-### P2-6 判定逻辑分散（技术债，这一轮已经疼过）
+### P2-6 判定逻辑分散（技术债，这一轮已经疼过）✅ 已收敛（2026-10-27）✅ 已收敛（2026-10-27）
 
 `_lod` / `_crack` / `decal` 三套判定现在分散在：
 
@@ -408,12 +477,50 @@ baseColor**。实测 Waterloo 15 个材质，唯一 `baseColorTexture` 为空的
 建议抽 `services/mesh_filters.py`：`shape_lod()` / `is_crack()` / `is_decal()` /
 `is_wire()`，几何层与导出层共用同一份判据。
 
-### P2-7 补 `tools/blender_wows_vertex_groups.py`
+**已落地**：`services/mesh_filters.py`
 
-`export_service.py:33 / :172` 的注释写着"需要顶点组但不要骨架时……再用
-`tools/blender_wows_vertex_groups.py` 还原"，但**本仓库没有 `tools/` 目录**。
+| 判据 | 入口 | 原散落位置 |
+|---|---|---|
+| LOD 级别 + 面数保护 + 辅助几何豁免 | `should_skip_lod(name, lod, levels_by_base, tri_by_base_lod, shape_lod)` | `geometry_service._lod_skip()` 闭包 |
+| 破损断面 | `is_crack_material(mat)` | `mat_key.startswith('__crack__')` |
+| 老式 wire | `is_wire_material(mat)` | `mat in ('__wire__','WIRE')` |
+| 贴花 | `is_decal(obj)` | `export_service._is_decal()` |
+| 辅助几何关键词 | `is_auxiliary_geometry(name)` | `_lod_skip` 里的内联元组 |
+
+回归：Waterloo 重导与重构前**逐项一致**——731 meshes / 24 materials / 297,425 三角 /
+18.71 MiB / 11 个烘焙材质；`tools/ab_render_compare.py` 同机位 A/B：MAE 0.000、
+显著差异 0.000% → PASS。
+
+注：`is_wire_material()` **只认** `__wire__`/`WIRE`，`TL2_SHIPWIRE_*` 不判 wire
+（那些是薄三角形，判进去会丢几何，见 P1-4）。
+
+**已落地**：`services/mesh_filters.py`
+
+| 判据 | 入口 | 原散落位置 |
+|---|---|---|
+| LOD 级别 + 面数保护 + 辅助几何豁免 | `should_skip_lod(name, lod, levels_by_base, tri_by_base_lod, shape_lod)` | `geometry_service._lod_skip()` 闭包 |
+| 破损断面 | `is_crack_material(mat)` | `mat_key.startswith('__crack__')` |
+| 老式 wire | `is_wire_material(mat)` | `mat in ('__wire__','WIRE')` |
+| 贴花 | `is_decal(obj)` | `export_service._is_decal()` |
+| 辅助几何关键词 | `is_auxiliary_geometry(name)` | `_lod_skip` 里的内联元组 |
+
+回归：Waterloo 重导与重构前**逐项一致**——731 meshes / 24 materials / 297,425 三角 /
+18.71 MiB / 11 个烘焙材质；`tools/ab_render_compare.py` 同机位 A/B：MAE 0.000、
+显著差异 0.000% → PASS。
+
+注：`is_wire_material()` **只认** `__wire__`/`WIRE`，`TL2_SHIPWIRE_*` 不判 wire
+（那些是薄三角形，判进去会丢几何，见 P1-4）。
+
+### P2-7 补 `tools/blender_wows_vertex_groups.py` ❌ 不做（2026-10-27 用户确认）
+
+`export_service.py` 的注释曾写着"需要顶点组但不要骨架时……再用
+`tools/blender_wows_vertex_groups.py` 还原"，但**本仓库一直没有这个脚本**。
 参考项目里是 130 行的独立脚本（读 `_JOINTS_0` / `_WEIGHTS_0` + `bone_palette`
-重建顶点组，不建 Armature）。`export_skins=False` 模式下没有它，这套数据就是死的。
+重建顶点组，不建 Armature）。
+
+决定：**不做**。`export_skins=True`（默认）本来就写标准 skin，Blender 直接有顶点组；
+`export_skins=False` 只是"要空物体层级、不要 Armature"的少数场景，需要时用
+自定义属性自己接即可。注释已同步改成说明数据位置，不再指向不存在的脚本。
 
 ---
 

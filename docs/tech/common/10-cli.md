@@ -22,9 +22,10 @@
 [--no-textures] [--zstd] [--armor]
 [--damage] [--decals]
 [--bake-indexed | --no-bake-indexed] [--bake-size PX=0]
+[--slim | --no-slim]
 [--texture-size N=1024] [--lod N=2]
 [--merge-shapes | --split-shapes]   # 互斥；默认就是拆分
-[--skins] [--permoflage] [--model-skins]
+[--skins] [--permoflage] [--model-skins] [--model-skin ID|auto]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -37,6 +38,9 @@
 | `--bake-indexed` | **开** | 把 INDEXED 材质烘成标准 baseColor/normal/MR（关闭后丢失实时换涂装换不回来，见下） |
 | `--no-bake-indexed` | — | 保留原始图集数组 + 6 LUT（只有自带 shader 的页面能画对，可实时换涂装） |
 | `--bake-size` | **0** | 烘焙贴图最长边；`0` = 跟随 materialIdMap 原生尺寸（4096×2048） |
+| `--slim` | **开** | 顶点属性量化（`KHR_mesh_quantization`）+ 丢掉 `_T4`/`TEXCOORD_1`/`TANGENT`，实测 GLB -53% |
+| `--no-slim` | — | 保留 float32 全部属性（对照/调试用） |
+| `--skins` / `--model-skins` | 关 | 皮肤不是默认产物：不加这两个开关时**不写** `skins/`，`manifest.skins` 为空数组 |
 | `--texture-size` | **1024** | 贴图最大边长（PX），小图不放大 |
 | `--lod` | **2** | `-1` = LOD0；`0–3` 指定级别，缺级部件回退 LOD0 |
 | `--merge-shapes` | 关 | 每段合成一个网格（会丢面，见 known-issues） |
@@ -44,6 +48,9 @@
 | `--skins` | 关 | 导出 mskin/skin 材质皮肤 |
 | `--permoflage` | 关 | 追加永久涂装（需同时给 `--skins`） |
 | `--model-skins` | 关 | 导出换模型皮肤（各一套 GLB） |
+| `--model-skin` | 空 | 把某套**模型皮肤当基准外观**导出（产物仍是 `<ship>.glb`）。
+`auto` = 该船 permoflages 里第一套 model skin。用于 ARP 大和这类「默认模型是原版、
+特殊外观在皮肤里」的船；manifest 会记 `base_skin` |
 
 `--ship` 既接受 GameParams key（`PJSB018_Yamato_1944`），也接受模型目录名
 （`JSB039_Yamato_1945`），取第一个匹配。
@@ -76,10 +83,11 @@ import --game DIR [--server] [--gp] [--bin BUILD] [--version TEXT]
 
 ```text
 batch --game DIR --filter TEXT --out DIR [--jobs N=1] [--limit N] [--force]
-      + ship 的全部开关
+      + ship 的全部开关（含 --slim/--no-slim）
 ```
 
-- 逐船判断 `geometry/<ship>.glb` 是否已存在：存在则 `skip`，`--force` 强制重导；
+- 逐船判断 `geometry/<ship>/<ship>.glb` 是否已存在、且增量签名匹配（见 `.export_index.json`）：
+  两者都满足才 `skip`；`--force` 强制全量重导；
 - `--jobs > 1`：先 `export-keys` 写 `.keys.txt`，把 key 均分成 N 份，
   起 N 个 `batch-worker` 子进程并行；子进程参数由父进程按"偏离默认才追加"的规则拼；
 - `--jobs 1`：父进程内串行调 `_export_ship()`（**不**起子进程，因此不了隔离崩溃）。
@@ -90,7 +98,7 @@ batch --game DIR --filter TEXT --out DIR [--jobs N=1] [--limit N] [--force]
 batch-worker --game DIR --keys-file FILE --out DIR
              [--no-textures] [--zstd] [--armor] [--damage] [--decals]
              [--texture-size] [--lod] [--skins] [--permoflage]
-             [--model-skins] [--merge-shapes] [--gp]
+             [--model-skins] [--model-skin ID|auto] [--merge-shapes] [--gp]
 ```
 
 只为 `batch --jobs` 服务，一般不手跑。**历史坑**：`--skins / --permoflage /
