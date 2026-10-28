@@ -266,6 +266,10 @@ class ExportReport:
         return (f"✅ 导出{kind}完成：{self.meshes} 网格 / {self.triangles:,} 三角形"
                 f" / {self.vertices:,} 顶点{tex}{skip}{warn}\n→ {self.output_path}")
 
+    def __str__(self) -> str:
+        # CLI 直接 print(report)；不给 __str__ 的话打出来是 dataclass repr
+        return self.summary()
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # DDS → RGBA / PNG
