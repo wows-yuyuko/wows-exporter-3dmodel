@@ -68,7 +68,7 @@
 | 库 | 导出用到的表 |
 |---|---|
 | `assets_data*.db` | `render_sets`、`skeleton_mounts`、`skeleton_bones`、`material_full`、`mfm_textures`、`shape_names`、`camouflages`、`camouflage_color_schemes`、`camo_ship_groups`、`exteriors` |
-| `game_data*.db` | `entity_snapshots`（只读 `entity_type='ship'`）、`meta_import_state`、`ship_models`、`entity_registry` |
+| `game_data*.db` | `entity_snapshots`（只读 `entity_type='ship'`）、`meta_import_state`、`ship_models`、`name_mappings`（`category='ship'`） |
 
 ### A. 已完成（2026-10-26）
 
@@ -94,7 +94,7 @@ data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
 | `skeleton_mounts` + 2 个索引 | 161 MB | 同上（现有 7,219 个 stem） |
 | `render_sets` + 2 个索引 | 214 MB | 只留 `/ship/` 与 `/gun/` 路径；丢掉 `other` 97k 条（location/建筑/飞机） |
 | `material_full` | 18.5 MB | 可只留被 render_sets 引用到的 mfm |
-| `camo_thumbs` | 0 行 | 已删表（2026-10-28）；`exteriors` 已改为 GameParams 入库（WG 2,362 条） |
+| `camo_thumbs` | 0 行 | 已从 schema 删除（2026-10-28）；**旧库里的表还在**，重建或手工 `DROP TABLE camo_thumbs` 才真正释放 |
 
 **约束**：必须按路径类型裁剪，不能按船名——否则以后导冷门船会缺数据。
 

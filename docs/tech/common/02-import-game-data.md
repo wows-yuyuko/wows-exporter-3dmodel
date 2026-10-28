@@ -68,17 +68,20 @@ db.save_entity_snapshots([s for s in snapshots_batch if s[1] == "ship"], version
 
 ## 3. 表结构与"实际被谁读"
 
-`database_new.sql` 两服各有 **50+ 张表**，但导出链路只碰 4 张：
+`database_new.sql` 两服各有 **50+ 张表**，但导出链路只读 4 张：
 
 | 表 | 导出期用途 | 代码 |
 |---|---|---|
 | `meta_import_state` | 取 build 号（`8867689_8867689` → `8867689`） | `core/build_info.imported_build()` |
 | `entity_snapshots`（`entity_type='ship'`） | 舰船 JSON：装甲厚度字典、各挂载组件 model 路径、`permoflages` | `geometry_service._ship_snapshot()`、`camo_service` |
 | `ship_models` | 模型目录名（`model_folder`） | `database_service.load_ship_models()` |
-| `entity_registry` | 实体 id / 名称 / 国籍 | 列船兜底 |
+| `name_mappings`（`category='ship'`） | 舰船中文名（`"PJSB018_Yamato_1944"` → `"大和"`） | `geometry_service._ship_display_name()` → `get_all_name_mappings("ship")` |
+
+`entity_registry` **只在导入期写**（`register_entities()`，给 `entity_snapshots` 做外键），
+导出不读 —— 别把它算进"导出依赖"。
 
 其余（`ship_basic_info`、`ship_module_*`、`projectile_*`、`crew_*`、`consumable_*`、
-`name_mappings`、`enum_translations` …）属于原「数据浏览/对比」功能：导出不读，
+`enum_translations` …）属于原「数据浏览/对比」功能：导出不读，
 **新导入也不再写**（分析层已裁剪，见 §2 的警告）。可以直接删表瘦身；
 `assets_data` 侧的裁剪方案见 [../../known-issues.md](../../known-issues.md) 的「数据库精简」。
 
