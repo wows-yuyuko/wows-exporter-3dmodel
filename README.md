@@ -50,6 +50,10 @@
     # 列船
     python cli.py list --server lesta --game D:\Games\Korabli --filter Yamato
 
+    # 版本更新后：先找变动过的船，再只导这些（不加载 assets.bin、不建库）
+    python cli.py diff  --server wg --game D:\Games\World_of_Warships --format keys --out changed.txt
+    python cli.py batch --server wg --game D:\Games\World_of_Warships --out out\wg --keys-file changed.txt
+
     # 单船：渲染 + 装甲 + zst
     python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --armor --zstd
 

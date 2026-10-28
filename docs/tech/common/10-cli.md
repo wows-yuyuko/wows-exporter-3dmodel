@@ -8,6 +8,7 @@
 | 命令 | 用途 | 需要先 `import` 建库 | 典型耗时 |
 |---|---|---|---|
 | `list` | 列船（GameParams 直读） | ❌ | < 5 s |
+| `diff` | **版本对比**：找出两版之间 geometry 变动的船（只读 idx 的 crc32） | ❌（有库才能映射到船 key） | ~15 s（两版各扫一次 idx） |
 | `import` | 建库（GameParams + assets.bin → `data/*.db`） | — | 分钟级 |
 | `ship` | **单船导出**（主力） | ✅ | 35 s ~ 4 min |
 | `batch` | 批量导出（默认单进程 `batch-worker` 跑完整批） | ✅ | 按船数 |
@@ -113,6 +114,58 @@ export-keys --game DIR --out FILE --server {lesta,wg} [--filter TEXT] [--limit N
 - `--filter` 是**子串匹配**（大小写不敏感，同时匹配 key 与 model_folder）；空串 = 全部；
 - `export-keys` 只写 key，一行一个；`--limit` 截断（`batch --jobs ≥ 1` 靠它工作）。
 
+## 4.5 `diff` —— 版本对比（找变动的船）
+
+```text
+diff --game DIR --server {lesta,wg} [--old BUILD] [--new BUILD]
+     [--format text|keys|json] [--out FILE]
+```
+
+`--old` / `--new` 缺省时取 `<game>/bin/` 下**数值最大的两个**（新 = 最大）。
+
+**判据是 idx 里本来就存的 `crc32`**（解压后内容的 CRC32，实测与 `zlib.crc32(内容)` 一致），
+所以**完全不加载 assets.bin、不解包几何**：
+
+| 层 | 做什么 | 成本 |
+|---|---|---|
+| 读两版 idx | 各 ~3.2 万个 `.geometry` 的 `(crc32, size)` | 两版合计 ~12 s |
+| 比对 | crc+size 一致 → 视为没变 | 毫秒级 |
+| 映射 | 目录名 → 船（`ship_models` + ship 快照的 `A_*.*.model`） | ~2 s |
+
+实测（WG `13187581 → 13357625`，共 2.4 万个改动点里只有 25 个文件变）：
+
+```text
+对比 13187581 → 13357625
+  变动 19 个模型目录（25 个文件）
+
+船体变动 7 条（其中 1 条动了主文件，可能含装甲）：
+  PASC597_Nueve_de_Julio_1951   ASC028_Boise_1951        主文件
+  PWSC016_Tre_Kronor            WSC305_Tre_Kronor_1947   仅分段 + 1 分段
+  ...
+
+挂载模型变动 12 个，波及 21 条船：
+  JGM055_100mm65_Type98         PJSB508_Kii、PJSD210_Harugumo、…
+  JGT023_610mm4_Type_93R        PJSB539_Daisen、PJSC517_Maya、…
+```
+
+字段含义：
+- **主文件** = `<folder>.geometry`（**装甲只在这里**，分段实测恒 0）；
+- **仅分段** = 只动了 `_Bow` / `_MidFront` 等，属于模型细节，装甲没变；
+- 挂载是**多船共享**的，改一个会影响一批船 —— 所以输出按「模型目录 → 引用它的船」列。
+
+`--format keys` 输出一行一个船 key，可直接给 `batch --keys-file`：
+
+```bash
+python cli.py diff --server wg --game D:\Games\World_of_Warships --format keys --out changed.txt
+python cli.py batch --server wg --game D:\Games\World_of_Warships --out out\wg --keys-file changed.txt
+```
+
+**局限（口径：宽松）**：
+- crc32 覆盖整个 `.geometry`（含顶点/索引）→ **只改模型细节也会判为变动**，宁可多导不漏导；
+- 只比 `.geometry`。**纯 GameParams 变动**（改装甲厚度、改挂载配置、改涂装归属）不会被发现；
+- 新增/删除的 geometry 会单独列出（新船通常伴随新增 geometry），但不自动转成船 key；
+- 没有 `game_data*.db` 时退化为只报模型目录名，映射不到船。
+
 ## 5. `import` —— 建库
 
 ```text
@@ -130,10 +183,14 @@ import --game DIR --server {lesta,wg} [--gp FILE] [--bin BUILD] [--version TEXT]
 ## 6. `batch` —— 批量导出
 
 ```text
-batch --game DIR --out DIR --server {lesta,wg} [--filter TEXT]
+batch --game DIR --out DIR --server {lesta,wg} [--filter TEXT] [--keys-file FILE]
       [--jobs N=1] [--limit N] [--force] [--gp FILE]
       + ship 的全部开关
 ```
+
+`--keys-file` 直接指定要导哪些船（一行一个 key，`#` 开头当注释），
+与 `--filter` 是**交集**；不在当前 GameParams 里的 key 会打印 `[warn]` 跳过。
+配 `diff --format keys` 就是「版本更新只导变动船」的闭环。
 
 ### 6.1 `--jobs` 三档
 
