@@ -254,16 +254,6 @@ def parse_vertex_format(format_name: str) -> list[tuple[str, int, int]]:
     return attrs
 
 
-def unpack_vertices(raw: np.ndarray, fmt: str) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """把 (count, stride) uint8 顶点数据拆成 (positions, normals, uvs)。
-
-    兼容旧调用；需要全部属性（uv2/tangent/binormal/extra）时用
-    :func:`unpack_vertex_attributes`。
-    """
-    attrs = unpack_vertex_attributes(raw, fmt)
-    return attrs["positions"], attrs["normals"], attrs["uv"]
-
-
 def unpack_vertex_attributes(raw: np.ndarray, fmt: str) -> dict:
     """把 (count, stride) uint8 顶点数据拆成**全部**顶点属性。
 

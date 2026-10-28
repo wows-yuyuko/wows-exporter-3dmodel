@@ -255,29 +255,6 @@ class ArmorScene:
 
     # ── 查询 ────────────────────────────────────────────
 
-    def tris_for_plate(self, plate_key: tuple) -> list[int]:
-        return self._plate_tris.get(plate_key, [])
-
-    def tris_for_part(self, zone: str, part: str) -> list[int]:
-        return self._part_tris.get((zone, part), [])
-
-    def tris_for_zone(self, zone: str) -> list[int]:
-        return self._zone_tris.get(zone, [])
-
-    def visible_edges(self, visible_tris: np.ndarray | None) -> np.ndarray:
-        """按三角形可见性过滤边界线段，返回可见线段的端点 (E'*2,3)。"""
-        if self.edge_positions.shape[0] == 0:
-            return self.edge_positions
-        if visible_tris is None:
-            return self.edge_positions
-        t1 = self.edge_tris[:, 0]
-        t2 = self.edge_tris[:, 1]
-        vis1 = visible_tris[t1]
-        vis2 = (t2 >= 0) & visible_tris[np.maximum(t2, 0)]
-        keep = vis1 | vis2
-        if keep.all():
-            return self.edge_positions
-        return self.edge_positions.reshape(-1, 2, 3)[keep].reshape(-1, 3)
 
     # ── 拾取 ────────────────────────────────────────────
 

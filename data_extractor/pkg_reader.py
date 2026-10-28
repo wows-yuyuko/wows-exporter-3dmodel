@@ -200,21 +200,6 @@ class PkgReader:
             f"({volume_filename} @ {file_info.offset})"
         )
 
-    def read_file_direct(self, volume_filename: str,
-                         offset: int, size: int,
-                         compression_info: int = 0) -> bytes:
-        """直接从卷中读取一段原始数据（低级接口, 低内存 seek+read）。"""
-        pkg_path = self._pkgs_dir / volume_filename
-        if not pkg_path.exists():
-            raise PkgError(f"PKG 文件不存在: {pkg_path}")
-        with open(pkg_path, 'rb') as f:
-            f.seek(offset)
-            data = f.read(size)
-        if len(data) < size:
-            raise PkgError(
-                f"文件 {volume_filename} 偏移 {offset}+{size} 超出范围"
-            )
-        return data
 
     # ── 流式提取 (低内存: 一个一个文件边读边写) ─────────────
 

@@ -38,13 +38,6 @@ def packed_add(a: int, b: int, msb_mask: int, nonmsb_mask: int = None) -> int:
     return (low ^ ((a ^ b) & msb_mask)) & M64
 
 
-def packed_sub(a: int, b: int, msb_mask: int, nonmsb_mask: int = None) -> int:
-    if nonmsb_mask is None:
-        nonmsb_mask = ~msb_mask & M64
-    low = ((a | msb_mask) - (b & nonmsb_mask)) & M64
-    return (low ^ ((a ^ ~b) & msb_mask)) & M64
-
-
 def decorr_to_RGB_packed(r: int, g: int, b: int, msb_mask: int, nonmsb_mask: int = None):
     """就地 YCrCb->RGB: 输入 (r=Y, g=Cr, b=Cb) -> 输出 (r=R, g=G, b=B)"""
     y = r

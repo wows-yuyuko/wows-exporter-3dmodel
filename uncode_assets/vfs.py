@@ -452,15 +452,6 @@ class AssetsBinVfs:
             key = "/"
         return sorted(self._dirs.get(key, []))
 
-    def pkg_has(self, path: str) -> Optional[bool]:
-        """该路径（PKG 内相对路径，无前导 '/'）是否存在于 PKG 文件树。
-
-        未提供 PKG 文件树（直接打开 assets.bin 文件）时返回 None。
-        """
-        if self._pkg_paths is None:
-            return None
-        return path.lstrip("/") in self._pkg_paths
-
 
     def is_dir(self, path: str) -> bool:
         return self._logical_path(path) in self._dirs
@@ -623,7 +614,3 @@ class AssetsBinVfs:
             parts[0] = parts[0][1:]
         return "/" + "/".join(parts) if parts else "/"
 
-    @staticmethod
-    def logical_path(path: str) -> str:
-        """公开接口：原始路径 → 目录树逻辑路径。"""
-        return AssetsBinVfs._logical_path(path)

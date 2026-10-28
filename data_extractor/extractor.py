@@ -114,7 +114,7 @@ class GameExtractor:
     使用方式::
 
         extractor = GameExtractor(
-            game_dir="D:/World_of_Warships_RU/Korabli"
+            game_dir="D:/Games/Korabli"
         )
         # 列出所有文件
         for entry in extractor.list_files("content/**/*.data"):

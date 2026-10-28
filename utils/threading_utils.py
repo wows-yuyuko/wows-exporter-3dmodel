@@ -46,8 +46,6 @@ class _AppTask:
     def cancel(self):
         self._cancel_event.set()
 
-    def is_cancelled(self):
-        return self._cancel_event.is_set()
 
     @property
     def cancel_event(self):

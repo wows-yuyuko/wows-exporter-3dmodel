@@ -5,10 +5,8 @@
 from __future__ import annotations
 
 import json
-import os
 import pickle
 import shutil
-import struct
 import sys
 import threading
 import zlib
@@ -17,8 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 from app.signals import bus
 from app.application import app as app_ctx
 from utils.threading_utils import run_async
-from utils.path_utils import get_data_dir, get_split_dir, safe_join
-from services.database_service import DatabaseManager, get_db, reset_db
+from utils.path_utils import get_data_dir, get_split_dir
+from services.database_service import DatabaseManager, reset_db
 
 from services import GameParams as _GameParamsModule
 from services import wg_compat
@@ -36,54 +34,11 @@ class _GPEncode(json.JSONEncoder):
             return {}
 
 
-def _write_one(key, value, index, out_dir):
-    try:
-        t = value.get('typeinfo', {}).get('type', 'UnknownType')
-        # type / 实体名都来自游戏数据，可能含 ..\ 或盘符，必须校验落点
-        d = safe_join(out_dir, t) if index is None else safe_join(out_dir, str(index), t)
-        os.makedirs(d, exist_ok=True)
-        with open(safe_join(d, f"{key}.json"), 'w', encoding='latin1') as f:
-            json.dump(value, f, sort_keys=True, indent=4, separators=(',', ': '))
-    except Exception:
-        pass
-
-
-def _run_analysis(db, data_by_category: dict[str, dict[str, dict]] | None = None,
-                  version_code: str = "") -> None:
-    """分析层已裁剪：模型导出只需要 ship_models / entity_snapshots。"""
-    return
-    try:
-        if not data_by_category:
-            split_dir = get_split_dir()
-            if not split_dir.exists():
-                bus.log_message.emit("⏳ 跳过预分析：split 目录已被清理")
-                return
-
-        # 数据写入层按服务器分发：Lesta → services/lesta/analysis.py，
-        # Wargaming → services/wargaming/analysis.py（两套平级实现）
-        from services import wg_compat
-        if wg_compat.is_wg():
-            from services.wargaming.analysis import WargamingAnalysisService as AnalysisService
-        else:
-            from services.lesta.analysis import LestaAnalysisService as AnalysisService
-        svc = AnalysisService()
-        svc.initialize()
-        if not svc.is_ready:
-            return
-        bus.task_progress.emit(80, "数据入库")
-        if not version_code:
-            version_code = db.get_latest_version_code() or ""
-        svc.precompute_all(db, data_by_category=data_by_category, version_code=version_code)
-        bus.task_progress.emit(100, "步骤 3/3: 数据入库完成")
-    except Exception as e:
-        bus.log_message.emit(f"⚠️ 预分析跳过: {e}")
-
-
 def _save_ship_models(db, data_by_category: dict, version_code: str) -> None:
     """把可载入舰船列表（有 model 的 Ship）写入数据库 ship_models 表。
 
-    3D 查看器的 list_ships 从该表读取，避免每次启动都扫描 data/split
-    （keep_split_json=False 时该目录会被清理）。
+    3D 查看器的 list_ships 从该表读取，避免每次启动都扫描临时目录
+    （split 不再产出，导入开始时会清掉旧残留）。
     """
     try:
         ships = (data_by_category or {}).get("Ship") or {}
@@ -130,9 +85,8 @@ def run_process() -> "_AppTask":
         bus.task_progress.emit(80, "步骤 3/3: 数据入库")
         bus.log_message.emit("🧠 步骤 3/3: 正在数据入库（内存模式）...")
         # 预提取 assets.bin 到**独立缓存库 assets_data.db**（与主库 game_data.db 无锁冲突）。
-        # 在这里（分析开始前）后台启动，与下方 _run_analysis 写 game_data.db **同时进行**，
-        # 缩短整体加载时长；3D 查看器只读该缓存库。
-        # assets.bin 全程内存流转（现场从 .pkg 读到字节 → 直接写库），不落盘。
+        # 在这里后台启动，与下面主线程写 game_data.db **同时进行**，缩短整体加载时长；
+        # 3D 查看器只读该缓存库。assets.bin 全程内存流转（现场从 .pkg 读到字节 → 直接写库），不落盘。
         # WG 服与 Korabli 服统一走后台 _assets_cache_job：WG 用 10 类型表 +
         # WG 布局（渲染集 0x70/材质 0x78），由 AssetsCacheService 按 wows_type 适配。
         assets_started[0] = True
@@ -166,8 +120,7 @@ def run_process() -> "_AppTask":
             run_async(_assets_cache_job)
         except Exception:  # noqa: BLE001
             assets_done.set()  # 启动失败兜底，避免主流程等待卡死
-        # 主线程：分析并写 game_data.db（与 assets 后台缓存并行）
-        _run_analysis(db, data_by_category, version_code=version_code)
+        # 主线程：写 game_data.db（与 assets 后台缓存并行）
         bus.log_message.emit(f"📦 步骤 3/3: 数据入库写入: {len(db_batch)} 条, 映射 {sum(ms.values())} 条 ({db.db_size_mb} MB)")
         bus.task_progress.emit(100, "步骤 3/3: 完成")
 
@@ -204,24 +157,16 @@ def run_process() -> "_AppTask":
         )
         return cat, k, v, db_item, snap_item
 
-    def _collect_all(ej, ti, db_batch, snapshots_batch, data_by_category, sd, do_write_json):
-        """并行收集一批实体：CPU 密集的 json.dumps 与写 JSON 在线程池，主线程合并。
+    def _collect_all(ej, ti, db_batch, snapshots_batch, data_by_category):
+        """并行收集一批实体：CPU 密集的 json.dumps 在线程池，主线程合并。
 
         ej 是只读 dict；每项在子线程独立序列化，返回独立结果，主线程 append
         到共享列表（无竞争）。比原主线程逐条 json.dumps 明显提速。
         """
         with ThreadPoolExecutor(max_workers=8) as tpe:
-            write_futs = []
             collect_futs = []
             for k, v in ej.items():
-                if do_write_json:
-                    write_futs.append(tpe.submit(_write_one, k, v, ti, sd))
                 collect_futs.append(tpe.submit(_collect_one, k, v, ti))
-            for w in write_futs:
-                try:
-                    w.result()
-                except Exception:  # noqa: BLE001
-                    pass
             for f in collect_futs:
                 cat, k, v, db_item, snap_item = f.result()
                 if cat:
@@ -231,9 +176,10 @@ def run_process() -> "_AppTask":
 
     def _process():
         nonlocal db
+        # split 已不再产出（导入直接进 DB + 内存 dict）。清掉旧版本残留，避免
+        # 后续步骤误读上一次导入遗留的 JSON。
         if split_dir.exists():
             shutil.rmtree(str(split_dir))
-        split_dir.mkdir(parents=True)
 
         for n in ["GameParams_py3.data", "GameParams_py2.data", "GameParams.data"]:
             p = data_dir / n
@@ -273,13 +219,11 @@ def run_process() -> "_AppTask":
         db_batch: list[tuple[str, str, dict]] = []
         snapshots_batch: list[tuple[str, str, str, str]] = []
         data_by_category: dict[str, dict[str, dict]] = {}
-        sd = str(split_dir)
-        do_write_json = app_ctx.config.keep_split_json
         msg = ""
 
         if source_dict:
             ej = json.loads(json.dumps(source_dict, cls=_GPEncode, ensure_ascii=False))
-            _collect_all(ej, None, db_batch, snapshots_batch, data_by_category, sd, do_write_json)
+            _collect_all(ej, None, db_batch, snapshots_batch, data_by_category)
             msg = "Wargaming 拆分完成"
         else:
             for idx, elem in enumerate(data):
@@ -287,7 +231,7 @@ def run_process() -> "_AppTask":
                     continue
                 ti = None if idx == 0 else idx
                 ej = json.loads(json.dumps(elem, cls=_GPEncode, ensure_ascii=False))
-                _collect_all(ej, ti, db_batch, snapshots_batch, data_by_category, sd, do_write_json)
+                _collect_all(ej, ti, db_batch, snapshots_batch, data_by_category)
             msg = "Lesta 拆分完成"
 
         if db_batch:
@@ -313,9 +257,6 @@ def run_process() -> "_AppTask":
         ok, msg = ret
         if ok:
             try:
-                if not app_ctx.config.keep_split_json and split_dir.exists():
-                    shutil.rmtree(str(split_dir))
-                    bus.log_message.emit("🧹 split 临时文件已清理")
                 for n in ["GameParams_py3.data", "GameParams_py2.data", "GameParams.data"]:
                     p = data_dir / n
                     if p.exists():

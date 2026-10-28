@@ -852,7 +852,6 @@ def current_layout(wows_type: Optional[str] = None) -> _Layout:
     return LAYOUTS.get(wows_type, LESTA_LAYOUT)
 
 
-
 # ── 基础工具 ──────────────────────────────────────────────────────────────
 
 class _Ctx:
@@ -2101,31 +2100,6 @@ def decode_effect_data(data: bytes, name: str = "",
     if not (0 <= start <= end <= len(data)):
         raise FxFormatError(f"systems 区域异常: [0x{start:X}, 0x{end:X}) len=0x{len(data):X}")
     return decode_region(data[start:end], count, name, max_emitting, lay)
-
-
-def record_region_bounds(db, record_index: int) -> Tuple[bytes, int, int]:
-    """返回 (blob 字节, 区域起始, 区域结束)（EffectPrototype 数据块）。"""
-    entry = None
-    for e in db.databases:
-        if e.prototype_magic == 0xEB23E0AF:
-            entry = e
-            break
-    if entry is None:
-        raise FxFormatError("assets.bin 中没有 EffectPrototype 数据块")
-    blob = entry.data
-    if record_index < 0 or record_index >= entry.record_count:
-        raise FxFormatError(f"记录索引越界: {record_index}")
-    rec_addr = BLOB_HEADER + record_index * RECORD_SIZE
-    rel = _i64(blob, rec_addr + 8)
-    start = rec_addr + rel
-    if record_index + 1 < entry.record_count:
-        nrel = _i64(blob, rec_addr + RECORD_SIZE + 8)
-        end = rec_addr + RECORD_SIZE + nrel
-    else:
-        end = len(blob)
-    if not (rec_addr <= start <= end <= len(blob)):
-        raise FxFormatError(f"区域范围异常: [0x{start:X}, 0x{end:X})")
-    return blob, start, end
 
 
 # ── EffectMetadataPrototype（粒子 `/xxx.xml/shared` 元数据）────────────────

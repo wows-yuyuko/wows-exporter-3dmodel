@@ -227,11 +227,6 @@ def mp_base_id(mp_name: str) -> str:
     return m.group(1) if m else ""
 
 
-def mp_nation(base_id: str) -> str:
-    """baseID 首字母 → 国家目录名；未知返回空串。"""
-    return _MP_NATION_BY_LETTER.get(base_id[:1], "") if base_id else ""
-
-
 @dataclass
 class HullMesh:
     """一个舰体部件网格（顶点/法线/UV/索引，已合并该部件全部 primitive）。
@@ -437,18 +432,6 @@ class ShipGeometry:
     #: 舰体漫反射贴图（.dds 原始字节）与 VFS 路径（可能为 None，未找到贴图）
     texture_dds: bytes | None = None
     texture_path: str = ""
-
-    @property
-    def bounds_center(self) -> np.ndarray:
-        if self.bounds_min is None or self.bounds_max is None:
-            return np.zeros(3, dtype=np.float32)
-        return (self.bounds_min + self.bounds_max) * 0.5
-
-    @property
-    def bounds_size(self) -> np.ndarray:
-        if self.bounds_min is None or self.bounds_max is None:
-            return np.ones(3, dtype=np.float32)
-        return np.maximum(self.bounds_max - self.bounds_min, 1e-6)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -695,210 +678,6 @@ class GeometryService:
             snap.stats["warnings"] = list(warns)
         return snap
 
-    def apply_camo(self, geom: ShipGeometry, camo, extractor=None) -> int:
-        # ⚠️【临时标记】涂装渲染逻辑尚未正确：camouflage/MSkin/Permoflage/通用永久等几类
-        # 生效方式不同的涂装需**分开处理**，当前统一 artMap/composite 覆盖是错的（配色1 全灰）。
-        # 此函数按涂装类型拆分前，先屏蔽涂装入口（见 geometry_viewer 临时标记），勿继续在
-        # 这条统一路径上调试。拆分点建议：标准 PBS 用 composite 到 diffuse；
-        # INDEXED（视觉 2.0）用 artMap 叠加；二者对 colorScheme 的 zone 掩膜判定需分别验证。
-        """把 camo（CamouflageEntry 或 dict）的贴图按部件分类覆盖到标准(PBS)材质 mesh，返回替换数。
-
-        INDEXED 图集（albedoArray 等）需单独 artMap/tint 覆盖，暂回退不改；仅处理单张 diffuseMap 的标准材质。
-        """
-        if camo is None:
-            return 0
-        texs = getattr(camo, "textures", None)
-        if texs is None and isinstance(camo, dict):
-            texs = camo.get("textures") or {}
-        texs = texs or {}
-        if not texs:
-            return 0
-        from services.camo_service import classify_part_category
-        extractor = extractor or self._get_extractor()
-        import numpy as np
-        count = 0
-        meshes = list(geom.hull_meshes) + [m for m in getattr(geom, "mounts", [])]
-        for hm in meshes:
-            is_idx = getattr(hm, "tech_family", "pbs") == "indexed"
-            name = getattr(hm, "material", "") or ""
-            cat = classify_part_category(name)
-            tp = texs.get(cat) or texs.get("hull") or texs.get("tile")
-            if not tp:
-                continue
-            base = tp[:-4] if tp.endswith(".dds") else tp
-            try:
-                vp, td = self._load_texture_tier(base, extractor)
-            except Exception:  # noqa: BLE001
-                continue
-            if not td:
-                continue
-            ucs = self._camo_attr(camo, "use_color_scheme", False)
-            colors = self._camo_attr(camo, "colors", None)
-            tiled = bool(self._camo_attr(camo, "tiled", False))
-            if is_idx:
-                # INDEXED 涂装：zone mask 按颜色方案烘焙 → artMap 叠加。
-                # 覆盖量 = art alpha(图案遮罩) × 材质 art 强度；non-tiled 黑区 α=0 透出底色。
-                art_td = td
-                if ucs and colors:
-                    baked = self._bake_camo_art(td, colors, tiled=tiled)
-                    if baked is not None:
-                        art_td = baked
-                mt = dict(getattr(hm, "material_textures", {}) or {})
-                mt["artMap"] = (vp, art_td)
-                hm.material_textures = mt
-                ip = dict(hm.indexed_params or {})
-                arrays = dict(ip.get("arrays") or {})
-                asa = np.zeros((196, 4), dtype=np.float32)
-                asa[:, 0] = 1.0
-                arrays["artStrengthMatIdArr"] = asa
-                ip["arrays"] = arrays
-                hm.indexed_params = ip
-                hm.has_color = True
-                count += 1
-            else:
-                # 标准（PBS）：烘焙并按颜色方案**叠加到底色**后作为 diffuseMap
-                diff_td = td
-                if ucs and colors:
-                    baked = self._bake_camo_art(td, colors, tiled=tiled)
-                    if baked is not None:
-                        comp = self._composite_camo_over_base(
-                            getattr(hm, "texture_dds", None), baked)
-                        diff_td = comp if comp is not None else baked
-                hm.texture_path, hm.texture_dds = vp, diff_td
-                mt = dict(getattr(hm, "material_textures", {}) or {})
-                mt["diffuseMap"] = (vp, diff_td)
-                hm.material_textures = mt
-                hm.has_color = True
-                count += 1
-        return count
-
-    @staticmethod
-    def _camo_attr(camo, name: str, default=None):
-        """从 CamouflageEntry 或 dict 取属性。"""
-        if camo is None:
-            return default
-        if isinstance(camo, dict):
-            return camo.get(name, default)
-        return getattr(camo, name, default)
-
-    @staticmethod
-    def _rgba_to_dds_bgra(rgba) -> bytes | None:
-        """RGBA (H,W,4) uint8 → 未压缩 DDS（BGRA 像素，供 _upload_texture 未压缩分支上传）。"""
-        import struct
-        import numpy as np
-        h, w, _ = rgba.shape
-        bgra = rgba[:, :, [2, 1, 0, 3]].copy()
-        hdr = bytearray(128)
-        hdr[0:4] = b"DDS "
-        struct.pack_into("<I", hdr, 4, 124)        # dwSize
-        struct.pack_into("<I", hdr, 8, 0x1007)     # flags: caps|height|width|pixelformat
-        struct.pack_into("<I", hdr, 12, h)         # height
-        struct.pack_into("<I", hdr, 16, w)         # width
-        struct.pack_into("<I", hdr, 20, w * 4)     # pitch
-        struct.pack_into("<I", hdr, 24, 0)         # depth
-        struct.pack_into("<I", hdr, 28, 1)         # mip count
-        struct.pack_into("<I", hdr, 76, 32)        # pixel format size
-        struct.pack_into("<I", hdr, 80, 0x41)      # DDPF_RGB | DDPF_ALPHAPIXELS
-        struct.pack_into("<I", hdr, 84, 0)         # fourcc = 0（未压缩）
-        struct.pack_into("<I", hdr, 88, 32)        # RGB bit count
-        struct.pack_into("<I", hdr, 92, 0x00ff0000)
-        struct.pack_into("<I", hdr, 96, 0x0000ff00)
-        struct.pack_into("<I", hdr, 100, 0x000000ff)
-        struct.pack_into("<I", hdr, 104, 0xff000000)
-        struct.pack_into("<I", hdr, 108, 0x1000)   # DDSCAPS_TEXTURE
-        return bytes(hdr) + np.ascontiguousarray(bgra).tobytes()
-
-    def _bake_camo_art(self, dds_bytes: bytes, colors, tiled: bool = False) -> bytes | None:
-        """把 camo zone mask 按颜色方案 CPU 上色为 RGBA，再包成未压缩 DDS（作为 artMap）。
-
-        对齐 wows-toolkit bake_tiled_camo_png：
-        - zone 由**主色通道**判定：红→color1、绿→color2、蓝→color3、黑→color0。
-        - 颜色为线性 [0,1]，写回前转 sRGB（linear→sRGB）。
-        - black_passthrough = !tiled：非 tiled（整船涂装）黑区 α=0（透出底涂），
-          tiled（重复图案）黑区 α=255（作为真实图案色）。
-        - 若纹理由真实烘焙贴图而非 zone mask 组成（zone 像素占比 < 0.90），返回 None，
-          由调用方回退未上色的原始贴图。
-        """
-        import numpy as np
-        try:
-            from services.export_service import dds_to_rgba
-        except Exception:  # noqa: BLE001
-            return None
-        try:
-            rgba = dds_to_rgba(dds_bytes)
-        except Exception:  # noqa: BLE001
-            return None
-        if rgba is None:
-            return None
-        h, w, _ = rgba.shape
-        r = rgba[..., 0].astype(np.int32)
-        g = rgba[..., 1].astype(np.int32)
-        b = rgba[..., 2].astype(np.int32)
-        red_zone = (r > g) & (r > b) & (r > 30)
-        green_zone = (g > r) & (g > b) & (g > 30)
-        blue_zone = (b > r) & (b > g) & (b > 30)
-        near_black = (r <= 30) & (g <= 30) & (b <= 30)
-        black_zone = ~(red_zone | green_zone | blue_zone)
-        # zone_mask_fraction：主色通道或近黑的像素占比，过低则视为真实烘焙贴图 → 回退
-        frac = (red_zone | green_zone | blue_zone | near_black).sum() / float(h * w)
-        if frac < 0.90:
-            return None
-        c = np.asarray(colors, dtype=np.float64).reshape(4, 4)
-        if c.max() > 1.001:
-            c = c / 255.0
-
-        def _lin2srgb(x):
-            x = np.clip(x, 0.0, 1.0)
-            return (np.where(x <= 0.0031308, x * 12.92,
-                             1.055 * np.power(x, 1.0 / 2.4) - 0.055) * 255.0).astype(np.uint8)
-
-        srgb = [_lin2srgb(c[i][:3]) for i in range(4)]
-        black_alpha = 0 if not tiled else 255
-        out = np.zeros((h, w, 4), np.uint8)
-        for i, mask in enumerate((black_zone, red_zone, green_zone, blue_zone)):
-            if not mask.any():
-                continue
-            col = srgb[i]
-            out[..., 0][mask] = col[0]
-            out[..., 1][mask] = col[1]
-            out[..., 2][mask] = col[2]
-        out[..., 3] = 255
-        if not tiled:
-            out[..., 3][black_zone] = 0
-        return self._rgba_to_dds_bgra(out)
-
-    def _composite_camo_over_base(self, base_dds, camo_baked) -> bytes | None:
-        """把烘焙后的 camo RGBA（alpha = 覆盖遮罩）叠加到底色 diffuse 上，返回未压缩 DDS。
-
-        对齐 wows-toolkit 导出流程：zone mask 黑区（= 未涂装，α=0）透出底色，
-        涂装区（α=255）用 camo 颜色。两者 UV 均为 0..1，分辨率不同则重采样到底色尺寸。
-        """
-        import numpy as np
-        if not base_dds:
-            return None
-        try:
-            from services.export_service import dds_to_rgba
-            base = dds_to_rgba(base_dds)
-            camo = dds_to_rgba(camo_baked)
-        except Exception:  # noqa: BLE001
-            return None
-        if base is None or camo is None:
-            return None
-        if camo.shape[:2] != base.shape[:2]:
-            try:
-                from PIL import Image
-                ci = Image.fromarray(camo)
-                ci = ci.resize((base.shape[1], base.shape[0]), Image.BILINEAR)
-                camo = np.asarray(ci, dtype=np.uint8)
-            except Exception:  # noqa: BLE001
-                return None
-        a = camo[..., 3:4].astype(np.float32) / 255.0
-        comp = (base[..., :3].astype(np.float32) * (1.0 - a)
-                + camo[..., :3].astype(np.float32) * a)
-        out = np.zeros_like(base)
-        out[..., :3] = np.clip(comp, 0, 255).astype(np.uint8)
-        out[..., 3] = 255
-        return self._rgba_to_dds_bgra(out)
 
     def _load_ship_impl(self, ship: ShipInfo, progress_cb=None,
                         cancel_event: threading.Event | None = None,
@@ -1626,21 +1405,6 @@ class GeometryService:
         except Exception:  # noqa: BLE001
             return None
 
-    def _get_assets_service(self):
-        if self._assets_svc is not None:
-            return self._assets_svc
-        if self._assets_tried:
-            return None
-        self._assets_tried = True
-        try:
-            from uncode_assets.service import AssetsBinService
-            data = self.load_assets_bytes()
-            if data:
-                self._assets_svc = AssetsBinService(
-                    assets_bytes=data, wows_type=app_ctx.ctx.wows_type)
-        except Exception:  # noqa: BLE001
-            self._assets_svc = None
-        return self._assets_svc
 
     def _get_assets_cache(self):
         """AC11: AssetsCacheService 单实例惰性缓存（替代 9 处每次 new 新 sqlite 连接）。
@@ -1709,77 +1473,6 @@ class GeometryService:
         self._mount_model_cache[key] = world
         return world
 
-    def _live_skel_path_index(self) -> dict:
-        """实时索引：模型目录 stem → 该目录下**全部** SkeletonPrototype 路径。
-
-        同一模型目录可能有多个骨架文件（舰体主骨架 + 各分段/天线骨架），
-        必须全部合并才能得到完整骨骼表。
-        """
-        if self._live_skel_index is not None:
-            return self._live_skel_index
-        idx: dict = {}
-        try:
-            svc = self._get_assets_service()
-            if svc is not None:
-                for f in svc.vfs.all_files():
-                    try:
-                        pt = f.prototype_type
-                        if pt is None or pt.name != "SkeletonPrototype":
-                            continue
-                    except Exception:  # noqa: BLE001
-                        continue
-                    parts = [p for p in f.path.replace("/@", "/").split("/") if p]
-                    stem = parts[-2] if len(parts) >= 2 else ""
-                    if stem:
-                        idx.setdefault(stem, []).append(f.path)
-        except Exception as exc:  # noqa: BLE001
-            bus.log_message.emit(f"⚠️ 实时骨架索引构建失败: {exc}")
-        self._live_skel_index = idx
-        return idx
-
-    def live_skeleton(self, stem: str) -> dict:
-        """**实时从客户端 assets.bin** 读取某模型骨架（bind pose 世界矩阵）。
-
-        返回 {bone_name: (4,4) 行主序}；不读写 assets_data.db。
-        合并该模型目录下**全部** SkeletonPrototype（主骨架 + 分段骨架），
-        矩阵列主序 → 行主序后按 parent_ids 累积到世界空间。
-        无游戏目录 / assets.bin 无该骨架时返回空 dict。
-        """
-        cached = self._live_skel_cache.get(stem)
-        if cached is not None:
-            return cached
-        out: dict = {}
-        try:
-            svc = self._get_assets_service()
-            paths = self._live_skel_path_index().get(stem) or []
-            for path in paths:
-                try:
-                    sk = svc.decode_skeleton_path(path)
-                except Exception:  # noqa: BLE001
-                    continue
-                names = sk.get("name_ids") or []
-                mats = sk.get("matrices") or []
-                parents = sk.get("parent_ids") or []
-                n = len(names)
-                if not n or n != len(mats):
-                    continue
-                local = [np.array(mats[i], dtype=np.float32).reshape(4, 4).T
-                         for i in range(n)]
-                world: list = [None] * n
-                for i in range(n):
-                    p = parents[i] if i < len(parents) else 65535
-                    if p >= n or p == i or p == 65535:
-                        world[i] = local[i]
-                    else:
-                        world[i] = (world[p] if world[p] is not None
-                                    else np.eye(4, dtype=np.float32)) @ local[i]
-                for i, nm in enumerate(names):
-                    if i < len(world) and world[i] is not None:
-                        out.setdefault(str(nm), world[i])
-        except Exception as exc:  # noqa: BLE001
-            bus.log_message.emit(f"⚠️ 实时骨架读取失败({stem}): {exc}")
-        self._live_skel_cache[stem] = out
-        return out
 
     def _mp_model_folder(self, mp_name: str) -> str:
         """MP_ 节点 → 模型目录：WG 用完整 miscName（如 AM003_Fairlead_1），Lesta 用 baseID（AM003）。
@@ -1948,114 +1641,6 @@ class GeometryService:
         from utils.asset_utils import murmur3_32
         return murmur3_32(data, seed)
 
-    def _section_render_sets(self, section_geom_path: str) -> list[dict]:
-        """从 assets.bin 提取某分段几何的渲染集（shape → material → mfm）。
-
-        返回 [{shape: 'BowShape.vertices', material: 'TL2_SHIPMAT_PBS_Hull',
-               mfm: '...Hull.mfm'}]；按 material 分组后的主渲染集（排除 crack/patch 损伤变体）。
-
-        注意：Korabli ST assets.bin 的 r2p→visual 记录偏移 5510（读错记录），
-        这里改为**扫描** visual blob 找 +0x20/+0x60 引用该几何的记录，再解析其
-        record-relative OOL 渲染集（起始 +0x40、步长 0x50）。
-        """
-        cache_key = section_geom_path
-        cached = self._visual_rs_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        svc = self._get_assets_service()
-        result: list[dict] = []
-        if svc is not None:
-            try:
-                result = self._parse_visual_render_sets(svc, section_geom_path)
-            except Exception:  # noqa: BLE001
-                result = []
-        self._visual_rs_cache[cache_key] = result
-        return result
-
-    def _parse_visual_render_sets(self, svc, section_geom_path: str) -> list[dict]:
-        from uncode_assets.parser import BLOB_HEADER_SIZE
-        db = svc.db
-        entry = db.databases[2]   # VisualPrototype blob
-        data = entry.data
-        if self._assets_self_id_index is None:
-            self._assets_self_id_index = db.build_self_id_index()
-        idx = self._assets_self_id_index
-
-        def path_of(h):
-            if h in (0, 0xFFFFFFFFFFFFFFFF):
-                return ''
-            i = idx.get(h)
-            return db.reconstruct_path(i, idx) if i is not None else ''
-
-        target = section_geom_path.rstrip('/')
-        # 1) 一次性索引：geometry 路径 → 引用它的 visual 记录（+0x20 geometry）
-        #    ⚠️ 2026-08-19 修正：VisualPrototype item_size=0x40（非 0x80）。
-        #    每条记录唯一 geometry（+0x20）+ primitives（+0x28），无 +0x60 第二引用。
-        if self._visual_geom_index is None:
-            geom_idx: dict = {}
-            for ri in range(entry.record_count):
-                off = BLOB_HEADER_SIZE + ri * entry.item_size
-                if off + 0x40 > len(data):
-                    break
-                rec = data[off:off + 0x40]
-                h = struct.unpack_from('<Q', rec, 0x20)[0]
-                if h in idx:
-                    gp = db.reconstruct_path(idx[h], idx)
-                    geom_idx.setdefault(gp, []).append(ri)
-            self._visual_geom_index = geom_idx
-        recs = self._visual_geom_index.get(target) or []
-        if not recs:
-            return []
-
-        # 2) 解析 OOL 渲染集（rel 起、0x50 步长、count 项）：
-        #    渲染集结构（0x50 步长）：+0x00 shape.vertices / +0x04 indices /
-        #    +0x08 材质名 / +0x20 .mfm 路径 selfId.
-        out: dict[str, dict] = {}
-        for ri in recs:
-            rec_off = BLOB_HEADER_SIZE + ri * entry.item_size
-            rec = data[rec_off:rec_off + 0x40]
-            cnt = struct.unpack_from('<Q', rec, 0x30)[0]
-            rel = struct.unpack_from('<Q', rec, 0x38)[0]
-            if not rel or cnt <= 0 or cnt > 500:
-                continue
-            base = rec_off + rel
-            if base + cnt * 0x50 > len(data):
-                continue
-            for k in range(cnt):
-                o = base + k * 0x50
-                shape_h = struct.unpack_from('<I', data, o)[0]
-                shape = db.strings.get_string_by_id(shape_h) or ''
-                if not shape.endswith('.vertices'):
-                    continue
-                iid = struct.unpack_from('<I', data, o + 4)[0]
-                mat_h = struct.unpack_from('<I', data, o + 8)[0]
-                mfm_h = struct.unpack_from('<Q', data, o + 0x20)[0]
-                sind = db.strings.get_string_by_id(iid) or ''
-                mat = db.strings.get_string_by_id(mat_h) or ''
-                smfm = path_of(mfm_h)
-                # 蒙皮标志 + 调色板节点名（与入库存库逻辑一致）：
-                #   +0x0C u8 skinned / +0x0D u8 nodes_count /
-                #   +0x28 u64 node_name_ids relptr（item-relative）→ u32 名ID 数组
-                skinned = bool(data[o + 0x0C])
-                ncnt = data[o + 0x0D]
-                nodes: list[str] = []
-                if ncnt:
-                    nrel = struct.unpack_from('<Q', data, o + 0x28)[0]
-                    if nrel:
-                        nabs = o + nrel
-                        if nabs + ncnt * 4 <= len(data):
-                            for j in range(ncnt):
-                                nid = struct.unpack_from('<I', data, nabs + j * 4)[0]
-                                nm = db.strings.get_string_by_id(nid) or ''
-                                if nm:
-                                    nodes.append(nm)
-                # 仅跳过 crack 损伤与低模 LOD；patch/wire/hide 保留渲染
-                damage = ('_crack_' in shape or '_lod' in shape or 'Crack' in mat)
-                if shape not in out:
-                    out[shape] = {'shape': shape, 'indices': sind,
-                                  'material': mat, 'mfm': smfm, 'damage': damage,
-                                  'skinned': skinned, 'nodes': nodes}
-        return list(out.values())
 
     def _geometry_folder_index(self, extractor) -> dict:
         """懒构建：{模型目录名: [VfsEntry .geometry]}，一次构建跨船复用。
@@ -2191,23 +1776,6 @@ class GeometryService:
         self._mount_model_cache[folder] = result
         return result
 
-    def _mfm_index(self) -> dict:
-        """懒构建 材质名(去 .mfm) → 完整路径 索引（一次，跨船复用）。"""
-        if self._mfm_index_cache is not None:
-            return self._mfm_index_cache
-        svc = self._get_assets_service()
-        idx: dict = {}
-        if svc is not None:
-            try:
-                for f in svc.vfs.all_files():
-                    if f.prototype_type is not None \
-                            and f.prototype_type.name == "MaterialPrototype" \
-                            and f.path.endswith(".mfm"):
-                        idx[f.path.rsplit("/", 1)[-1][:-4]] = f.path
-            except Exception:  # noqa: BLE001
-                idx = {}
-        self._mfm_index_cache = idx
-        return idx
 
     def _mfm_diffuse_base(self, stem: str, prefer: tuple[str, ...] = ()) -> str:
         """基于 .mfm 识别贴图（**只从 assets_data.db 读取**）：diffuseMap 原始路径。
@@ -2655,39 +2223,6 @@ class GeometryService:
         self._shape_names_cache = out
         return out
 
-    def _ensure_visual_geom_index(self):
-        """构建 {geometry 路径: [引用它的 visual 记录索引]} 全局索引（一次，跨船复用）。"""
-        if self._visual_geom_index is not None:
-            return
-        self._visual_geom_index = {}
-        svc = self._get_assets_service()
-        if svc is None:
-            return
-        try:
-            import struct as _s
-            from uncode_assets.parser import BLOB_HEADER_SIZE
-            from uncode_assets.types import type_from_magic
-            db = svc.db
-            idx = db.build_self_id_index()
-            vis = next((b for b in db.databases if (lambda t: t and t.name == 'VisualPrototype')(
-                type_from_magic(b.prototype_magic))), None)
-            if vis is None:
-                return
-            data = vis.data
-            isize = vis.item_size
-            geom_idx: dict = {}
-            for ri in range(vis.record_count):
-                off = BLOB_HEADER_SIZE + ri * isize
-                if off + 0x40 > len(data):
-                    break
-                rec = data[off:off + 0x40]
-                h = _s.unpack_from('<Q', rec, 0x20)[0]
-                if h in idx:
-                    gp = db.reconstruct_path(idx[h], idx)
-                    geom_idx.setdefault(gp, []).append(ri)
-            self._visual_geom_index = geom_idx
-        except Exception:  # noqa: BLE001
-            self._visual_geom_index = {}
 
     def _ship_render_sets(self, model_folder: str) -> dict:
         """该船全部记录的渲染集索引（**只从 assets_data.db 读取**）。
@@ -2855,127 +2390,6 @@ class GeometryService:
 
     # ── 实时材质（assets.bin，独立模型文件查看器）──────────
 
-    def _load_texture_tier_live(self, base: str, extractor) -> tuple[str, bytes]:
-        """按 .dd0/.dd1/.dd2/.dds 分级读取贴图，**跨模型复用**缓存。
-
-        与 `_load_texture_tier` 的区别：后者只在单次 load_ship 内有效
-        （`_clear_per_load_caches` 会清空）；独立模型查看器连续切换模型时，
-        共享图集（CIT000_1k_ship_tiles_* 等 20MB+）需要跨次复用，否则每次
-        重新解压（数十秒）。总量超过 `_LIVE_TEXTURE_CACHE_LIMIT` 时按插入
-        顺序淘汰最早的贴图。
-        """
-        if base in self._live_texture_cache:
-            return base + ".dds", self._live_texture_cache[base]
-        path, data = self._load_texture_tier(base, extractor)
-        if data:
-            self._live_texture_cache[base] = data
-            self._live_texture_bytes_total += len(data)
-            while (self._live_texture_bytes_total > self._LIVE_TEXTURE_CACHE_LIMIT
-                   and len(self._live_texture_cache) > 1):
-                old_key = next(iter(self._live_texture_cache))
-                old = self._live_texture_cache.pop(old_key)
-                self._live_texture_bytes_total -= len(old)
-        return path, data
-
-    def resolve_material_live(self, mfm_path: str, extractor=None) -> dict:
-        """实时从客户端 assets.bin 解析 .mfm 材质（**不读 assets_data.db**）。
-
-        独立模型文件查看器用：按需解码 MaterialPrototype → 贴图属性路径 →
-        从 pkg 读贴图字节（.dd0/.dd1/.dd2/.dds 分级）。结果按 mfm 路径缓存。
-
-        返回 ``{tech_family, shader_id, material_hash, fx_path,
-                textures: {属性名: (vfs_path, bytes)},
-                indexed_params: {arrays, grid, offset},
-                emissive_power}``；无法解析返回 ``{}``。
-        """
-        if not mfm_path or not mfm_path.endswith(".mfm"):
-            return {}
-        cached = self._live_material_cache.get(mfm_path)
-        if cached is not None:
-            return cached
-        result: dict = {}
-        try:
-            svc = self._get_assets_service()
-            if svc is None:
-                self._live_material_cache[mfm_path] = result
-                return result
-            decoded = svc.decode_material_by_path(mfm_path)
-            sid = decoded.get("shader_id") or "0x0"
-            mh = decoded.get("material_hash") or ""
-            from uncode_assets.mfm_fx import resolve_fx_path
-            fx_path = resolve_fx_path(getattr(svc, "db", None), mh)
-            family = (fx_tech_family(fx_path, sid)
-                      if mh else self._material_family(sid))
-            ext = extractor if extractor is not None else self._get_extractor()
-            textures: dict = {}
-            vec4s: dict = {}
-            emissive = None
-            for prop in decoded.get("properties") or []:
-                name = prop.get("name") or ""
-                if prop.get("type") == "texture":
-                    vp = prop.get("value_path") or ""
-                    # 反查失败会返回 "0x...." 占位 → 跳过（绝不按名补全）
-                    if not vp or vp.startswith("0x"):
-                        continue
-                    base = vp[:-4] if vp.endswith(".dds") else vp
-                    tp, td = self._load_texture_tier_live(base, ext)
-                    if td:
-                        textures[name] = (tp, td)
-                elif name == "emissivePower":
-                    val = prop.get("value")
-                    if isinstance(val, (int, float)):
-                        emissive = float(val)
-                arr = prop.get("array")
-                if arr and prop.get("type") == "vec4":
-                    vec4s[name] = np.asarray(arr, dtype=np.float32)
-            params: dict | None = None
-            if vec4s:
-                params = {"arrays": vec4s}
-                off = vec4s.get("offsetScaleMatIdArr")
-                if off is not None and off.ndim == 2 and off.shape[1] >= 4:
-                    params["offset"] = (float(off[0, 0]), float(off[0, 1]))
-                    params["grid"] = (int(round(off[0, 2])), int(round(off[0, 3])))
-                # 洋红占位 artMap = 缺失/无 camo：BaseStrength 置 0（与入库路径一致）
-                art_tx = textures.get("artMap")
-                if art_tx and _is_magenta_placeholder(art_tx[1]):
-                    a_arr = vec4s.get("artStrengthMatIdArr")
-                    if a_arr is not None and a_arr.ndim == 2 and a_arr.shape[1] >= 1:
-                        a_arr = a_arr.copy()
-                        a_arr[:, 0] = 0.0
-                        vec4s["artStrengthMatIdArr"] = a_arr
-            result = {"tech_family": family, "shader_id": sid,
-                      "material_hash": mh, "fx_path": fx_path,
-                      "textures": textures}
-            if params is not None:
-                result["indexed_params"] = params
-            if emissive is not None:
-                result["emissive_power"] = emissive
-        except Exception as exc:  # noqa: BLE001
-            result = {}
-            bus.log_message.emit(f"⚠️ 实时材质解析失败({mfm_path}): {exc}")
-        self._live_material_cache[mfm_path] = result
-        return result
-
-    def apply_live_material(self, hm, mfm_path: str, extractor=None) -> bool:
-        """把实时解析的材质装配到一个 HullMesh（独立模型查看器用）。
-
-        返回该网格是否有颜色贴图（False = 只有法线/参数，按叠加层处理）。
-        """
-        bundle = self.resolve_material_live(mfm_path, extractor)
-        if not bundle:
-            return False
-        ext = extractor if extractor is not None else self._get_extractor()
-        self._apply_declared_color(hm, bundle, ext)
-        if bundle.get("emissive_power") is not None:
-            hm.emissive_power = float(bundle["emissive_power"])
-        return bool(hm.has_color)
-
-    def release_live_material_caches(self) -> None:
-        """释放实时骨架/材质/贴图缓存（独立模型查看器关闭时调用）。"""
-        self._live_material_cache.clear()
-        self._live_texture_cache.clear()
-        self._live_texture_bytes_total = 0
-        self._live_skel_cache.clear()
 
     def _skeleton_bones(self, stem: str) -> dict:
         """某模型骨架全部骨骼世界矩阵 {bone_name: (4,4)}（DB 读取，跨船缓存）。"""
@@ -3083,44 +2497,6 @@ class GeometryService:
         prim.skin_bind = mats
         return True
 
-    def _apply_rigid_binding(self, prim, rs: dict | None) -> bool:
-        """对**非蒙皮但刚性绑定到骨架节点**的子模型施加父节点世界矩阵（原地烘焙顶点）。
-
-        背景：船体几何文件里的一些甲板/上层建筑小件（如 BIA454_Bollard_bigShape、
-        BIA703_HelmetsShape）在文件里位于**原点**，渲染集条目 skinned=0 但 nodes 非空
-        （如 ['BIA454_Bollard_big_7']），即刚性父级绑定到某个骨骼节点。需乘该骨骼的
-        世界矩阵（_skeleton_bones 返回）把顶点摆到舰船空间，否则渲染/导出都停在世界中心。
-
-        返回是否实际变换了顶点（True → 已烘焙，后续按普通几何处理）。
-        """
-        if prim is None or rs is None:
-            return False
-        if rs.get('skinned'):
-            return False  # 蒙皮走 _apply_skinning
-        nodes = rs.get('nodes') or []
-        if not nodes:
-            return False  # 无父节点（主船体/独立几何）→ 保持原点
-        stem = getattr(self, '_current_skinning_stem', None)
-        if not stem:
-            return False
-        bones = self._skeleton_bones(stem)
-        if not bones:
-            return False
-        m = bones.get(nodes[0])
-        if m is None:
-            return False
-        if np.allclose(m, np.eye(4), atol=1e-4):
-            return False  # 恒等无需变换
-        R = m[:3, :3].astype(np.float64)
-        t = m[:3, 3].astype(np.float64)
-        pos = prim.positions
-        nrm = prim.normals
-        prim.positions = ((pos.astype(np.float64) @ R.T) + t).astype(np.float32)
-        new_nrm = nrm.astype(np.float64) @ R.T
-        ln = np.linalg.norm(new_nrm, axis=1, keepdims=True)
-        ln[ln == 0] = 1.0
-        prim.normals = (new_nrm / ln).astype(np.float32)
-        return True
 
     def _bake_rigid(self, prim, m) -> None:
         """把刚性父节点矩阵 m（4x4 行主序）烘焙进 primitive 的顶点（原地）。"""
@@ -3519,12 +2895,3 @@ class GeometryService:
         self._visual_rs_cache.clear()
         self._mfm_diffuse_cache.clear()
 
-    def release_load_caches(self) -> None:
-        """释放本次加载产生的重内存缓存（3D 查看器关闭时的兜底清理）。
-
-        正常情况下每次 load_ship 结束已在 finally 里清空缓存（无跨船复用）；
-        此处为关闭窗口时的安全网：再清一次并立即 gc.collect() 回收。
-        """
-        import gc
-        self._clear_per_load_caches()
-        gc.collect()

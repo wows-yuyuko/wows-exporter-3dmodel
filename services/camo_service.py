@@ -23,7 +23,6 @@ def _dir_name(model_path: str) -> str:
     return model_path
 
 
-
 # ── 数据结构 ─────────────────────────────────────────────
 
 
@@ -52,7 +51,7 @@ class CamouflageEntry:
     uv_transforms: dict[str, UvTransform] = field(default_factory=dict)
     ship_groups: list[str] = field(default_factory=list)
     target_ships: list[str] = field(default_factory=list)
-    display_name: str = ""          # 本地化显示名（如 IDS_* 提取）
+    display_name: str = ""          # 显示名（恒空：本地化读取已移除）
 
 
 @dataclass
@@ -63,7 +62,7 @@ class CamoSchemeInfo:
     origin: str                      # "mat"(贴图层) / "model"(独立建模变体) / "none"(无涂装)
     use_color_scheme: bool = False
     uv_transforms: dict[str, UvTransform] = field(default_factory=dict)
-    icon_path: str = ""              # data 相对路径（camo_thumbs/...）
+    icon_path: str = ""              # 保留字段：缩略图链路已移除，恒为空
     model_replace: dict = field(default_factory=dict)   # 皮肤变体：原始 .model 路径 → 替换路径
     model_folder: str = ""           # 替换后的船体几何目录（如 FSB101_Aquitaine_White）
     skin: dict = field(default_factory=dict)            # 皮肤完整数据：hull_config/nodes_config/peculiarity_models
@@ -468,109 +467,4 @@ class CamoService:
                 infos.append(s)
         return infos
 
-    def collect_all_permoflages(self) -> set[str]:
-        """全部舰船 permoflages ∪ nativePermoflage 的并集（= 已归属涂装名集合）。
 
-        优先一次 SQL 从 game_data.db 的 entity_snapshots 取（json_extract，不整行读出），
-        无结果时回退扫描 data/split/Ship/*.json。
-        """
-        out: set[str] = set()
-        try:
-            from app.application import app as app_ctx
-            from services.database_service import get_db
-            db = get_db(getattr(app_ctx.ctx, "wows_type", "") or "")
-            vc = db.get_latest_version_code() or ""
-            if vc:
-                rows = db._conn.execute(
-                    "SELECT json_extract(data_json,'$.permoflages'), "
-                    "json_extract(data_json,'$.nativePermoflage') "
-                    "FROM entity_snapshots WHERE version_code=? AND entity_type='ship'",
-                    (vc,)).fetchall()
-                for arr, npf in rows:
-                    if arr:
-                        for v in json.loads(arr):
-                            if isinstance(v, str) and v:
-                                out.add(v)
-                    if isinstance(npf, str) and npf:
-                        out.add(npf)
-        except Exception:  # noqa: BLE001
-            out = set()
-        if out:
-            return out
-        # 回退：data/split/Ship/*.json（keep_split_json=True 时存在）
-        try:
-            from utils.path_utils import get_split_dir
-            for f in (get_split_dir() / "Ship").glob("*.json"):
-                try:
-                    d = json.loads(f.read_text(encoding="utf-8"))
-                except Exception:  # noqa: BLE001
-                    continue
-                for v in (d.get("permoflages") or []):
-                    if isinstance(v, str) and v:
-                        out.add(v)
-                npf = d.get("nativePermoflage")
-                if isinstance(npf, str) and npf:
-                    out.add(npf)
-        except Exception:  # noqa: BLE001
-            pass
-        return out
-
-    def list_orphan_skins(self) -> list[CamoSchemeInfo]:
-        """未被任何舰船收纳的皮肤类 Exterior（= 客户端存在但无归属。
-
-        归属判定与 :meth:`list_camos` 一致（name/index ∈ 全部船的 permoflages）。
-        返回项按索引排序，id 已顺序赋值；origin="model" 的项会标 geometry_present
-        （客户端是否真随包了该几何目录；False ⇒ 无法 3D 预览，如未发布的皮肤）。
-        """
-        self._ensure_loaded()
-        owned = self.collect_all_permoflages()
-        geom_dirs = self._geometry_folder_names()
-        infos: list[CamoSchemeInfo] = []
-        for ext in getattr(self, "_exteriors", []) or []:
-            sp = (ext.get("species") or "").lower()
-            if sp not in self._CAMO_SPECIES:
-                continue
-            name = ext.get("name") or ""
-            idx = ext.get("index") or ""
-            if name in owned or idx in owned:
-                continue
-            for s in self._build_exterior_schemes(ext, allow_unresolved=True):
-                if s.origin == "model" and s.model_folder and geom_dirs is not None:
-                    s.geometry_present = s.model_folder in geom_dirs
-                s.id = len(infos)
-                infos.append(s)
-        infos.sort(key=lambda s: (s.ext_index or s.raw_name))
-        for i, s in enumerate(infos):
-            s.id = i
-        return infos
-
-    def _geometry_folder_names(self) -> set[str] | None:
-        """客户端 pkg 索引中含 .geometry 的模型目录名集合（懒构建缓存）。
-
-        供「独立涂装」工具判断某皮肤自带模型是否真的随包；无 extractor 时返回 None。
-        """
-        if self._geom_dirs_cache is not None:
-            return self._geom_dirs_cache
-        ex = self._extractor
-        if ex is None:
-            return None
-        try:
-            names: set[str] = set()
-            for path in ex.file_tree:
-                if not path.endswith(".geometry"):
-                    continue
-                head, _, _ = path.rpartition("/")
-                folder = head.rpartition("/")[2]
-                if folder:
-                    names.add(folder)
-            self._geom_dirs_cache = names
-        except Exception:  # noqa: BLE001
-            return None
-        return self._geom_dirs_cache
-
-    def entry_by_name(self, name: str, ship_indexes: set[str]) -> CamouflageEntry | None:
-        self._ensure_loaded()
-        for entry in self._db["entries"].get(name, []):
-            if self._ship_group_match(entry, ship_indexes):
-                return entry
-        return None

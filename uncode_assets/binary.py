@@ -63,36 +63,6 @@ def resolve_relptr(base: int, rel: int) -> int:
 
 # ── Packed String ─────────────────────────────────────────────────────────
 
-def parse_packed_string_fields(data: bytes, struct_base: int) -> Tuple[int, int]:
-    """解析 packed string 头（16 字节）：char_count u32, pad u32, text_relptr i64。
-
-    返回 (char_count, text_relptr)。
-    """
-    _check(data, struct_base, 16)
-    char_count = read_u32(data, struct_base + 0)
-    _pad = read_u32(data, struct_base + 4)
-    text_relptr = read_i64(data, struct_base + 8)
-    return char_count, text_relptr
-
-
-def parse_packed_string(data: bytes, struct_base: int) -> str:
-    """从文件数据中解析 packed string。
-
-    字符串实际内容位于 `struct_base + text_relptr`，长度 char_count，
-    末尾可能带一个 \\0。
-    """
-    char_count, text_relptr = parse_packed_string_fields(data, struct_base)
-    if char_count == 0:
-        return ""
-    text_offset = resolve_relptr(struct_base, text_relptr)
-    text_end = text_offset + char_count
-    if text_end > len(data):
-        raise OutOfBoundsError(text_offset, char_count, len(data) - text_offset, "packed string")
-    raw = data[text_offset:text_end]
-    if raw.endswith(b'\x00'):
-        raw = raw[:-1]
-    return raw.decode('utf-8', errors='replace')
-
 
 def read_null_terminated_string(data: bytes, offset: int) -> str:
     """读取以 null 结尾的字符串。"""

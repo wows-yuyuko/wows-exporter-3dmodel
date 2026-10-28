@@ -164,16 +164,3 @@ CREATE TABLE IF NOT EXISTS camo_ship_groups (
     PRIMARY KEY(version_code, group_name, ship)
 );
 
--- 涂装选项图缓存：拆出的预览缩略图文件存 data/camo_thumbs/，本表只记录路径/尺寸/来源贴图
--- （避免每次涂装切换都重新拆图）。texture_tag 标识预览用的部件贴图（默认 tile 主贴图）。
-CREATE TABLE IF NOT EXISTS camo_thumbs (
-    version_code TEXT NOT NULL,
-    camo_name    TEXT NOT NULL,
-    texture_tag  TEXT NOT NULL DEFAULT 'tile',
-    thumb_path   TEXT NOT NULL DEFAULT '',
-    tex_path     TEXT NOT NULL DEFAULT '',
-    width        INTEGER DEFAULT 0,
-    height       INTEGER DEFAULT 0,
-    updated_at   TEXT DEFAULT (datetime('now','localtime')),
-    PRIMARY KEY(version_code, camo_name, texture_tag)
-);

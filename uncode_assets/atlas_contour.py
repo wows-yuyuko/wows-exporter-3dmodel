@@ -145,84 +145,9 @@ def decode_contours(data: bytes, name: str = "") -> Dict[str, Any]:
     }
 
 
-def encode_contours(root: Dict[str, Any]) -> bytes:
-    """把 :func:`decode_contours` 的 dict 编码回记录字节。
-
-    返回长度 = ``regionSize``；``[16, payloadAt)`` 这一段属于**别的记录**，
-    编码时按 0 填充（不参与比对）。未改动时 ``[0,16]`` 与 ``[payloadAt, regionSize)``
-    与原字节逐字节一致。
-    """
-    size = int(root.get("regionSize") or 0)
-    if size <= 0:
-        raise ContourFormatError("缺少 regionSize")
-    frames = root.get("frames") or []
-    count = int(root.get("frameCount") or len(frames))
-    fps_at = int(root.get("payloadAt") or root.get("framesAt") or 0)
-    if count and (fps_at <= 0 or fps_at + count * FRAME_SIZE > size):
-        raise ContourFormatError("frames 数组与 regionSize 不匹配")
-    reg = bytearray(size)
-
-    for raw in root.get("raw") or []:
-        off = int(raw.get("at") or 0)
-        blob = bytes.fromhex("".join(str(raw.get("hex") or "").split()))
-        if off < 0 or off + len(blob) > size:
-            raise ContourFormatError(f"raw 越界: at=0x{off:X} len={len(blob)}")
-        reg[off:off + len(blob)] = blob
-
-    struct.pack_into("<I", reg, 0, count)
-    struct.pack_into("<q", reg, 8, fps_at if count else 0)
-    for i, node in enumerate(frames):
-        pos = fps_at + i * FRAME_SIZE
-        points = node.get("points") or []
-        pcount = len(points) or int(node.get("pointCount") or 0)
-        struct.pack_into("<I", reg, pos, pcount)
-        at = int(node.get("at") or 0)
-        struct.pack_into("<q", reg, pos + 8, (at - pos) if at else 0)
-        if not (at and points):
-            continue
-        for k, pt in enumerate(points):
-            struct.pack_into("<f", reg, at + k * POINT_SIZE, float(pt.get("x") or 0.0))
-            struct.pack_into("<f", reg, at + k * POINT_SIZE + 4,
-                             float(pt.get("y") or 0.0))
-    return bytes(reg)
-
-
 def _num(value: Any) -> str:
     v = float(0.0 if value is None else value)
     return f"{v:.4f}"
-
-
-def format_contours_text(root: Dict[str, Any], name: str = "") -> str:
-    """解码结果 → 可读明文（每帧一组轮廓点）。"""
-    frames = [f for f in (root.get("frames") or []) if isinstance(f, dict)]
-    label = name or str(root.get("name") or "")
-    if not label:
-        label = "atlas.contours"
-    lines: List[str] = [
-        f'<contours name="{_xml_escape(label)}">',
-        f"{_T}<frameCount>{_T}{len(frames) or int(root.get('frameCount') or 0)}"
-        f"{_T}</frameCount>",
-    ]
-    if frames:
-        lines.append(f"{_T}<frames>")
-        for frame in frames:
-            points = [p for p in (frame.get("points") or []) if isinstance(p, dict)]
-            lines.append(f"{_T * 2}<item>")
-            lines.append(f"{_T * 3}<index>{_T}{int(frame.get('index') or 0)}"
-                         f"{_T}</index>")
-            lines.append(f"{_T * 3}<pointCount>{_T}"
-                         f"{len(points) or int(frame.get('pointCount') or 0)}"
-                         f"{_T}</pointCount>")
-            if points:
-                lines.append(f"{_T * 3}<points>")
-                for pt in points:
-                    lines.append(f"{_T * 4}<item>{_T}{_num(pt.get('x'))} "
-                                 f"{_num(pt.get('y'))}{_T}</item>")
-                lines.append(f"{_T * 3}</points>")
-            lines.append(f"{_T * 2}</item>")
-        lines.append(f"{_T}</frames>")
-    lines.append("</contours>")
-    return "\n".join(lines) + "\n"
 
 
 def _xml_escape(text: str) -> str:

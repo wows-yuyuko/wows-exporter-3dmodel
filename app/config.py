@@ -17,7 +17,6 @@ from typing import Optional
 from utils.path_utils import get_config_path
 
 
-
 @dataclass
 class AppConfig:
     """应用配置数据类"""
@@ -27,7 +26,6 @@ class AppConfig:
     game_version: str = "Unknown"
     game_data_state: bool = False
     wows_type: str = "未选择"   # "Wargaming" | "Lesta" | "未选择"
-    keep_split_json: bool = False  # 解析后是否保留 split JSON 文件
     bin_folder: str = ""  # 游戏 bin 子版本号（运行时由 import/扫描 <game>/bin 得到）
 
     # ── 游戏路径（按当前服务器动态解析） ──────────────────
@@ -58,22 +56,6 @@ class AppConfig:
             return True
         return False
 
-    @staticmethod
-    def _path_valid(path: str) -> bool:
-        """路径字段是否有效（非空且未用「未设置」占位）。"""
-        return bool(path) and path != "未设置"
-
-    def is_path_set(self, server: str) -> bool:
-        """指定服务器是否已设置有效路径。
-
-        当 server 为「未选择」时，任一服务器已设置路径即视为可用，
-        避免首次启动未选服务器时因只检查单一路径而误判为不可用。
-        """
-        if server == "Wargaming":
-            return self._path_valid(self.game_path_wargaming)
-        if server == "Lesta":
-            return self._path_valid(self.game_path_lesta)
-        return self._path_valid(self.game_path_lesta) or self._path_valid(self.game_path_wargaming)
 
     @classmethod
     def default(cls) -> AppConfig:
@@ -81,7 +63,7 @@ class AppConfig:
 
 
 #: 真正落盘的字段。其余字段（wows_type / bin_folder / game_version /
-#: game_data_state / keep_split_json）都是**运行时状态**：由 import 或
+#: game_data_state）都是**运行时状态**：由 import 或
 #: `_bootstrap()` 现场计算，写进 config.json 只会在换客户端后变成脏数据。
 PERSISTED_FIELDS = ("game_path_lesta", "game_path_wargaming")
 
@@ -153,15 +135,6 @@ class ConfigManager:
     @wows_type.setter
     def wows_type(self, value: str) -> None:
         self._config.wows_type = value
-        self.save()
-
-    @property
-    def keep_split_json(self) -> bool:
-        return self._config.keep_split_json
-
-    @keep_split_json.setter
-    def keep_split_json(self, value: bool) -> None:
-        self._config.keep_split_json = value
         self.save()
 
     @property
@@ -240,7 +213,3 @@ class ConfigManager:
             bus.log_message.emit(f"⚠️ 保存配置失败: {e}")
             print(f"保存配置失败: {e}")
 
-    def reset(self) -> None:
-        """重置为默认配置"""
-        self._config = AppConfig.default()
-        self.save()

@@ -393,19 +393,6 @@ class Mapping:
         "AAExtraBubbles": ("防空",),
     }
 
-    @staticmethod
-    def modifier_scope_ok(mod_key: str, section_label: str) -> bool:
-        """武器专用词条是否允许作用在 ``section_label`` 这个 section 上。
-
-        - ``section_label`` 为空：飞机子面板等内部调用，不限制
-        - 词条未登记在 ``MODIFIER_SECTION_SCOPE``：不限制
-        """
-        if not section_label:
-            return True
-        allowed = Mapping.MODIFIER_SECTION_SCOPE.get(mod_key)
-        if not allowed:
-            return True
-        return any(a in section_label for a in allowed)
 
     # ── 字段匹配短名（升级品/加成应用用，presenters 复用）──
     # 与 MODIFIER_MAP（显示名）不同：短名用于 _apply_modifiers_to_items 匹配 section items 字段名
@@ -892,11 +879,6 @@ class Mapping:
     # ⚠️ 只影响显示（AMMO_TYPE_MAP 即显示名）：穿深公式、标伤词条弹种门控、
     #    图标选择等逻辑仍用原始键（可用 ammo_type_key() 把显示名反查回去）。
 
-    @staticmethod
-    def ammo_type_label(raw) -> str:
-        """弹种显示名：CS → SAP、SS → 发烟弹；其它弹种原样返回（统一大写）。"""
-        key = str(raw or "").strip().upper()
-        return Mapping.AMMO_TYPE_MAP.get(key, key)
 
     @staticmethod
     def ammo_type_key(label) -> str:
@@ -907,82 +889,6 @@ class Mapping:
                 return raw
         return key
 
-    @staticmethod
-    def get_modifier_color(key: str, value: float | int) -> str:
-        """根据词条规则返回数值颜色 CSS 字符串，空字符串表示不指定颜色。"""
-        if not isinstance(value, (int, float)):
-            return ""  # dict/list 等非数值修饰符不参与颜色判定
-        fmt = Mapping.MODIFIER_FORMAT_MAP.get(key, "coeff")
-        av = abs(value)
-        if av < 0.001:
-            return ""
-        # 注：值倍率不影响符号/方向，因此此处不应用 MODIFIER_VALUE_FACTOR
-        # 符号翻转
-        if key in Mapping.MODIFIER_SIGN_INVERT:
-            value = -value
-        if fmt == "coeff" and abs(value - 1.0) < 0.001:
-            return ""
-        is_neg_dir = key in Mapping.MODIFIER_COLOR_NEG
-        if fmt == "coeff":
-            is_increase = value > 1.0
-        else:
-            is_increase = value > 0
-        is_buff = (not is_neg_dir and is_increase) or (is_neg_dir and not is_increase)
-        # 用主题色而不是写死的高饱和绿/红：深色主题用亮青绿/粉红，浅色主题用压深的同色相，
-        # 保证两种主题下都有足够对比度又不刺眼。
-        return "#4caf50" if is_buff else "#f44336"
-
-    @staticmethod
-    def format_modifier(key: str, value: float | int, *, color: bool = False) -> str:
-        """根据词条规则格式化修饰符数值，返回显示文本。
-        当 color=True 时返回带 HTML 颜色标签的文本：
-          - pos方向：正数绿色(#4caf50)、负数红色(#f44336)
-          - neg方向：负数绿色(#4caf50)、正数红色(#f44336)
-        """
-        if key in Mapping.MODIFIER_HIDDEN:
-            return ""
-        if not isinstance(value, (int, float)):
-            return ""  # dict/list 等非数值修饰符（如分舰种表）无法单值显示，跳过
-        fmt = Mapping.MODIFIER_FORMAT_MAP.get(key, "coeff")
-        av = abs(value)
-        if av < 0.001:
-            return ""
-        # 应用值倍率（存储值 × 系数 = 真实百分比）
-        factor = Mapping.MODIFIER_VALUE_FACTOR.get(key, 1.0)
-        value = value * factor
-        # 符号翻转：存储值与实际效果符号相反
-        invert = key in Mapping.MODIFIER_SIGN_INVERT
-        if invert:
-            value = -value
-        if fmt == "direct_pct":
-            # 存储值本身即百分数（0.2 → +0.20%），不再 ×100、也不按系数解读
-            text = f"{value:+.2f}%"
-        elif fmt == "coeff":
-            if abs(value - 1.0) < 0.001:
-                return ""
-            pct = (value - 1.0) * 100
-            text = f"{pct:+.1f}%"
-        elif fmt == "raw_pct":
-            pct = value * 100
-            text = f"{pct:+.1f}%"
-        elif fmt == "raw_int":
-            iv = int(value)
-            text = f"{iv:+.0f}"
-        elif fmt == "raw_km":
-            # 固定距离加值（存储单位米 → 显示公里，如 +500 → +0.50km）
-            text = f"{value / 1000:+.2f}"
-        else:
-            text = f"{value:+.1f}"
-        unit = Mapping.MODIFIER_UNIT_MAP.get(key, "")
-        if unit:
-            text += unit
-        if color:
-            # 颜色判断传入原始值（未翻转），由 get_modifier_color 自行处理符号翻转
-            raw_for_color = -value if invert else value
-            clr = Mapping.get_modifier_color(key, raw_for_color)
-            if clr:
-                text = f'<span style="color:{clr};">{text}</span>'
-        return text
 
     # ── 「每失去1%生命值」类词条的展开口径 ─────────────────────────────
     # 此类词条一个键对应多项属性，需展开显示（与技能面板 tooltip 同口径）：
@@ -1000,38 +906,6 @@ class Mapping:
         ("深水炸弹装填时间", "-"),
     )
 
-    @staticmethod
-    def lastchance_reload_items(value: float | int, ship_type_en: str = "") -> list[tuple[str, str]]:
-        """展开「每失去1%生命值」词条 → [(显示名, 带符号数值文本), ...]。
-
-        潜艇只影响鱼雷发射管与深水炸弹装填时间；其余舰种含主炮/副炮/空袭/防空。
-        """
-        try:
-            num = abs(float(value))
-        except (TypeError, ValueError):
-            return []
-        items = (Mapping.LASTCHANCE_RELOAD_ITEMS_SUB if ship_type_en == "Submarine"
-                 else Mapping.LASTCHANCE_RELOAD_ITEMS)
-        return [(name, f"{sign}{num:.2f}%") for name, sign in items]
-
-    @staticmethod
-    def rich_tooltip(text: str) -> str:
-        """将可能包含 HTML 标记的文本转为适合 QWidget.setToolTip 的富文本格式。
-        
-        Qt 的 tooltip 仅在文本以 '<' 开头时才启用富文本渲染，否则会将 HTML
-        标签原文显示。此方法确保：
-          - 检测到 HTML 标记时，整个文本包裹在 <html> 标签内
-          - 将 \\n 替换为 <br/>（HTML 模式下 \\n 不换行）
-        """
-        # 字面 \n（反斜杠+n，来自未解析转义的 PO/JSON）→ 真实换行符
-        text = text.replace("\\n", "\n")
-        if "<" not in text or ">" not in text:
-            return text
-        text = text.replace("\n", "<br/>")
-        text = text.replace("\r", "")
-        if not text.strip().startswith("<html"):
-            text = f"<html>{text}</html>"
-        return text
 
     TRIGGER_TYPE_MAP = {
         "enemyVehiclesDead": "敌方舰艇被击沉", "rageMode": "激活作战指令",

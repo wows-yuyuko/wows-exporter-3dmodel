@@ -140,27 +140,6 @@ class SceneResolver:
 
 # ── 各自格式头部解析 ──────────────────────────────────────────────────────
 
-def parse_geometry_header(data: bytes) -> dict:
-    """MergedGeometryPrototype 头部（0x48）。"""
-    if len(data) < GEOMETRY_HEADER_SIZE:
-        return {}
-    (mvc, mic, vmc, imc, cmc, amc) = struct.unpack_from("<6I", data, 0)
-    return {
-        "mergedVerticesCount": mvc,
-        "mergedIndicesCount": mic,
-        "verticesMappingCount": vmc,
-        "indicesMappingCount": imc,
-        "collisionModelCount": cmc,
-        "armorModelCount": amc,
-    }
-
-
-def parse_space_bin(data: bytes) -> int:
-    """space.bin 头部 → 实例数（instanceCount@0x00）。"""
-    if len(data) < 4:
-        return 0
-    return struct.unpack_from("<I", data, 0)[0]
-
 
 def parse_models_bin(data: bytes, resolver: SceneResolver) -> tuple[int, int, int, list[SceneModel]]:
     """解析 models.bin：返回 (modelsCount, skeletonsCount, modelBoneCount, models)。"""

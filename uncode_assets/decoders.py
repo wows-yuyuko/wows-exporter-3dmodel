@@ -40,65 +40,11 @@ def _f(v: float) -> float:
     return round(v, 6)
 
 
-def read_material_header(data: bytes, wargaming: Optional[bool] = None) -> dict:
-    """只读 MaterialPrototype 的头部字段（不解析属性，用于建 fx 索引）。
-
-    比 :func:`decode_material` 快两个数量级（不读贴图/数组），
-    但仍返回与解码结果同名的 `shader_id`（`0x%08X`）与 `material_hash`（`0x%016X`）。
-
-    Args:
-        data: 记录字节（从记录起始）。
-        wargaming: 是否 WG 0x78 布局；None → 按当前线程服务器判定。
-    """
-    wg = get_wows_type() == "Wargaming" if wargaming is None else bool(wargaming)
-    if len(data) < _LEGACY_MATERIAL_ITEM:
-        return {"shader_id": "", "material_hash": "", "collisionFlags": 0, "sortOrder": 0}
-    if get_wows_type() == "Legacy":
-        # 远古版本没有 shader_id 字段（+0x08 是 collisionFlags），fx 即 +0x00 的 selfId
-        cflags_raw = B.read_u32(data, 0x08)
-        sort_raw = B.read_u32(data, 0x0C)
-        return {
-            "shader_id": "",
-            "material_hash": f"0x{B.read_u64(data, 0x00):016X}",
-            "collisionFlags": 0 if cflags_raw in (0, 0xFFFFFFFF) else cflags_raw & 0xFF,
-            "sortOrder": 0 if sort_raw == 0xFFFFFFFF else sort_raw,
-        }
-    shader_off = 0x04 if wg else 0x08
-    mat_hash_off = 0x68 if wg else 0x78
-    if len(data) < mat_hash_off + 8:
-        return {"shader_id": "", "material_hash": "", "collisionFlags": 0, "sortOrder": 0}
-    shader_id = B.read_u32(data, shader_off)
-    material_hash = B.read_u64(data, mat_hash_off)
-    lay = _MATERIAL_LAYOUT[wg]
-    cflags_raw = B.read_u32(data, lay["cflags"]) if lay["cflags"] is not None else 0
-    sort_raw = B.read_u32(data, lay["sort"])
-    return {
-        "shader_id": f"0x{shader_id:08X}",
-        "material_hash": f"0x{material_hash:016X}",
-        "collisionFlags": 0 if cflags_raw in (0, 0xFFFFFFFF) else cflags_raw & 0xFF,
-        "sortOrder": 0 if sort_raw == 0xFFFFFFFF else sort_raw,
-    }
-
-
 def _arr(iterable) -> List:
     return list(iterable)
 
 
 _ASCII_RE = re.compile(rb"[\x20-\x7e]{3,}")
-
-
-def _extract_ascii_strings(data: bytes, limit: int = 50) -> List[str]:
-    """提取二进制区域中的内嵌可打印 ASCII 字符串（去重，限量）。"""
-    out: List[str] = []
-    seen = set()
-    for m in _ASCII_RE.finditer(data):
-        s = m.group().decode("ascii", "ignore")
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-            if len(out) >= limit:
-                break
-    return out
 
 
 _PARTICLE_HINTS = ("particle", ".effect", ".trail", ".vfx", "vfx", "fx/")

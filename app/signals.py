@@ -10,9 +10,6 @@ class _Signal:
         if fn not in self._slots:
             self._slots.append(fn)
 
-    def disconnect(self, fn):
-        if fn in self._slots:
-            self._slots.remove(fn)
 
     def emit(self, *args):
         for fn in list(self._slots):

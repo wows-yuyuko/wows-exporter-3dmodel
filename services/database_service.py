@@ -108,14 +108,6 @@ class DatabaseManager:
             type(self)._all_connections.discard(self._local.conn)
             self._local.conn = None
 
-    @classmethod
-    def close_all_connections(cls) -> None:
-        for conn in list(cls._all_connections):
-            try:
-                conn.close()
-            except Exception:
-                pass
-        cls._all_connections.clear()
 
     # ── Schema ─────────────────────────────────────────────
 
@@ -672,12 +664,6 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             return 0
 
-    def schema_rebuilt(self) -> bool:
-        """本次 initialize 是否因 schema 版本落后而整库重建（旧数据被清空）。
-
-        供启动/切换服务器时区分「需要重新加载数据」与「数据库为空」。
-        """
-        return self._schema_rebuilt
 
     def _record_version(self, ver: int) -> None:
         self._conn.execute(
@@ -761,13 +747,6 @@ class DatabaseManager:
             version_code = self.get_latest_version_code() or ""
         return version_code
 
-    def list_versions(self) -> list[dict]:
-        try:
-            cur = self._conn.execute(
-                "SELECT * FROM data_version_registry ORDER BY version_id DESC")
-            return [dict(r) for r in cur.fetchall()]
-        except sqlite3.OperationalError:
-            return []
 
     # ── 实体注册 ───────────────────────────────────────────
 
@@ -900,62 +879,6 @@ class DatabaseManager:
 
     # ── 舰船模块溅射防护口径 ───────────────────────────────
 
-    def save_ship_splash_protection(self, version_code: str, ship_id: str,
-                                    results: dict[str, list[dict]]) -> int:
-        """写入舰船各模块的溅射防护口径（Splash 有效装甲）。
-
-        results 结构来自 services.splash_protection_service.compute_*：
-            {module_type: [{config, module_key, boxes, effective_armor, protection_caliber}]}
-        返回写入行数。
-        """
-        import json
-        rows = []
-        for mtype, items in (results or {}).items():
-            for it in items:
-                rows.append((
-                    version_code, ship_id, mtype,
-                    it.get("config", ""), it.get("module_key", ""),
-                    json.dumps(it.get("boxes", []), ensure_ascii=False),
-                    it.get("effective_armor"), it.get("protection_caliber"),
-                ))
-        if not rows:
-            return 0
-        self._conn.execute(
-            "DELETE FROM ship_module_splash_protection "
-            "WHERE version_code=? AND ship_id=?", (version_code, ship_id))
-        self._conn.executemany(
-            "INSERT OR REPLACE INTO ship_module_splash_protection "
-            "(version_code, ship_id, module_type, config_group, module_key, "
-            " boxes_json, effective_armor, protection_caliber) "
-            "VALUES (?,?,?,?,?,?,?,?)", rows)
-        self._conn.commit()
-        return len(rows)
-
-    def load_ship_splash_protection(self, ship_id: str,
-                                    version_code: str = "") -> list[dict]:
-        """读取舰船模块溅射防护口径（最新版本）。"""
-        version_code = self._resolve_vc(version_code)
-        if not version_code:
-            return []
-        try:
-            cur = self._conn.execute(
-                "SELECT module_type, config_group, module_key, boxes_json, "
-                "effective_armor, protection_caliber "
-                "FROM ship_module_splash_protection "
-                "WHERE version_code=? AND ship_id=? ORDER BY module_type, config_group",
-                (version_code, ship_id))
-            out = []
-            for r in cur.fetchall():
-                d = dict(r)
-                import json
-                try:
-                    d["boxes"] = json.loads(d.pop("boxes_json") or "[]")
-                except (ValueError, TypeError):
-                    d["boxes"] = []
-                out.append(d)
-            return out
-        except sqlite3.OperationalError:
-            return []
 
     def load_ship_models(self, version_code: str = "") -> list[dict]:
         """读取可载入舰船列表（最新版本，空则返回空列表）。"""
@@ -995,98 +918,6 @@ class DatabaseManager:
 
     # ── 查询 ───────────────────────────────────────────────
 
-    def get_entity(self, category: str, key: str,
-                   version_code: str = "") -> Optional[dict]:
-        etype = self._entity_type(category)
-        version_code = self._resolve_vc(version_code)
-        if not version_code:
-            return None
-        try:
-            cur = self._conn.execute(
-                "SELECT * FROM entity_registry WHERE version_code=? AND entity_id=? AND entity_type=?",
-                (version_code, key, etype))
-            row = cur.fetchone()
-            if not row:
-                return None
-            return dict(row)
-        except sqlite3.OperationalError:
-            return None
-
-    def get_turret_arcs(self, ship_id: str, version_code: str = "") -> list[dict]:
-        """查询一艘舰船所有炮塔的射界数据（ship_turret_arcs 表）。
-
-        每行含 slot_type(artillery/atba/torpedoes/...)、hp_key、gun_index、
-        horiz_sector_json / vert_sector_json / dead_zone_json / pitch_dead_zones_json 等。
-        """
-        version_code = self._resolve_vc(version_code)
-        if not version_code:
-            return []
-        try:
-            cur = self._conn.execute(
-                "SELECT * FROM ship_turret_arcs "
-                "WHERE version_code=? AND ship_id=? ORDER BY slot_type, hp_key",
-                (version_code, ship_id))
-            return [dict(r) for r in cur.fetchall()]
-        except sqlite3.OperationalError:
-            return []
-
-    def has_turret_arcs(self, ship_id: str, version_code: str = "") -> bool:
-        """射界表是否有该舰船数据（用于判断是否需要从快照回填）"""
-        version_code = self._resolve_vc(version_code)
-        if not version_code:
-            return False
-        try:
-            r = self._conn.execute(
-                "SELECT 1 FROM ship_turret_arcs WHERE version_code=? AND ship_id=? LIMIT 1",
-                (version_code, ship_id)).fetchone()
-            return r is not None
-        except sqlite3.OperationalError:
-            return False
-
-    def list_entities(self, category: str, keyword: str = "",
-                      limit: int = 0, offset: int = 0,
-                      version_code: str = "") -> list[dict]:
-        etype = self._entity_type(category)
-        version_code = self._resolve_vc(version_code)
-        if not version_code:
-            return []
-        conn = self._conn
-        if keyword:
-            p = f"%{keyword}%"
-            sql = ("SELECT entity_id AS id, entity_type AS category, entity_id AS name, "
-                   "nation FROM entity_registry WHERE version_code=? AND entity_type=? AND entity_id LIKE ? "
-                   "ORDER BY entity_id")
-            params = [version_code, etype, p]
-        else:
-            sql = ("SELECT entity_id AS id, entity_type AS category, entity_id AS name, "
-                   "nation FROM entity_registry WHERE version_code=? AND entity_type=? "
-                   "ORDER BY entity_id")
-            params = [version_code, etype]
-        if limit > 0:
-            sql += " LIMIT ? OFFSET ?"
-            params += [limit, offset]
-        try:
-            return [dict(r) for r in conn.execute(sql, params).fetchall()]
-        except sqlite3.OperationalError:
-            return []
-
-    def count_entities(self, category: str, keyword: str = "",
-                       version_code: str = "") -> int:
-        etype = self._entity_type(category)
-        version_code = self._resolve_vc(version_code)
-        if not version_code:
-            return 0
-        conn = self._conn
-        if keyword:
-            p = f"%{keyword}%"
-            cur = conn.execute(
-                "SELECT COUNT(*) FROM entity_registry WHERE version_code=? AND entity_type=? AND entity_id LIKE ?",
-                (version_code, etype, p))
-        else:
-            cur = conn.execute(
-                "SELECT COUNT(*) FROM entity_registry WHERE version_code=? AND entity_type=?",
-                (version_code, etype))
-        return cur.fetchone()[0]
 
     def get_categories(self, version_code: str = "") -> list[str]:
         version_code = self._resolve_vc(version_code)
@@ -1103,31 +934,6 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             return []
 
-    def get_stats(self, version_code: str = "") -> dict:
-        version_code = self._resolve_vc(version_code)
-        conn = self._conn
-        cats, total = {}, 0
-        try:
-            # 单条 GROUP BY 聚合，替代逐类型 COUNT(*)（N+1）
-            if version_code:
-                cur = conn.execute(
-                    "SELECT entity_type, COUNT(*) FROM entity_registry "
-                    "WHERE version_code=? GROUP BY entity_type", (version_code,))
-            else:
-                cur = conn.execute(
-                    "SELECT entity_type, COUNT(*) FROM entity_registry GROUP BY entity_type")
-            counts = {r[0]: r[1] for r in cur.fetchall()}
-            for et in ENTITY_TYPES:
-                cnt = counts.get(et, 0)
-                cats[et] = cnt; total += cnt
-        except sqlite3.OperationalError:
-            pass
-        try:
-            mc = conn.execute("SELECT COUNT(*) FROM name_mappings").fetchone()[0]
-        except sqlite3.OperationalError:
-            mc = 0
-        return {"total_entities": total, "db_file_size_mb": self.db_size_mb,
-                "categories": cats, "name_mappings": mc}
 
     # ── 本地化 ─────────────────────────────────────────────
 
@@ -1144,34 +950,6 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             return {}
 
-    def ship_name_gaps(self, version_code: str = "", limit: int = 12) -> tuple[int, int, list[str]]:
-        """舰船中文名覆盖统计：返回 (有名字的船数, 舰船总数, 前 limit 个缺名 ship_index)。
-
-        空白/纯空格的名字视为缺失（上游语言文件常用一个空格表示「未翻译」）。
-        保留为只读诊断工具（当前界面不调用）。
-        """
-        version_code = self._resolve_vc(version_code)
-        if not version_code:
-            return 0, 0, []
-        sql = (
-            "SELECT COUNT(*) AS total, "
-            "SUM(CASE WHEN TRIM(COALESCE(nm.lang_zh,'')) <> '' THEN 1 ELSE 0 END) AS named "
-            "FROM ship_basic_info b "
-            "LEFT JOIN name_mappings nm ON nm.category='ship' AND nm.key_name=b.ship_index "
-            "WHERE b.version_code=?"
-        )
-        try:
-            row = self._conn.execute(sql, (version_code,)).fetchone()
-            total = int(row["total"] or 0)
-            named = int(row["named"] or 0)
-            gaps = [r["ship_index"] for r in self._conn.execute(
-                "SELECT b.ship_index AS ship_index FROM ship_basic_info b "
-                "LEFT JOIN name_mappings nm ON nm.category='ship' AND nm.key_name=b.ship_index "
-                "WHERE b.version_code=? AND TRIM(COALESCE(nm.lang_zh,''))='' "
-                "ORDER BY b.ship_index LIMIT ?", (version_code, limit)).fetchall()]
-            return named, total, gaps
-        except sqlite3.OperationalError:
-            return 0, 0, []
 
     def import_enum_translations(self) -> int:
         """从 models.name_mapping.Mapping 静态字典写入 enum_translations 表"""
@@ -1250,55 +1028,6 @@ class DatabaseManager:
                 pass
         return stats
 
-    def backfill_ship_name_mapping_ids(self) -> int:
-        """把 ``ship_basic_info.name_mapping_id`` 仍为空、但名字已能按
-        ``(category='ship', key_name=ship_index)`` 命中的行补上 id。
-
-        解析入库时该列是"入库那一刻"用子查询写死的；若当时文本还没加载，值就永久是 NULL。
-        加载文本后调用本方法即可让按 id 的读取路径也生效（返回更新行数）。
-        """
-        try:
-            cur = self._conn.execute(
-                """
-                UPDATE ship_basic_info
-                   SET name_mapping_id = (
-                       SELECT nm.id FROM name_mappings nm
-                        WHERE nm.category = 'ship' AND nm.key_name = ship_basic_info.ship_index)
-                 WHERE name_mapping_id IS NULL
-                   AND EXISTS (SELECT 1 FROM name_mappings nm
-                                WHERE nm.category = 'ship' AND nm.key_name = ship_basic_info.ship_index)
-                """)
-            n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-            self._conn.commit()
-            return int(n)
-        except Exception:  # noqa: BLE001
-            return 0
-
-    def import_po_translations(self, po_path: str | Path) -> int:
-        fp = Path(po_path)
-        if not fp.exists():
-            return 0
-        text = fp.read_text(encoding="utf-8")
-        fp.unlink(missing_ok=True)
-        # 合并多行 msgstr 续行格式（共用 utils.po_utils）
-        from utils.po_utils import join_po_multiline
-        text = join_po_multiline(text)
-        items = []
-        blocks = re.split(r'\n(?=msgid)', text)
-        _Q = re.compile(r'^msgstr\s+"((?:[^"\\]|\\.)*)"\s*$', re.MULTILINE)
-        for block in blocks:
-            m = re.search(r'^msgid\s+"(.+)"\s*$', block, re.MULTILINE)
-            s = _Q.search(block)
-            if m and s and m.group(1) and s.group(1):
-                items.append((m.group(1), _unescape_po_str(s.group(1)), ""))
-        if items:
-            try:
-                self._conn.executemany(
-                    "INSERT OR REPLACE INTO po_translations (msgid, msgstr, context) VALUES (?,?,?)", items)
-                self._conn.commit()
-            except Exception:
-                pass  # po_translations 表可能不存在于新 schema，静默忽略
-        return len(items)
 
     # ── 数据库管理 ─────────────────────────────────────────
 
@@ -1313,21 +1042,6 @@ class DatabaseManager:
     @property
     def db_path(self) -> Path:
         return self._db_path
-
-    def vacuum(self) -> None:
-        self._conn.execute("VACUUM")
-
-    def drop_all(self) -> None:
-        conn = self._conn
-        conn.execute("PRAGMA foreign_keys=OFF")
-        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        for (tname,) in tables:
-            try:
-                conn.execute(f'DELETE FROM "{tname}"')
-            except sqlite3.OperationalError:
-                pass
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.commit()
 
 
 def _unescape_po_str(s: str) -> str:
@@ -1377,104 +1091,4 @@ def reset_db() -> None:
 
 # ── Schema 版本一致性检查（纯只读，不触发 initialize/重建）─────────────────
 
-def _read_schema_version(db_path: Path) -> int:
-    """只读方式读取数据库文件当前记录的 schema 版本（meta_schema_version 最大值）。
 
-    文件不存在 / 打开失败 / 无该表 → 返回 0（视为全新库，不参与「落后」判定）。
-    仅以只读方式打开，绝不触发 SQLite 创建数据库文件或任何重写。
-    """
-    if not db_path.exists():
-        return 0
-    try:
-        # mode=ro 只读打开（WAL 库也能读到已提交数据），不落盘、不建库
-        conn = sqlite3.connect(
-            f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
-        try:
-            row = conn.execute(
-                "SELECT version FROM meta_schema_version "
-                "ORDER BY version DESC LIMIT 1").fetchone()
-            return int(row[0]) if row else 0
-        finally:
-            conn.close()
-    except (sqlite3.Error, OSError, ValueError):
-        return 0
-
-
-def read_latest_version_code(wows_type: str = "") -> str:
-    """**纯只读**读取指定服务器数据库中已入库的最新版本号。
-
-    与 `DatabaseManager.get_latest_version_code()` 口径一致（优先返回带
-    `meta_import_state` 完成标记的最新版本；老库无该表/表为空时按「最新版本」处理），
-    但**不触发 initialize、不建库、不整库重建**，也不改动任何文件 ——
-    用于在不切换服务器、不动用数据库单例的前提下查看**另一个服**的数据版本。
-
-    库文件不存在 / 无相关表 / 没有跑完的版本 → 返回 ""。
-    """
-    db_path = get_data_dir() / DatabaseManager._db_name(wows_type)
-    if not db_path.exists():
-        return ""
-    try:
-        # mode=ro 只读打开（WAL 库也能读到已提交数据），绝不创建/改写文件
-        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
-    except sqlite3.Error:
-        return ""
-    try:
-        try:
-            rows = [r[0] for r in conn.execute(
-                "SELECT version_code FROM data_version_registry ORDER BY version_id DESC")]
-        except sqlite3.Error:
-            return ""                      # 未建库 / 老库无该表
-        if not rows:
-            return ""
-        try:
-            done = {r[0] for r in conn.execute("SELECT version_code FROM meta_import_state")}
-        except sqlite3.Error:
-            done = set()                   # 老库：还没这张表
-        if not done:
-            return rows[0]                 # 兼容旧库：按「最新版本」处理
-        for code in rows:
-            if code in done:
-                return code
-        return ""                          # 一个跑完的都没有 ⇒ 视为无可用数据
-    except sqlite3.Error:
-        return ""
-    finally:
-        conn.close()
-
-
-def check_schema_mismatches(wows_type: str = "") -> list[dict]:
-    """纯只读检查指定服务器对应的两个数据库文件 schema 版本是否与当前程序不一致。
-
-    对应关系（与 DatabaseManager._db_name / AssetsCacheService._db_name 一致）：
-      Lesta      → game_data.db + assets_data.db
-      Wargaming  → game_data_wg.db + assets_data_wg.db
-
-    「不一致」判定：库内 meta_schema_version 记录 found > 0 且 found != 当前代码预期版本。
-    （found == 0 表示全新/未建库，不算不一致，不提示。）
-
-    返回（仅含不一致的库，空列表表示全部匹配）：
-      [{"kind": "game"|"assets", "db": 文件名, "found": 库内版本, "expected": 当前版本}, ...]
-    """
-    from services.assets_cache_service import (
-        AssetsCacheService, ASSETS_SCHEMA_VERSION,
-    )
-    if not wows_type:
-        from app.application import app as app_ctx
-        wows_type = app_ctx.ctx.wows_type
-
-    data_dir = get_data_dir()
-    checks = [
-        ("game", DatabaseManager._db_name(wows_type), DB_SCHEMA_VERSION),
-        ("assets", AssetsCacheService._db_name(wows_type), ASSETS_SCHEMA_VERSION),
-    ]
-    mismatches: list[dict] = []
-    for kind, name, expected in checks:
-        found = _read_schema_version(data_dir / name)
-        if found > 0 and found != expected:
-            mismatches.append({
-                "kind": kind,
-                "db": name,
-                "found": found,
-                "expected": expected,
-            })
-    return mismatches

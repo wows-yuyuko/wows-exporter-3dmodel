@@ -273,6 +273,3 @@ def item_size_for_blob(index: int, magic: Optional[int] = None,
     return 0x10
 
 
-def default_item_sizes(wows_type: Optional[str] = None) -> dict:
-    """各 blob 的默认 item_size（供 CLI/工具快速查表；当前服务器）。"""
-    return {t.blob_index: t.item_size for t in _type_table(wows_type)}

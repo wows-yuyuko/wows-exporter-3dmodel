@@ -365,31 +365,6 @@ ARMOR_TYPE_ORDER: list[str] = [
 ]
 
 
-def get_armor_types(mat_name: str) -> frozenset[str]:
-    """材质名 → 归属装甲类型集合（对应游戏内装甲类型判定）。
-
-    - 非 `Dual_`：用完整材质名前缀匹配各类型的 prefix 元组
-    - `Dual_X_Y_*`：对 `_` 分隔的第 1、2 段分别匹配（可命中多个类型）
-    返回 frozenset（空 = 无归属类型）。
-    """
-    if not mat_name:
-        return frozenset()
-    if mat_name.startswith("Dual"):
-        candidates = mat_name.split("_")[1:3]
-    else:
-        candidates = [mat_name]
-    result: set[str] = set()
-    for candidate in candidates:
-        for atype, prefixes in ARMOR_TYPE_PREFIXES.items():
-            if any(candidate.startswith(p) for p in prefixes):
-                result.add(atype)
-    return frozenset(result)
-
-
-def armor_type_display(atype: str) -> str:
-    return ARMOR_TYPE_NAMES.get(atype, atype)
-
-
 # ────────────────────────────────────────────────────────────────────────────
 # 命中区域分类
 # ────────────────────────────────────────────────────────────────────────────#: 命中区域中文显示名（内部 key 保持英文；JSON zones 可覆盖/扩展）

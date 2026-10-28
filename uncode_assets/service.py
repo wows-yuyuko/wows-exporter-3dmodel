@@ -256,23 +256,6 @@ class AssetsBinService:
         from .parse_rules import RULE_LEGACY, RULE_WG_OLD
         return getattr(self, "_auto_rule", "") in (RULE_LEGACY, RULE_WG_OLD)
 
-    @property
-    def wows_type_auto(self) -> bool:
-        """构造时是否请求了「自动」判定。"""
-        return getattr(self, "_wows_type_auto", False)
-
-    @property
-    def auto_rule(self) -> str:
-        """``wows_type='auto'`` 自动判定出的规则（``Lesta`` / ``Wargaming`` / ``legacy``）。
-
-        判不出来时为空串 —— 此时 :attr:`wows_type` 仍是退回的默认 Lesta。
-        """
-        return getattr(self, "_auto_rule", "")
-
-    @property
-    def auto_rule_reason(self) -> str:
-        """``wows_type='auto'`` 时的判定依据说明（未自动判定为空串）。"""
-        return getattr(self, "_auto_rule_reason", "")
 
     @property
     def game_dir(self) -> Optional[Path]:
@@ -319,16 +302,6 @@ class AssetsBinService:
         """列出虚拟目录下的子项。"""
         return self.vfs.list_dir(dir_path)
 
-    def find_files(self, keyword: str = "", max_results: int = 100) -> List[VirtualFile]:
-        """按路径关键字查找虚拟文件。"""
-        kw = keyword.lower()
-        matches = []
-        for f in self.vfs.all_files():
-            if kw in f.path.lower():
-                matches.append(f)
-                if max_results and len(matches) >= max_results:
-                    break
-        return matches
 
     # ── 解码 ─────────────────────────────────────────────
 
@@ -402,21 +375,6 @@ class AssetsBinService:
             data = self.vfs.open_file(path)
             return decode_prototype_to_json(data, self.db, f.prototype_type)
 
-    def decode_material_by_path(self, path: str) -> dict:
-        """按路径解码 MFM 材质（对齐 wows-toolkit `--parse-material` / `parse_mfm_from_db`）。"""
-        from .types import wows_type_context
-        with wows_type_context(self._wows_type):
-            f = self.vfs.get_file(path)
-            if f is None:
-                raise AssetsBinError(f"虚拟文件不存在: {path}")
-            if f.prototype_type is None or f.prototype_type.name != "MaterialPrototype":
-                raise AssetsBinError(f"路径不是 MaterialPrototype: {path} ({f.prototype_type})")
-            data = self.vfs.open_file(path)
-            return decode_material(data, self.db)
-
-    def decode_mfm_by_self_id(self, self_id: int) -> Optional[dict]:
-        """按 selfId 反查并解码 MFM 材质（对齐 wows-toolkit `parse_mfm_from_db`）。"""
-        return parse_mfm_from_db(self.db, self_id)
 
     # ── 批量导出 ─────────────────────────────────────────
 

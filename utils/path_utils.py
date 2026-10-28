@@ -34,15 +34,6 @@ from pathlib import Path
 IS_COMPILED: bool = "__compiled__" in globals()
 
 
-def is_debug_build() -> bool:
-    """是否「调试模式」——即按源码方式启动（非 Nuitka 编译的发布版）。
-
-    用途：把只有排障时才需要的信息（引擎功率基准 P、阻力系数 k、弹射功率倍率…）
-    限制在源码/调试运行时显示，发布版 exe 不显示。
-    """
-    return not IS_COMPILED
-
-
 def _get_source_root() -> Path:
     """源码模式下的项目根目录"""
     return Path(__file__).resolve().parent.parent

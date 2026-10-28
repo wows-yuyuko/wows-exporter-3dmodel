@@ -50,15 +50,6 @@ class OodleBitReader:
                 self.ptr += 1
                 self.bits_left += 8
     
-    def _init_stream_reverse(self):
-        """反向流: 从末尾加载4字节, 小端序, 保持32位"""
-        self.bit_buf = 0
-        self.bits_left = 0
-        for _ in range(4):
-            if self.ptr > 0:
-                self.ptr -= 1
-                self.bit_buf = ((self.bit_buf << 8) | self.data[self.ptr]) & 0xFFFFFFFF
-                self.bits_left += 8
     
     def refill(self):
         """C++ Refill: 右移8bit, 在24位加载新字节"""
@@ -67,12 +58,6 @@ class OodleBitReader:
             self.ptr += 1
             self.bits_left += 8
     
-    def refill_reverse(self):
-        """反向流补充: 从ptr-1加载到低位, 保持32位"""
-        while self.bits_left <= 24 and self.ptr > 0:
-            self.ptr -= 1
-            self.bit_buf = ((self.bit_buf << 8) | self.data[self.ptr]) & 0xFFFFFFFF
-            self.bits_left += 8
     
     def peek(self, n: int = 11) -> int:
         """窥视顶部 n 比特"""
@@ -80,10 +65,6 @@ class OodleBitReader:
             self.refill()
         return self.bit_buf >> (32 - n)
     
-    def peek_reverse(self, n: int = 11) -> int:
-        if self.bits_left < n:
-            self.refill_reverse()
-        return self.bit_buf >> (32 - n)
     
     def consume(self, n: int):
         """消耗顶部 n 比特 (左移)"""
@@ -99,12 +80,6 @@ class OodleBitReader:
         self.bits_left -= 1
         return b
     
-    def read_bits_nr(self, n: int) -> int:
-        """读 n 比特 (从MSB, no refill)"""
-        val = self.bit_buf >> (32 - n)
-        self.bit_buf = (self.bit_buf << n) & 0xFFFFFFFF
-        self.bits_left -= n
-        return val
 
 
 # ══════════════════════════════════════════════════════════
@@ -271,11 +246,6 @@ class BitReader2:
             result = (result << 1) | self.read_bit()
         return result
     
-    def align_to_byte(self):
-        """字节对齐"""
-        if self.bitpos != 0:
-            self.ptr += 1
-            self.bitpos = 0
 
 
 def _decode_golomb_rice_lengths(dst, dst_size, br2):
