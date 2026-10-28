@@ -2,6 +2,9 @@
 
 > 入口：`cli.py import` → `services/processor_service.run_process()`
 > schema：`resources/database/{lesta,wargaming}/database_new.sql`
+>
+> **单版本镜像 + 增量同步**（2026-10-28 重构）：库只反映最后一次同步的客户端 build；
+> 内容没变的行不重写，只刷 `last_checked`。
 
 ## 1. 输入文件与解码
 
@@ -11,100 +14,118 @@
 ```python
 gpd = open(data/GameParams*.data).read()
 gpd = gpd[::-1]                      # 1) 整体反转
-data = zlib.decompress(gpd)          # 2) zlib
+gpd = zlib.decompress(gpd)           # 2) zlib
 pickle.loads(gpd, encoding='latin1') # 3) pickle → GPData / dict
 ```
 
-两服的 pickle **顶层结构不同**，靠"有没有 `''` 键"分流
-（`processor_service.py:255-273`）：
+两服的 pickle **顶层结构不同**，靠"有没有 `''` 键"分流：
 
 | 服务器 | 顶层结构 | 遍历方式 |
 |---|---|---|
-| Lesta | `list[dict]`，每个元素一个实体，`idx==0` 是表头 | `enumerate(data)`，`typeinfo` 由 `ti = idx` 标记 |
-| Wargaming | `dict`，实体全在 `data['']` 下 | 取 `source_dict`，`typeinfo=None` |
+| Lesta | `list[dict]`，每个元素一批实体 | 逐个 `elem.items()` |
+| Wargaming | `dict`，实体全在 `data['']` 下 | 取 `source_dict` |
 
 `core/gameparams.py`（CLI 列船用）额外支持 WG 的 **deflate 变体**：
-`zlib.decompressobj(-15)` 解出后整体反转再 zlib（`core/gameparams.py:40-44`）。
-两条路径互不依赖：`list`/`export-keys` 走 `core.gameparams`，`import` 走
-`processor_service`。
+`zlib.decompressobj(-15)` 解出后整体反转再 zlib。两条路径互不依赖：
+`list`/`export-keys`/`diff` 走 `core.gameparams`，`import` 走 `processor_service`。
 
-## 2. 拆分与入库
+## 2. 只保留舰船
 
-每个实体按 `typeinfo.type` 归类（`TYPE_CATEGORY_MAP`，`processor_service.py:180`）：
+`typeinfo.type == "Ship"` 的实体才进库 —— 导出链路只读舰船（其余 2.3 万条
+Gun/Projectile/Aircraft 快照无人读取，曾占 100+ MB）。
 
-```python
-{"Ship": "Ship", "Gun": "Gun", "Projectile": "Projectile",
- "Aircraft": "Aircraft", "Ability": "Ability",
- "Modernization": "Modernization", "Crew": "Crew",
- "Other": "Other", "Exterior": "Exterior"}
+> ⚠️ 顺序很重要：**先按 `typeinfo.type` 过滤，再 `json.dumps`**。
+> 2.3 万实体全做一次 json 往返要几十秒，而最终只留 1.1 千条。
+> 实体在 pickle 里是自定义对象不是 dict，取类型要走 `_entity_type()`（兼容两者）。
+
+每艘船产出两样东西：
+
+| 产物 | 内容 | 去向 |
+|---|---|---|
+| 元信息 | `id` / `index` / `name` / `nation` / `level` / `typeinfo.species` / `group` / 船体模型目录 | `ship` |
+| 规范化快照 | `json.dumps(entity, sort_keys=True, ensure_ascii=False)` + `sha1` | `ship_data` |
+
+快照是**装甲厚度、挂载 model 路径、`permoflages`** 的唯一来源，导出期必读。
+平均约 100 KB/条，占整库 84%，所以增量同步的第一个优化就是「sha1 没变就不重写它」。
+
+## 3. 表结构（7 张表）
+
+```text
+ship          主表：一艘船一行（数字 id 主键，GameParams 的 $.id）
+ship_data     从表：快照 JSON（1:1，单独存放，避免整表扫描拖入大 blob）
+model         从表：一个模型目录一行（21k）
+model_file    从表：模型目录下的 .geometry 清单（crc32 + size）
+ship_model    关联：船 ↔ 模型 N:N（挂载模型多船共用，40k 行）
+meta          key/value：build / game_version / synced_at / assets_build …
+meta_schema_version  schema 版本（低版本 → 整库重建）
 ```
 
-WG 的类型集合可能与 Lesta 不同，差异预留在 `services/wg_compat.py`
-（`get_type_category_map(wows_type)`；当前**未填充** → 回退 Lesta 默认）。
+为什么「船 : 模型」不是 1:1：一条船有 1 个船体 + N 个挂载；而
+`JGM055_100mm65_Type98` 这类挂载被 13 条船共用。所以必须经 `ship_model`
+关联，`role` 记位置（`hull` / `A_Artillery.HP_JGM_1`）。
 
-落库实际只写这些：
+> `ship.name` 与船体模型目录**不是同一个字符串**：
+> `PBSD511_Waterloo`（带 P 前缀 + 编号）vs `BSD100_Waterloo_1956`（另一套编号）。
+> 两者只能靠快照里 `A_Hull.model` 的路径关联。
 
-| 目标 | 内容 | 说明 |
+## 4. 增量规则
+
+每个元信息行带三个时间戳 + 两个 build：
+
+| 字段 | 什么时候写 |
+|---|---|
+| `first_build` / `first_seen` | 首次入库，之后不变 |
+| `last_build` / `last_changed` | 内容**真变了**（快照 sha1 或模型签名变化） |
+| `last_checked` | 每次同步都刷（没变也刷） |
+
+判据：
+
+| 对象 | 判据 | 代码 |
 |---|---|---|
-| `data/split/<Category>/*.json` | 每实体一个 JSON | **导入过程的临时产物**，收尾即删（没有开关控制）。只供同一次导入里的后续步骤读，跨进程不再存在 |
-| `entity_snapshots` | 实体原始 JSON | **只写 `entity_type='ship'`**（见下） |
-| `ship_models` | 模型目录名 | 导出期取 `model_folder` |
-| `meta_import_state` / `data_version_registry` | build 号与版本状态 | `core/build_info.imported_build()` 读 |
+| 船 | `ship_data.sha1`（规范化 JSON 的哈希） | `_build_ship_rows()` |
+| 模型 | `model.sig` = sha1(目录名 + 每个 `.geometry` 的 `(文件名, crc32, size)`) | `services/model_index.py` |
 
-> ⚠️ **分析层已裁剪**：`processor_service._run_analysis()` 第一行就是 `return`
-> （函数体保留作参考）。所以 `ship_basic_info` / `projectile_*` / `crew_*` /
-> `name_mappings` 等结构化表**新导入不再写入**，库里现有的行数是旧版导入的遗留。
-> 不要再按"导入会刷新这些表"来做设计。
+`model.sig` 只读 `bin/<build>/idx/*.idx`（21k 目录 / 27k geometry，实测 **5.5 s**），
+**不加载 assets.bin、不解包几何**。crc32 是 idx 里本来就存的「解压后内容 CRC32」。
 
-```python
-# processor_service._finalize_import
-db.save_entity_snapshots([s for s in snapshots_batch if s[1] == "ship"], version_code=...)
+传播：模型变了 → 引用它的船也算变动（挂载是共享件）：
+
+```sql
+UPDATE ship SET last_build=?, last_changed=?
+WHERE id IN (SELECT ship_id FROM ship_model WHERE model_id IN (...))
 ```
 
-限定 ship 是 2026-10-26 的裁剪：其余 2.3 万条 Gun/Projectile/Aircraft/… 快照
-无人读取，占约 100 MB。实测 `game_data_wg.db` 318 → 157 MB，`game_data.db`
-162 → 120 MB。ship 快照平均 105 KB/条（`A_AirDefense` 26% / `A_Hull` 15% /
-`A_ATBA` 10% 都是挂载 model 路径来源，**不可再裁**）。
+实测（同一 build 重复 import）：
 
-## 3. 表结构与"实际被谁读"
+```text
+战舰 新增 0 / 变动 0 / 未变 1165 / 下架 0
+模型 新增 0 / 变动 0 / 未变 21232 / 消失 0
+→ 18 s（全量首次约 4 min，其中 92 s 是读 assets.bin）
+```
 
-`database_new.sql` 两服各有 **50+ 张表**，但导出链路只读 4 张：
+下架的船**不删行**，只置 `status='removed'` —— 「这船曾经存在」这个事实要留着，
+否则下次又出现时无法区分「回归」和「新增」。
 
-| 表 | 导出期用途 | 代码 |
-|---|---|---|
-| `meta_import_state` | 取 build 号（`8867689_8867689` → `8867689`） | `core/build_info.imported_build()` |
-| `entity_snapshots`（`entity_type='ship'`） | 舰船 JSON：装甲厚度字典、各挂载组件 model 路径、`permoflages` | `geometry_service._ship_snapshot()`、`camo_service` |
-| `ship_models` | 模型目录名（`model_folder`） | `database_service.load_ship_models()` |
-| `name_mappings`（`category='ship'`） | 舰船中文名（`"PJSB018_Yamato_1944"` → `"大和"`） | `geometry_service._ship_display_name()` → `get_all_name_mappings("ship")` |
+## 5. 一致性
 
-`entity_registry` **只在导入期写**（`register_entities()`，给 `entity_snapshots` 做外键），
-导出不读 —— 别把它算进"导出依赖"。
+- `DB_SCHEMA_VERSION = 49`。库里版本更低时 `initialize()` **整库重建**
+  （`_schema_rebuilt=True`），之后就一直增量。
+- 全部写在一个事务里，最后一次 `commit()`；中途被强杀不会留半成品
+  （`meta.build` 仍是上一次成功同步的值）。
+- 收尾 `checkpoint("TRUNCATE")` 回收 WAL。
+- `assets_data*.db` 由后台线程并行同步，主流程在工作线程里等 `assets_done`
+  （最长 900 s）。成功后写 `meta.assets_build`；失败则不写，下次 `import`
+  发现 `assets_build != build` 会自动重试。
 
-其余（`ship_basic_info`、`ship_module_*`、`projectile_*`、`crew_*`、`consumable_*`、
-`enum_translations` …）属于原「数据浏览/对比」功能：导出不读，
-**新导入也不再写**（分析层已裁剪，见 §2 的警告）。可以直接删表瘦身；
-`assets_data` 侧的裁剪方案见 [../../known-issues.md](../../known-issues.md) 的「数据库精简」。
-
-## 4. 版本与一致性
-
-- `DB_SCHEMA_VERSION = 48`（`database_service.py:20`）。库里版本更低时
-  `initialize()` **整库重建**（`_schema_rebuilt=True`），调用方据此提示"需重新加载数据"。
-- 每次导入 `begin_version()` 写 `data_version_registry`，全部成功后才
-  `mark_version_complete()` 写 `meta_import_state`。中途被杀 → 半成品不会被
-  `get_latest_version_code()` 当成可用。
-- 收尾 `checkpoint("TRUNCATE")` 回收 WAL（大 WAL 会拖慢后续开库）。
-- `assets_data*.db` 由后台线程并行写，主流程 `assets_done.wait(timeout=900)`；
-  超时或失败 → 整个 import 报错终止（不标完成）。
-
-## 5. 两服差异（详表见 `../servers/`）
+## 6. 两服差异
 
 | 项 | Lesta | WG |
 |---|---|---|
 | 库文件名 | `game_data.db` | `game_data_wg.db` |
 | schema 目录 | `resources/database/lesta/` | `resources/database/wargaming/` |
-| 独有表 | — | `ship_module_atba_config`、`crew_skill_groups` |
 | GameParams 文件名 | `GameParams_py3.data` 优先 | `GameParams.data` 优先 |
 | 当前舰船数 | 1,165 | 1,246 |
+| 当前模型目录 | 21,232 | —（未实测） |
 
-SQL 里两服**同名表也可能列不同**（如 WG 的 `ship_module_atba_config`），
-所以 schema 必须按服务器取目录，不能共用一份。
+两服的库**绝不合并**：`PJSB018_Yamato_1944` 在两边同名但内容不同。
+schema 文件也各一份（当前两份内容一致，保留分目录是为了以后能按服调）。

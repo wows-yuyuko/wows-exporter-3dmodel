@@ -20,7 +20,7 @@
 
 - `meta` 只用于展示，不影响导出；
 - `shape_names` 按 `bin_folder` **精确过滤** → 查空；
-  几何侧已改用 `render_sets` 自带 `shape` 做 LOD/crack 判定，所以导出结果仍正确；
+  几何侧已改用 `render_set` 自带 `shape` 做 LOD/crack 判定，所以导出结果仍正确；
 - 修法：重跑 `python cli.py import --game D:\Games\World_of_Warships --server wg`。
 
 ## 2. 素材格式
@@ -58,7 +58,7 @@
 |---|---|
 | `assets_data_wg.db` | 623 MB |
 | `game_data_wg.db` | 157 MB |
-| `render_sets` | 392,305 |
+| `render_set` | 392,305 |
 | `material_full` | pbs 19,708 / other 12,040 / indexed 0 |
 | `ship_basic_info` | 1,246 |
 | `exteriors` | 2,362（Ensign 930 / Skin 667 / MSkin 246 / Permoflage 221 / Camouflage 131 / VisualCustomization 51） |

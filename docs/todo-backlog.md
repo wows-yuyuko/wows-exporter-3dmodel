@@ -528,7 +528,7 @@ load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是�
 
 | 参考项 | 出处 | 原因 |
 |---|---|---|
-| assets.bin PrototypeDatabase 全解析、VFS 浏览、粒子效果 | `unpack_assets_bin.md` | 导出只读 `render_sets` / `material_full` / `skeleton_*` |
+| assets.bin PrototypeDatabase 全解析、VFS 浏览、粒子效果 | `unpack_assets_bin.md` | 导出只读 `render_set` / `material_full` / `skeleton_*` |
 | D3D11 渲染器、Qt 交互、拾取、HUD、设备丢失恢复 | `d3d11_renderer.md` | 本项目无 GUI |
 | 装甲展示重构、分区高亮、穿透计算器 | `unpack_geo_and_display.md` 第二章 | 同上 |
 | 涂装切换器 UI、实时换肤、缩略图 | `camo_switcher.md` 三～五章 | 我方只出离线产物，切换由前端做 |
@@ -585,13 +585,23 @@ load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是�
 P0、P1 与 P2-1/3/4/5/6/7 已全部结清（逐项状态见各节标题）。下面是**还没做**的全部项，
 按「收益 ÷ 风险」排序，括号内为实测数据来源。
 
+### A0. 数据库重构 ✅ 已完成（2026-10-28）
+
+`game_data.db` 从「多版本 50 张表」改成「单版本镜像 7 张表」（`ship` / `ship_data` /
+`model` / `model_file` / `ship_model` / `meta` / `meta_schema_version`），
+`assets_data.db` 去掉 `bin_folder` 维度改按 `model_id` 组织。
+
+效果：同 build 重复 `import` 从「全清重建 ~4 min」变成 **18 s**；
+只有内容变了的船/模型会被重写（快照 sha1 + geometry 签名判定）。
+详见 [tech/common/02](tech/common/02-import-game-data.md) 与 [03](tech/common/03-import-assets.md)。
+
 ### A. 数据体积（纯本地，不改导出结果）
 
 | # | 项 | 现状（实测） | 目标 | 风险 |
 |---|---|---|---|---|
-| A1 | `assets_data` 裁剪 | 555 MB（Lesta）/ 623 MB（WG）。`render_sets` 399,008 行里 `/ship/` 283,908、`location` 34,748、`gun` 14,873、`aircraft` 9,430、其余 56,049；两张骨骼表 + 索引约占 300 MB/库 | 按路径类型裁 → 估计 350 / 400 MB | 口径必须按**路径类型**，不能按船名；裁 `aircraft` 会丢水上飞机挂载 |
-| A2 | `game_data` 快照瘦身 | `entity_snapshots` 占 100.5 / 135.2 MB（分别为整库的 84% / 86%），1,165 / 1,246 条 × 均 105 KB | 只存导出用到的字段（`components[*].model`、装甲厚度、`permoflages`、`hull/nodes_config`）→ 估计 40 / 55 MB | **有漏字段风险**：漏一个 `A_*` 组件就少一批挂载；需逐船 A/B 对比网格数 |
-| A3 | 删二级索引 | `idx_rs_geom` 46+48 MB、`idx_bones_stem` 37+43 MB（`camo_thumbs` 空表已于 2026-10-28 删除） | 改为导出前临时建、用完删 | 无（导出是一次性扫描） |
+| A1 | `assets_data` 裁剪 | 555 MB（Lesta）/ 623 MB（WG）。`render_set` 399,008 行里 `/ship/` 283,908、`location` 34,748、`gun` 14,873、`aircraft` 9,430、其余 56,049；两张骨骼表 + 索引约占 300 MB/库 | 按路径类型裁 → 估计 350 / 400 MB | 口径必须按**路径类型**，不能按船名；裁 `aircraft` 会丢水上飞机挂载 |
+| A2 | `game_data` 快照瘦身 | `ship_data` 占 118 / 154 MB 库的大头，1,165 / 1,230 条 × 均 105 KB。**增量后不再每次重写**（sha1 没变就跳过），但体积仍在 | 只存导出用到的字段（`components[*].model`、装甲厚度、`permoflages`、`hull/nodes_config`）→ 估计 40 / 55 MB | **有漏字段风险**：漏一个 `A_*` 组件就少一批挂载；需逐船 A/B 对比网格数 |
+| A3 | 删二级索引 | 本轮去掉了 `idx_rs_geom` / `idx_bones_stem`（主键前缀已覆盖查询），只剩 `idx_rs_model`（按模型增量删行用，约 6 MB） | ✅ 已解决 | — |
 
 ### B. 保真度（观感/正确性，需要对着游戏截图验）
 
@@ -622,7 +632,7 @@ P0、P1 与 P2-1/3/4/5/6/7 已全部结清（逐项状态见各节标题）。�
 
 | # | 项 | 现状 |
 |---|---|---|
-| E1 | WG 库 build 过期 | `assets_data_wg.db` 的 `meta.bin_folder = 13488861`，客户端 `bin/` 是 13187581 / 13357625 → `shape_names` 查空（几何侧已改用 `render_sets.shape`，导出仍正确）。重跑 `import` 即修 |
+| E1 | ~~WG 库 build 过期~~ | ✅ 2026-10-28 重跑 `import` 修好：`meta.build = 13357625`，与客户端一致 |
 | E2 | `wg_compat` 4 处 `TODO(手动)` | WG 的类型映射 / 弹夹炮识别目前复制 Lesta 版，未按 WG 实测校准 |
 
 ### F. 死代码 ✅ 已清理（2026-10-28）

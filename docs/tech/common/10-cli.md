@@ -166,19 +166,32 @@ python cli.py batch --server wg --game D:\Games\World_of_Warships --out out\wg -
 - 新增/删除的 geometry 会单独列出（新船通常伴随新增 geometry），但不自动转成船 key；
 - 没有 `game_data*.db` 时退化为只报模型目录名，映射不到船。
 
-## 5. `import` —— 建库
+## 5. `import` —— 建库 / 增量同步
 
 ```text
-import --game DIR --server {lesta,wg} [--gp FILE] [--bin BUILD] [--version TEXT]
+import --game DIR --server {lesta,wg} [--gp FILE] [--bin BUILD] [--version TEXT] [--rebuild]
 ```
 
 1. 设 `wows_type / game_path / bin_folder`；
 2. 把 GameParams 复制进 `<project>/data/`；
 3. `bin_folder` = `--bin`，否则 `<game>/bin/` 下**数字最大**的目录；
-4. 同步跑（后台线程 + `data_processed` 信号），超时 **1800 s**；
-5. 失败 `SystemExit(1)`；成功打印 `import result: {'ok': True}`。
+4. 扫 idx 建模型清单（**5.5 s**，不解包几何）→ 与库里的 `model.sig` 比对；
+5. 只重写内容变了的行（快照 sha1 / 模型签名），其余仅刷 `last_checked`；
+6. 有模型变动才同步 3D 缓存（`assets_data.db`），否则直接跳过；
+7. 同步跑（后台线程 + `data_processed` 信号），超时 **1800 s**；
+8. 失败 `SystemExit(1)`；成功打印 `import result: {'ok': True}`。
 
-客户端更新后必须重跑（否则 build 号与资产对不上）。
+| 场景 | 耗时（Lesta 实测） |
+|---|---|
+| 首次 / `--rebuild` | 约 4 min（其中 92 s 是读 assets.bin） |
+| 同 build 无变更 | **18 s**（只扫 idx + 刷时间戳，不碰 assets.bin） |
+| 版本更新（几条船变了） | 18 s + 重建那几个模型的 3D 缓存 |
+
+`--rebuild` 忽略增量判据，强制全量重解析 3D 缓存 —— 解析逻辑改过
+（或怀疑缓存脏了）时用。它不会重建 `game_data.db` 的行，只重写内容变化的。
+
+客户端更新后必须重跑；不做增量校验的话 build 号与资产会对不上
+（旧版直接全清重建，现在是 upsert + 变更集）。
 
 ## 6. `batch` —— 批量导出
 

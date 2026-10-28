@@ -14,7 +14,7 @@
 4. 其余分段文件（`_Bow` / `_MidFront` / `_MidBack` / `_Stern` …）逐个解析合并；
 5. 只有主文件、没有分段 → 明确报错（不回退用主文件当船体）。
 
-`ShipGeometry` 的渲染集索引来自 `assets_data.db` 的 `render_sets`，
+`ShipGeometry` 的渲染集索引来自 `assets_data.db` 的 `render_set`，
 按 `model_folder` 取该船全部记录（含跨分段的同名 shape）。
 
 ## 2. 二进制格式
@@ -110,7 +110,7 @@ primitives → _split_primitives_by_material()
 ## 5. 材质解析（每段一次）
 
 ```text
-render_sets 里该 (geom_path, mapping_id) → mfm 路径
+render_set 里该 (geom_path, mapping_id) → mfm 路径
    ↓ _resolve_material_full(mfm, extractor)
 {tech_family, shader_id, material_hash, fx_path,
  textures: {键: (VFS 路径, DDS 字节)}, indexed_params}

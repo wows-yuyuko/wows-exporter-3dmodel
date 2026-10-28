@@ -54,55 +54,50 @@
 仍是**输入级**增量：签名只含 build 与参数，不含产物内容哈希。要「资产变了也能感知」
 还需把 geom/tex 指纹写进 manifest 再比对（未做）。
 
+> 注意与「数据库增量」的区别：这里的签名含 `build`，所以客户端一更新，整批签名失效 →
+> `batch` 会重导全量。要只导变动的船，用 `diff --format keys` 出清单再
+> `batch --keys-file`（见 [tech/common/10](tech/common/10-cli.md)）。
+
 ## P1：batch 性能 ✅ 已实现（2026-10-27）
 
 - ~~每艘船都是独立 Python 进程~~ → `--jobs 1`（默认）改走 `batch-worker`，
   一个进程跑完整批，GameParams / DB 只初始化一次；`--jobs 0` 保留旧的每船子进程；
 - 每次加载仍会重开 VFS 索引（按船必需），但不再重复 bootstrap。
 
-## P1：数据库精简（剩余）
+## P1：数据库结构与体积
 
-本项目是**纯导出器**，但两个库里仍存着原 Wows_Paragrams_Unpack 数据浏览功能留下的数据。
-导出链路实际只读这些表：
+本项目是**纯导出器**。2026-10-28 把两个库都改成「单版本镜像 + 增量同步」，
+删掉了原 Wows_Paragrams_Unpack 数据浏览功能留下的 46 张空表。
 
-| 库 | 导出用到的表 |
+| 库 | 表 | 体积（Lesta / WG） |
+|---|---|---|
+| `game_data*.db` | `ship` / `ship_data` / `model` / `model_file` / `ship_model` / `meta` / `meta_schema_version` | 118 / 154 MB |
+| `assets_data*.db` | `render_set` / `skeleton_mounts` / `skeleton_bones` / `material_full` / `mfm_textures` / `shape_names` / `exteriors` / `camouflages` / `camo_*` / `meta` | 554 / 623 MB |
+
+设计取舍见 [tech/common/02](tech/common/02-import-game-data.md) 与
+[03](tech/common/03-import-assets.md)。要点：表里**不再有 `version_code` / `bin_folder`**，
+否则 build 一变，未变动的上百万行也要 UPDATE 到新 build，增量无从谈起。
+
+### A. 已完成
+
+| 项 | 结果 |
 |---|---|
-| `assets_data*.db` | `render_sets`、`skeleton_mounts`、`skeleton_bones`、`material_full`、`mfm_textures`、`shape_names`、`camouflages`、`camouflage_color_schemes`、`camo_ship_groups`、`exteriors` |
-| `game_data*.db` | `entity_snapshots`（只读 `entity_type='ship'`）、`meta_import_state`、`ship_models`、`name_mappings`（`category='ship'`） |
+| 只写 ship 快照（2026-10-26） | 其余 2.3 万条 Gun/Projectile/Aircraft 快照无人读取，`game_data_wg` 318 → 157 MB |
+| 删分析层 46 张表（2026-10-28） | `_run_analysis()` 早已 `return`，这些表只写不读；schema 从 1017 行降到 180 行 |
+| 删 `name_mappings` / 显示名（2026-10-28） | 产物不需要中文名；`_resolve_ship_name()` 与 `.po/.mo` 读取一起移除 |
+| 增量同步（2026-10-28） | 同 build 重复 `import` 从 ~4 min 降到 **18 s**；快照 sha1 没变就不重写（占整库 84% 的那部分） |
+| 二级索引 | 去掉 `idx_rs_geom` / `idx_bones_stem`（主键前缀已覆盖），只留 `idx_rs_model` |
 
-### A. 已完成（2026-10-26）
-
-`import` 时只写 ship 快照（其余 2.3 万条 Gun/Projectile/Aircraft/… 快照无人读取），
-并清掉了遗留的大表数据。实测：
-
-```
-data/game_data_wg.db   318 MB -> 157 MB   （删 23,250 快照 + 51,004 crew + 596 buff）
-data/game_data.db      162 MB -> 120 MB   （删 20,050 快照 + 1,301 buff）
-```
-
-`--skins` 已验证不受影响（10 个皮肤正常导出）。ship 快照保留 1,246（WG）/ 1,165（Lesta）条，
-平均 105 KB/条 —— 体积大头是 `A_AirDefense`(26%)、`A_Hull`(15%)、`A_ATBA`(10%)，
-这些正是导出挂载时要读的 model 路径，**不能再裁**。
-
-### B. 待做：裁剪 assets_data（619 MB -> 估计 200 MB）
-
-`dbstat` 实测分布：
+### B. 待做：assets_data 按路径类型裁剪
 
 | 项 | 体积 | 处理 |
 |---|---|---|
-| `skeleton_bones` + 2 个索引 | 207 MB | 只留「舰船 + 舰炮」stem（现有 27,016 个 stem，含飞机 AAB、建筑、港口） |
-| `skeleton_mounts` + 2 个索引 | 161 MB | 同上（现有 7,219 个 stem） |
-| `render_sets` + 2 个索引 | 214 MB | 只留 `/ship/` 与 `/gun/` 路径；丢掉 `other` 97k 条（location/建筑/飞机） |
-| `material_full` | 18.5 MB | 可只留被 render_sets 引用到的 mfm |
-| `camo_thumbs` | 0 行 | 已从 schema 删除（2026-10-28）；**旧库里的表还在**，重建或手工 `DROP TABLE camo_thumbs` 才真正释放 |
+| `skeleton_bones` | 812,395 行 | 只留「舰船 + 舰炮」stem（现有含飞机 AAB、建筑、港口） |
+| `skeleton_mounts` | 483,925 行 | 同上 |
+| `render_set` | 402,395 行 | 只留 `/ship/` 与 `/gun/` 路径；丢掉 `other` 9 万条（location/建筑/飞机） |
+| `material_full` | 29,688 行 / 20 MB | 可只留被 `render_set` 引用到的 mfm |
 
-**约束**：必须按路径类型裁剪，不能按船名——否则以后导冷门船会缺数据。
-
-### C. 待做：去掉二级索引
-
-`idx_rs_geom`(48 MB)、`idx_bones_stem`(43 MB)、`idx_skel_stem`(31 MB) 合计约 122 MB。
-导出是「打开库、按 geom_path 批量取一次」的一次性扫描，索引收益不如它占的空间；
-可改成导出前临时建、用完丢。
+**约束**：必须按路径类型裁剪，不能按船名 —— 否则以后导冷门船会缺数据。
 
 ## P2：工程化
 

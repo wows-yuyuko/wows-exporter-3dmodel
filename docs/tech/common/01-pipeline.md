@@ -25,7 +25,7 @@ cli.py
      ├─ GeometryService.instance().load_ship(info, lod=…)
      │   ├─ data_extractor.GameExtractor  # 从 pkg 取 .geometry / .mfm / 贴图
      │   ├─ models.geometry_parser        # .geometry → 顶点/索引/装甲
-     │   ├─ AssetsCacheService            # 读 assets_data*.db（render_sets / material_full / skeleton）
+     │   ├─ AssetsCacheService            # 读 assets_data*.db（render_set / material_full / skeleton）
      │   └─ models.geometry_transform      # 解析空间 → 渲染空间
      ├─ export_service.export_render_glb   # 渲染 GLB
      ├─ export_service.export_armor_glb    # 装甲 GLB（--armor）

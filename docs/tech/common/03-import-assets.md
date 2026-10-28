@@ -2,7 +2,11 @@
 
 > 入口：`import` 的后台任务 `_populate_assets_cache()`
 > → `services/assets_cache_service.populate()`
-> schema：`resources/database/{lesta,wargaming}/assets_database.sql`（`ASSETS_SCHEMA_VERSION = 18`）
+> schema：`resources/database/{lesta,wargaming}/assets_database.sql`（`ASSETS_SCHEMA_VERSION = 19`）
+>
+> **单版本镜像 + 按模型增量**（2026-10-28 重构）：表里**不再有 `bin_folder` 主键列**，
+> 改按 `model_id` 组织。原因：`bin_folder` 进主键意味着 build 一变，未变动的那上百万行
+> 也要 UPDATE 到新 build，等于全量重写 —— 增量就无从谈起。build 号记在 `meta.build`。
 
 ## 1. 为什么要这个库
 
@@ -10,8 +14,16 @@
 材质、视觉、骨架、模型路径全在里面。每次导出都现场解析要几十秒到几分钟，
 所以导入时**一次性提取成 SQLite**，导出只读库（`assets_data*.db`）。
 
-派生库体积：Lesta 554 MB / WG 623 MB —— 大头是两张骨骼表与 `render_sets`
-的 `nodes` JSON（见 §3）。
+派生库体积：Lesta 554 MB / WG 623 MB —— 大头是两张骨骼表与 `render_set`
+的 `nodes` JSON（见 §3）。按数据类型分两类：
+
+| 类 | 表 | 体量 | 增量策略 |
+|---|---|---|---|
+| 按模型 | `render_set`、`skeleton_mounts`、`skeleton_bones` | 274 MB | **只重建 `models` 集合里的模型**（先按 `model_id` DELETE，再只解析这些记录） |
+| 全局 | `material_full`、`mfm_textures`、`shape_names`、`exteriors`、`camouflages`、`camo_*` | 约 30 MB | 每次同步全刷 —— 一个 mfm / 一个 shape 哈希被多船共用，无法归属到单个模型 |
+
+`populate(models=None)` 是全量；给了集合就是增量。判定在上层
+（`processor_service` 拿 idx 签名比 `model.sig` 得出变更集）。
 
 **只存路径与参数，不存贴图字节**：贴图在导出时按 `.dd0 → .dd1 → .dd2 → .dds`
 分层从 pkg 实时读。
@@ -21,7 +33,7 @@
 | # | 步骤 | 产出表 |
 |---|---|---|
 | 1 | 骨架挂点 + 完整骨骼（bind pose 按 parent 累积到世界） | `skeleton_mounts`、`skeleton_bones` |
-| 2 | 视觉渲染集：`shape → 材质 / mfm` | `render_sets` |
+| 2 | 视觉渲染集：`shape → 材质 / mfm` | `render_set` |
 | 3 | 材质：贴图路径 + 完整参数 | `mfm_textures`、`material_full` |
 | 9 | Exterior 实体（**GameParams 直读**，split 仅回退） | `exteriors` |
 | 10 | 包根 `camouflages.xml`（三段） | `camouflages`、`camouflage_color_schemes`、`camo_ship_groups` |
@@ -33,11 +45,12 @@
 
 ## 3. 关键表与语义
 
-### `render_sets`（核心，39～40 万行）
+### `render_set`（核心，约 40 万行）
 
 | 列 | 含义 |
 |---|---|
-| `bin_folder` + `geom_path` + `shape` | 主键 |
+| `geom_path` + `shape` | 主键（`geom_path` 前缀索引足够快：带模型过滤的 IN 查询 4.65 ms） |
+| `model_id` | 模型目录名（父目录），**冗余存一份**：增量重建要按模型整片删，SQL 里没法从路径反推 |
 | `material` | 材质名（如 `TL2_SHIPMAT_INDEXED_PBS_Hull`） |
 | `mfm` | 材质文件 VFS 路径 |
 | `damage` | 1 = 破损/断面或 LOD 变体（两者混在一起，靠 `shape` 名再分） |
@@ -104,7 +117,7 @@ peculiarityModels / renderSetsStates / miscFilter / planesConfig / decalsEnabled
 | 指标 | Lesta | WG |
 |---|---|---|
 | `assets_data*.db` | 554 MB | 623 MB |
-| `render_sets` | 399,008 | 392,305 |
+| `render_set` | 399,008 | 392,305 |
 | `material_full` | pbs 16,357 / indexed 192 / other 12,772 | pbs 19,708 / other 12,040 / indexed 0 |
 | `exteriors` | 1,915 | 2,362 |
 | `camouflages` | 384 | 515 |
@@ -116,6 +129,6 @@ peculiarityModels / renderSetsStates / miscFilter / planesConfig / decalsEnabled
 WG 当前库里是 **13488861**，而客户端 `bin/` 是 `13187581` / `13357625`：
 - `meta` 只用来展示，不影响导出；
 - 但 `shape_names` 按 `bin_folder` 精确过滤 → **查空**，LOD/crack 的名字兜底失效
-  （几何侧改用 `render_sets` 自带 `shape`，所以导出的 LOD 选择仍然正确）。
+  （几何侧改用 `render_set` 自带 `shape`，所以导出的 LOD 选择仍然正确）。
 
 客户端更新后重跑一次 `import` 即可修好。

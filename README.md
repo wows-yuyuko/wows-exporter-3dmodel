@@ -26,19 +26,29 @@
 
 | 路径 | 用途 |
 |---|---|
-| `data/game_data*.db` | 舰船快照（装甲厚度、各挂载 `model` 路径、`permoflages`）、`ship_models`、build 号 |
+| `data/game_data*.db` | 舰船快照（装甲厚度、各挂载 `model` 路径、`permoflages`）+ 模型清单 + build 号 |
 | `data/assets_data*.db` | 材质 / 渲染集 / 骨骼 / 涂装索引（表清单见 `docs/tech/common/03-import-assets.md`） |
 | `<game>/data/GameParams*.data` | 取 `ShipInfo` 与 `permoflages`（决定 `--model-skin auto` 套不套皮肤）；**不存在时从 pkg 解包并写回该目录** |
 | `<game>/bin/<build>/**.pkg` | `.geometry`、`.mfm`、贴图（按 `.dd0 → .dd1 → .dd2 → .dds` 分层取） |
 
 `list` / `export-keys` 只读 GameParams，不进数据库。`data/split/` 不再产出也不会被读。
 
-## 首次：建库
+## 建库 / 更新
 
     python cli.py import --game D:\Games\Korabli --server lesta
-    python cli.py import --game D:\Games\World_of_Warships_PT --server wg
+    python cli.py import --game D:\Games\World_of_Warships --server wg
 
-会生成 data/game_data*.db 和 data/assets_data*.db（挂载/材质用）。
+会生成 data/game_data*.db（舰船主数据）和 data/assets_data*.db（骨架/渲染集/材质）。
+
+**增量**：同 build 重跑只花 18 s（全量约 4 min）。只有内容变了的船与模型会被重写 ——
+判据是舰船快照的 sha1 与 `.geometry` 的 crc32 签名，后者在 `bin/<build>/idx` 里现成可读。
+解析逻辑改过、或怀疑缓存脏了，用 `import ... --rebuild` 强制全量重解析 3D 缓存。
+
+客户端更新后的推荐流程（只导变动的船）：
+
+    python cli.py diff --server wg --game D:\Games\World_of_Warships --format keys --out changed.txt
+    python cli.py import --server wg --game D:\Games\World_of_Warships
+    python cli.py batch --server wg --game D:\Games\World_of_Warships --out out --keys-file changed.txt
 
 `config.json` 只存两个游戏路径；build 号（`bin/` 下的版本目录）不落盘，每次自动取
 **数字最大**的那个目录，所以客户端更新后不需要改配置。`--server` 必须显式给，没有默认值。

@@ -52,7 +52,7 @@ WG 侧 indexed = 0，所以 `05-materials-textures.md` 的 INDEXED 章节只对 
 |---|---|
 | `assets_data.db` | 554 MB |
 | `game_data.db` | 120 MB |
-| `render_sets` | 399,008 |
+| `render_set` | 399,008 |
 | `material_full` | pbs 16,357 / indexed 192 / other 12,772 |
 | `skeleton_bones` / `skeleton_mounts` | 全量（含飞机/建筑/港口） |
 | `ship_basic_info` | 1,165 |
