@@ -248,8 +248,38 @@ def cmd_ship(args):
     _export_ship(ship, args, Path(args.out))
 
 
+def cmd_diff(args):
+    """对比两个 build 的 `.geometry` crc32，列出变动的船 / 挂载模型。
+
+    只读 idx 与 game_data*.db，不加载 assets.bin、不解包几何（秒级）。
+    """
+    from services.version_diff import run
+
+    text, n = run(args.game, args.server, args.old, args.new, args.format)
+    if args.out:
+        p = Path(args.out)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text + ("" if not text or text.endswith("\n") else "\n"), encoding="utf-8")
+        if args.format == "keys":
+            print("%d 条船 -> %s（可直接给 batch --keys-file）" % (n, p))
+        else:
+            print("写出 %s（受影响 %d 条船）" % (p, n))
+    else:
+        print(text)
+
+
 def cmd_batch(args):
     ships = gp_ships(str(_gameparams_path(Path(args.game), args.server, args.gp)), args.filter)
+    # --keys-file：只导指定船（可直接用 `diff --format keys` 的输出）
+    if getattr(args, "keys_file", None):
+        raw = Path(args.keys_file).read_text(encoding="utf-8").splitlines()
+        wanted = {k.strip() for k in raw if k.strip() and not k.strip().startswith("#")}
+        ships = [s for s in ships if s.key in wanted]
+        missing = wanted - {s.key for s in ships}
+        print("[keys] %s：命中 %d 条" % (Path(args.keys_file).name, len(ships)))
+        if missing:
+            print("[warn] %d 条不在当前 GameParams 里（跳过）：%s"
+                  % (len(missing), ", ".join(sorted(missing)[:5])))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     if args.limit:
@@ -337,12 +367,16 @@ def cmd_batch(args):
     if args.jobs and args.jobs >= 1:
         import tempfile
         keys_file = out / ".keys.txt"
-        subprocess.run([sys.executable, str(Path(__file__).resolve()), "export-keys",
-                        "--game", str(args.game), "--server", args.server,
-                        "--filter", args.filter, "--out", str(keys_file)]
-                       + (["--limit", str(args.limit)] if args.limit else [])
-                       + (["--gp", args.gp] if args.gp else []), check=True)
-        keys = keys_file.read_text(encoding="utf-8").splitlines()
+        if getattr(args, "keys_file", None):
+            # 已按 --keys-file 过滤过，别再让 export-keys 覆盖成全量
+            keys = [s.key for s in ships]
+        else:
+            subprocess.run([sys.executable, str(Path(__file__).resolve()), "export-keys",
+                            "--game", str(args.game), "--server", args.server,
+                            "--filter", args.filter, "--out", str(keys_file)]
+                           + (["--limit", str(args.limit)] if args.limit else [])
+                           + (["--gp", args.gp] if args.gp else []), check=True)
+            keys = keys_file.read_text(encoding="utf-8").splitlines()
         # 并行分支同样吃增量指纹：先剔掉签名一致的，跑完再按产物登记
         sig_by_key = {k: export_signature(args.server, build, k, "", int(getattr(args, "lod", 2)),
                                           int(getattr(args, "texture_size", 1024)), flags)
@@ -453,6 +487,17 @@ def main(argv=None):
     p.add_argument("--gp", default=None, help="explicit GameParams file")
     p.set_defaults(func=cmd_list)
 
+    p = sub.add_parser("diff", help="对比两个 build 的 geometry crc32，列出变动的船")
+    p.add_argument("--game", required=True)
+    p.add_argument("--server", choices=("lesta", "wg"), required=True,
+                   help="which client the --game path points at (no default)")
+    p.add_argument("--old", default=None, help="旧 build 目录名（默认 bin/ 下第二新的）")
+    p.add_argument("--new", default=None, help="新 build 目录名（默认 bin/ 下最新的）")
+    p.add_argument("--format", choices=("text", "keys", "json"), default="text",
+                   help="text=报告 / keys=一行一个船 key（喂 batch --keys-file）/ json")
+    p.add_argument("--out", default=None, help="写到文件（不给则打印到 stdout）")
+    p.set_defaults(func=cmd_diff)
+
     p = sub.add_parser("ship")
     p.add_argument("--game", required=True)
     p.add_argument("--server", choices=("lesta", "wg"), required=True,
@@ -521,6 +566,9 @@ def main(argv=None):
     p.add_argument("--server", choices=("lesta", "wg"), required=True,
                    help="which client the --game path points at (no default)")
     p.add_argument("--filter", default="")
+    p.add_argument("--keys-file", default=None,
+                   help="只导这些船（一行一个 key，可直接用 "
+                        "`diff --format keys --out FILE` 的输出）")
     p.add_argument("--out", required=True)
     p.add_argument("--no-textures", action="store_true")
     p.add_argument("--zstd", action="store_true")
