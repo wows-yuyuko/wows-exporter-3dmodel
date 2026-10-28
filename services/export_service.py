@@ -1241,7 +1241,6 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
     builder.slim = bool(getattr(options, "slim_attributes", True))
     builder.gltf.asset.extras = {
         "game_key": geometry.game_key,
-        "display_name": geometry.display_name,
         "model_folder": geometry.model_folder,
         "content": "render",
         "hierarchy": "bigworld-visual",
@@ -1750,7 +1749,6 @@ def export_armor_glb(geometry, armor_scene, output_path: str,
     builder = _GlbBuilder()
     builder.gltf.asset.extras = {
         "game_key": geometry.game_key,
-        "display_name": geometry.display_name,
         "model_folder": geometry.model_folder,
         "content": "armor",
         "visible_only": bool(options.visible_only),

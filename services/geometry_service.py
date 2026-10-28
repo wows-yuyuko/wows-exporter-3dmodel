@@ -565,28 +565,16 @@ class GeometryService:
             from services.database_service import get_db
             db = get_db(app_ctx.ctx.wows_type)
             if db.exists:
-                # 舰种/等级/船型分组：徽章（标识）渲染用，取自舰船基础信息表
-                basics: dict[str, dict] = {}
-                try:
-                    vc = db.get_latest_version_code() or ""
-                    for r in db._conn.execute(
-                        "SELECT ship_id, shiptype, tier, group_status_key FROM ship_basic_info "
-                        "WHERE version_code=?", (vc,)
-                    ).fetchall():
-                        basics[r["ship_id"]] = r
-                except Exception:  # noqa: BLE001
-                    basics = {}
-                for row in db.load_ship_models():
-                    basic = basics.get(row["ship_id"])
+                for row in db.load_ships():
                     ships.append(ShipInfo(
-                        game_key=row["ship_id"],
-                        display_name=self._resolve_ship_name(row["ship_id"]),
+                        game_key=row["name"],
+                        display_name=row["name"],
                         model_folder=row["model_folder"],
-                        model_path=row["model_path"],
+                        model_path="",
                         nation=row["nation"],
-                        ship_type=(basic["shiptype"] or "") if basic else "",
-                        tier=int(basic["tier"] or 0) if basic else 0,
-                        group=(basic["group_status_key"] or "") if basic else "",
+                        ship_type=row["ship_class"] or "",
+                        tier=int(row["tier"] or 0),
+                        group=row["ship_group"] or "",
                         has_geometry=bool(row["model_folder"]),
                     ))
         except Exception as exc:  # noqa: BLE001
@@ -596,22 +584,6 @@ class GeometryService:
             self._ships_error = "数据库无可载入舰船（请先「加载数据」）"
         self._ships = ships
         return ships
-
-    @staticmethod
-    def _resolve_ship_name(game_key: str) -> str:
-        """GameParams 键前缀 → 本地化舰船名（DB name_mappings，category='ship'）。"""
-        try:
-            prefix = game_key.split("_", 1)[0]
-            from services.database_service import get_db
-            db = get_db(app_ctx.ctx.wows_type)
-            if db.exists:
-                names = db.get_all_name_mappings("ship")
-                name = names.get(prefix) or names.get(game_key)
-                if name:
-                    return name
-        except Exception as exc:  # noqa: BLE001
-            bus.log_message.emit(f"⚠️ 舰船名解析失败({game_key}): {exc}，回退到 game_key")
-        return game_key
 
     # ── 舰船几何加载 ────────────────────────────────────
 
@@ -1269,7 +1241,7 @@ class GeometryService:
             world: dict = {}
             try:
                 c = self._get_assets_cache()
-                world = c.get_skeleton_bones(app_ctx.ctx.bin_folder or "", folder)
+                world = c.get_skeleton_bones(folder)
             except Exception:  # noqa: BLE001
                 world = {}
             self._mount_model_cache[key] = world
@@ -1446,7 +1418,7 @@ class GeometryService:
         rb = np.eye(4, dtype=np.float32)
         try:
             c = self._get_assets_cache()
-            bones = c.get_skeleton_bones(app_ctx.ctx.bin_folder or "", folder)
+            bones = c.get_skeleton_bones(folder)
             if bones and "Root_BlendBone" in bones:
                 rb = bones["Root_BlendBone"]
         except Exception as exc:  # noqa: BLE001
@@ -1466,8 +1438,7 @@ class GeometryService:
             return cached
         world: dict = {}
         try:
-            world = self._get_assets_cache().get_skeleton_bones(
-                app_ctx.ctx.bin_folder or "", folder)
+            world = self._get_assets_cache().get_skeleton_bones(folder)
         except Exception:  # noqa: BLE001
             world = {}
         self._mount_model_cache[key] = world
@@ -1627,7 +1598,7 @@ class GeometryService:
         out: dict[str, np.ndarray] = {}
         try:
             c = self._get_assets_cache()
-            out = c.get_skeleton_mounts(app_ctx.ctx.bin_folder or "", stem)
+            out = c.get_skeleton_mounts(stem)
         except Exception:  # noqa: BLE001
             out = {}
         self._stem_mount_cache[stem] = out
@@ -1791,8 +1762,7 @@ class GeometryService:
         try:
             if self._mfm_textures_db is None:
                 c = self._get_assets_cache()
-                self._mfm_textures_db = c.get_mfm_textures(
-                    app_ctx.ctx.bin_folder or "") or {}
+                self._mfm_textures_db = c.get_mfm_textures() or {}
             if self._mfm_textures_db:
                 cands = []
                 for mfm_path, tex_path in self._mfm_textures_db.items():
@@ -2216,7 +2186,7 @@ class GeometryService:
         out: dict = {}
         try:
             c = self._get_assets_cache()
-            out = c.get_shape_names(app_ctx.ctx.bin_folder or "") or {}
+            out = c.get_shape_names() or {}
         except Exception as exc:  # noqa: BLE001
             out = {}
             bus.log_message.emit(f"⚠️ shape_names 数据读取失败: {exc}")
@@ -2242,7 +2212,7 @@ class GeometryService:
             entries = self._geometry_folder_index(ext).get(model_folder) or []
             if entries:
                 paths = [e.path for e in entries]
-                rows = c.get_render_sets(app_ctx.ctx.bin_folder or "", paths)
+                rows = c.get_render_sets(paths)
                 for r in rows:
                     mid = self._murmur3_32(r["shape"].encode())
                     mat, mfm, damage = r["material"], r["mfm"], r["damage"]
@@ -2342,7 +2312,7 @@ class GeometryService:
         result: dict = {}
         try:
             c = self._get_assets_cache()
-            info = c.get_material_full(app_ctx.ctx.bin_folder or "", mfm_path)
+            info = c.get_material_full(mfm_path)
             if info:
                 sid = info.get("shader_id") or "0x0"
                 mh = info.get("material_hash") or ""
@@ -2399,7 +2369,7 @@ class GeometryService:
         out: dict = {}
         try:
             c = self._get_assets_cache()
-            out = c.get_skeleton_bones(app_ctx.ctx.bin_folder or "", stem) or {}
+            out = c.get_skeleton_bones(stem) or {}
         except Exception:  # noqa: BLE001
             out = {}
         self._skeleton_bones_cache[stem] = out

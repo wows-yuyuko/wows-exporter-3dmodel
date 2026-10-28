@@ -443,7 +443,7 @@ def cmd_import(args):
     done = threading.Event()
     result = {}
     bus.data_processed.connect(lambda ok: (result.setdefault("ok", ok), done.set()))
-    run_process()
+    run_process(rebuild=bool(getattr(args, "rebuild", False)))
     if not done.wait(timeout=1800):
         raise SystemExit("import timed out")
     print("import result:", result)
@@ -559,6 +559,8 @@ def main(argv=None):
     p.add_argument("--gp", default=None)
     p.add_argument("--bin", default=None)
     p.add_argument("--version", default=None)
+    p.add_argument("--rebuild", action="store_true",
+                   help="重建 3D 缓存（assets_data.db）：忽略增量判据，全量重解析")
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("batch")

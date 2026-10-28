@@ -51,7 +51,7 @@ class CamouflageEntry:
     uv_transforms: dict[str, UvTransform] = field(default_factory=dict)
     ship_groups: list[str] = field(default_factory=list)
     target_ships: list[str] = field(default_factory=list)
-    display_name: str = ""          # 显示名（恒空：本地化读取已移除）
+    display_name: str = ""          # 显示名（恒空：项目不读本地化文件）
 
 
 @dataclass
@@ -255,7 +255,7 @@ class CamoService:
     def _build_from_db(self):
         entries: dict[str, list[CamouflageEntry]] = {}
         icon_map: dict[str, str] = {}
-        for row in self._cache.get_all_camouflages(self._bin_folder):
+        for row in self._cache.get_all_camouflages():
             name = row["name"]
             uv: dict[str, UvTransform] = {}
             for tag, t in (row.get("uv") or {}).items():
@@ -273,26 +273,26 @@ class CamoService:
                 uv_transforms=uv,
                 ship_groups=row.get("ship_groups") or [],
                 target_ships=row.get("target_ships") or [],
-                display_name=row.get("display_name") or "",
+                display_name="",
             )
             entries.setdefault(name, []).append(entry)
             if row.get("icon_path"):
                 icon_map[name.lower()] = row["icon_path"]
         color_schemes: dict[str, ColorScheme] = {}
-        for cname, cols in (self._cache.get_all_camo_color_schemes(self._bin_folder) or {}).items():
+        for cname, cols in (self._cache.get_all_camo_color_schemes() or {}).items():
             color_schemes[cname] = ColorScheme(name=cname, colors=[list(c) for c in cols])
         self._db = {"entries": entries, "color_schemes": color_schemes,
-                    "ship_groups": self._cache.get_all_camo_ship_groups(self._bin_folder)}
+                    "ship_groups": self._cache.get_all_camo_ship_groups()}
         self._icon_map = icon_map
         try:
-            self._exteriors = self._cache.get_exteriors(self._bin_folder)
+            self._exteriors = self._cache.get_exteriors()
         except Exception:  # noqa: BLE001
             self._exteriors = []
 
     def _ensure_loaded(self):
         if self._db is not None:
             return
-        if self._cache is not None and self._bin_folder:
+        if self._cache is not None:
             try:
                 self._build_from_db()
                 return
@@ -368,7 +368,7 @@ class CamoService:
                     mf = _dir_name(v)
                     break
             out.append(CamoSchemeInfo(
-                id=-1, display_name=ext.get("display_name") or ext_name or key,
+                id=-1, display_name=ext_name or key,
                 raw_name=key, origin="model", icon_path=icon,
                 model_replace=dict(pmodels), model_folder=mf,
                 skin={"hull_config": hull_config, "nodes_config": nodes_config,

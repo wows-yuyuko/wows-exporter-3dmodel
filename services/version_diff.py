@@ -90,11 +90,11 @@ def list_builds(game: str | Path, count: int = 2) -> list[str]:
 
 
 def ship_model_index(db_path: str | Path) -> tuple[dict[str, set[str]], dict[str, str]]:
-    """构建两份映射：模型目录 → 船 key 集合；船体目录 → 船 key。
+    """构建两份映射：模型目录 → 船名集合；船体目录 → 船名。
 
     返回 ``(by_folder, hull_folder)``：
       - ``by_folder``：所有被引用的模型目录 → 引用它的船（含挂载共享件）
-      - ``hull_folder``：``ship_models.model_folder`` → 船（只有这些是船体）
+      - ``hull_folder``：``ship.model_folder`` → 船（只有这些是船体）
     """
     db_path = Path(db_path)
     if not db_path.is_file():
@@ -104,41 +104,21 @@ def ship_model_index(db_path: str | Path) -> tuple[dict[str, set[str]], dict[str
     hull_folder: dict[str, str] = {}
     conn = sqlite3.connect(str(db_path))
     try:
-        for ship_id, folder in conn.execute(
-                "SELECT ship_id, model_folder FROM ship_models"):
-            if ship_id and folder:
-                hull_folder[str(folder)] = str(ship_id)
-                by_folder.setdefault(str(folder), set()).add(str(ship_id))
-
-        # 挂载：扫 ship 快照里的 A_* 组，找每个 HP_* 的 model 目录
-        rows = conn.execute(
-            "SELECT entity_id, data_json FROM entity_snapshots "
-            "WHERE entity_type='ship'").fetchall()
-    except sqlite3.OperationalError:
+        id_to_name: dict[int, str] = {}
+        for sid, name, folder in conn.execute(
+                "SELECT id, name, model_folder FROM ship WHERE status='active'"):
+            id_to_name[int(sid)] = str(name)
+            if folder:
+                hull_folder[str(folder)] = str(name)
+                by_folder.setdefault(str(folder), set()).add(str(name))
+        for sid, mid in conn.execute("SELECT ship_id, model_id FROM ship_model"):
+            name = id_to_name.get(int(sid))
+            if name and mid:
+                by_folder.setdefault(str(mid), set()).add(name)
+    except (sqlite3.OperationalError, ValueError):
         return by_folder, hull_folder
     finally:
         conn.close()
-
-    for ship_id, data_json in rows:
-        try:
-            d = json.loads(data_json)
-        except Exception:  # noqa: BLE001
-            continue
-        if not isinstance(d, dict):
-            continue
-        for grp, hp in d.items():
-            if not (isinstance(grp, str) and grp.startswith("A_") and isinstance(hp, dict)):
-                continue
-            for v in hp.values():
-                if not isinstance(v, dict):
-                    continue
-                model = v.get("model") or ""
-                if model:
-                    base = str(model).rstrip("/").rsplit("/", 1)[-1]
-                    if base.lower().endswith(".model"):
-                        base = base[: -len(".model")]
-                    if base:
-                        by_folder.setdefault(base, set()).add(str(ship_id))
     return by_folder, hull_folder
 
 

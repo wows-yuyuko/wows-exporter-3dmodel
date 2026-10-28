@@ -5,7 +5,7 @@ import sqlite3
 
 
 def imported_build(server: str) -> str:
-    """Read meta_import_state (e.g. '8867689_8867689') from data/game_data*.db."""
+    """读 game_data*.db 的 meta.build（导入时写入的客户端 build 号）。"""
     from utils.path_utils import get_data_dir
     name = "game_data_wg.db" if server == "wg" else "game_data.db"
     path = get_data_dir() / name
@@ -13,10 +13,10 @@ def imported_build(server: str) -> str:
         return ""
     try:
         con = sqlite3.connect(str(path))
-        row = con.execute("SELECT * FROM meta_import_state ORDER BY rowid DESC LIMIT 1").fetchone()
-        con.close()
-    except Exception:
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key='build'").fetchone()
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001
         return ""
-    if not row or not row[0]:
-        return ""
-    return str(row[0]).split("_", 1)[0]
+    return str(row[0]) if row and row[0] else ""

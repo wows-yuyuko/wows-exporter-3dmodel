@@ -1,22 +1,28 @@
-"""
-数据解析服务 —— 解密并拆分 GameParams.data（适配多版本架构）。
+"""数据解析服务 —— 解密 GameParams、建库、同步 3D 缓存。
+
+两条链路：
+  game_data.db  —— 战舰主数据（ship / ship_data / model / ship_model），**增量**写入；
+  assets_data.db —— 骨架/渲染集/材质缓存，按模型目录**增量**重建。
+
+增量判据见 `services/model_index.py`（geometry crc32 签名）与
+`services/database_service.py`（快照 sha1）。首次运行是全量，之后只重写变化的部分。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pickle
 import shutil
 import sys
 import threading
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 
 from app.signals import bus
 from app.application import app as app_ctx
 from utils.threading_utils import run_async
 from utils.path_utils import get_data_dir, get_split_dir
-from services.database_service import DatabaseManager, reset_db
+from services.database_service import DatabaseManager, ShipRow, reset_db
 
 from services import GameParams as _GameParamsModule
 from services import wg_compat
@@ -34,68 +40,116 @@ class _GPEncode(json.JSONEncoder):
             return {}
 
 
-def _save_ship_models(db, data_by_category: dict, version_code: str) -> None:
-    """把可载入舰船列表（有 model 的 Ship）写入数据库 ship_models 表。
+#: 实体类型 → 类别（WG 若在 wg_compat 已填充则用 WG 版）
+TYPE_CATEGORY_MAP = {
+    "Ship": "Ship", "Gun": "Gun", "Projectile": "Projectile",
+    "Aircraft": "Aircraft", "Ability": "Ability",
+    "Modernization": "Modernization", "Crew": "Crew",
+    "Other": "Other", "Exterior": "Exterior",
+}
 
-    3D 查看器的 list_ships 从该表读取，避免每次启动都扫描临时目录
-    （split 不再产出，导入开始时会清掉旧残留）。
+
+def _entity_type(v) -> str:
+    """取实体的 typeinfo.type —— 兼容 dict 与 GameParams 的自定义对象。"""
+    ti = v.get('typeinfo') if isinstance(v, dict) else getattr(v, 'typeinfo', None)
+    if ti is None:
+        return ""
+    if isinstance(ti, dict):
+        return str(ti.get('type') or '')
+    return str(getattr(ti, 'type', '') or '')
+
+
+def _model_of(model_path: str) -> str:
+    """`.model` 的 VFS 路径 → 模型目录名（父目录）。"""
+    parts = [p for p in str(model_path or "").replace("\\", "/").split("/") if p]
+    return parts[-2] if len(parts) >= 2 else ""
+
+
+def _iter_mounts(entity: dict):
+    """遍历舰船实体的 A_* 组，产出 (role, model_path)。
+
+    role 形如 ``hull`` / ``A_Artillery.HP_JGM_1``（挂载共享，靠 role 区分位置）。
+
+    ⚠️ `A_Hull` 的 `model` 值是**字符串**，其它组是 `{hp_key: {"model": ...}}`，
+       所以不能只认 dict —— 否则全船 model_folder 为空（2026-10-28 踩过）。
     """
-    try:
-        ships = (data_by_category or {}).get("Ship") or {}
-        items = []
-        for key, v in ships.items():
-            hull = v.get("A_Hull") or {}
-            model = hull.get("model") or ""
+    for grp, hp in entity.items():
+        if not (isinstance(grp, str) and grp.startswith("A_") and isinstance(hp, dict)):
+            continue
+        for key, node in hp.items():
+            if isinstance(node, dict):
+                model = node.get("model") or ""
+            elif isinstance(node, str) and key == "model":
+                model = node
+            else:
+                continue
             if not model:
                 continue
-            model_path = str(model)
-            parts = [p for p in model_path.replace("\\", "/").split("/") if p]
-            model_folder = parts[-2] if len(parts) >= 2 else ""
-            nation = str(v.get("typeinfo", {}).get("nation", ""))
-            items.append((key, model_folder, model_path, nation))
-        n = db.save_ship_models(items, version_code)
-        if n:
-            bus.log_message.emit(f"📦 可载入舰船列表已记录: {n} 艘")
-    except Exception as e:  # noqa: BLE001
-        bus.log_message.emit(f"⚠️ 可载入舰船列表写入失败: {e}")
+            role = "hull" if (grp == "A_Hull" and key == "model") else "%s.%s" % (grp, key)
+            yield role, str(model)
 
 
-def run_process() -> "_AppTask":
+def _build_ship_rows(ships: dict[str, dict]) -> tuple[list[ShipRow], dict[str, list[tuple[str, str]]],
+                                                     dict[str, dict]]:
+    """实体 dict → (ShipRow 列表, 船→模型关联, 模型附加信息)。
+
+    模型附加信息（model_path / kind）来自 GameParams：idx 里只有 geometry，
+    模型目录与 `.model` 路径的对应关系只有实体里才有。
+    """
+    rows: list[ShipRow] = []
+    links: dict[str, list[tuple[str, str]]] = {}
+    model_info: dict[str, dict] = {}
+
+    for key, v in ships.items():
+        ti = v.get("typeinfo") if isinstance(v.get("typeinfo"), dict) else {}
+        hull_model = ""
+        pairs: list[tuple[str, str]] = []
+        for role, path in _iter_mounts(v):
+            folder = _model_of(path)
+            if not folder:
+                continue
+            info = model_info.setdefault(folder, {"model_path": path, "kind": "mount"})
+            if role == "hull":
+                hull_model = folder
+                info["kind"] = "hull"
+                info["model_path"] = path
+            pairs.append((folder, role))
+
+        data_json = json.dumps(v, sort_keys=True, ensure_ascii=False)
+        rows.append(ShipRow(
+            id=int(v.get("id") or 0),
+            idx=str(v.get("index") or key.split("_", 1)[0]),
+            name=str(v.get("name") or key),
+            nation=str(ti.get("nation") or ""),
+            tier=int(v.get("level") or 0),
+            ship_class=str(ti.get("species") or ""),
+            ship_group=str(v.get("group") or ""),
+            model_folder=hull_model,
+            data_json=data_json,
+            sha1=hashlib.sha1(data_json.encode("utf-8")).hexdigest(),
+        ))
+        links[str(v.get("name") or key)] = pairs
+    return rows, links, model_info
+
+
+def run_process(rebuild: bool = False) -> "_AppTask":
     data_dir = get_data_dir()
     split_dir = get_split_dir()
 
     db: DatabaseManager | None = None
-    # assets_data.db 后台缓存：完成事件 + 结果标志 + 是否启动（主流程需等它写完才标「全部完成」）
     assets_done = threading.Event()
     assets_ok = [False]
     assets_started = [False]
 
-    def _finalize_import(db: DatabaseManager, db_batch: list, snapshots_batch: list,
-                          data_by_category: dict, data_dir, version_code: str) -> None:
-        db.insert_entities_batch(db_batch, version_code=version_code)
-        # 只存舰船快照：导出链路只读 Ship（geometry_service 取 hull/挂载路径，
-        # camo_service 取 permoflages）；其余 2.3 万条快照占 100+ MB 且无人读取。
-        db.save_entity_snapshots([s for s in snapshots_batch if s[1] == "ship"],
-                                 version_code=version_code)
-        # 可载入舰船列表（3D 查看器用）：入库时一并记录，不依赖 data/split
-        _save_ship_models(db, data_by_category, version_code)
-        bus.task_progress.emit(45, "步骤 2/3: 写入数据库实体")
-        ms = db.import_name_mappings(str(data_dir))
-        bus.task_progress.emit(60, "步骤 2/3: 导入名称映射")
-        bus.task_progress.emit(80, "步骤 3/3: 数据入库")
-        bus.log_message.emit("🧠 步骤 3/3: 正在数据入库（内存模式）...")
-        # 预提取 assets.bin 到**独立缓存库 assets_data.db**（与主库 game_data.db 无锁冲突）。
-        # 在这里后台启动，与下面主线程写 game_data.db **同时进行**，缩短整体加载时长；
-        # 3D 查看器只读该缓存库。assets.bin 全程内存流转（现场从 .pkg 读到字节 → 直接写库），不落盘。
-        # WG 服与 Korabli 服统一走后台 _assets_cache_job：WG 用 10 类型表 +
-        # WG 布局（渲染集 0x70/材质 0x78），由 AssetsCacheService 按 wows_type 适配。
+    _cat_map = wg_compat.get_type_category_map(app_ctx.ctx.wows_type) or TYPE_CATEGORY_MAP
+
+    def _start_assets_job(models: set[str] | None, removed: set[str] | None,
+                          force_full: bool = False) -> None:
+        """后台启动 3D 缓存同步（与主线程写 game_data.db 并行）。"""
         assets_started[0] = True
         try:
-            from utils.threading_utils import run_async
-
-            # ★ 在**启动后台任务前**固定当前客户端信息：导入过程中用户可能切服，
-            #   若任务里再读 app_ctx 就会拿新服务器的类型表去解旧客户端的 assets.bin
-            #   （实测：WG 12 万 visual 全部解析失败 → 3D 缓存空库）。
+            # ★ 启动前固定客户端信息：导入过程中用户切服会拿新服务器的类型表
+            #   去解旧客户端的 assets.bin（实测 WG 12 万 visual 全部解析失败）
             _job_bin = app_ctx.ctx.bin_folder
             _job_ver = app_ctx.ctx.game_version
             _job_type = app_ctx.ctx.wows_type
@@ -104,80 +158,23 @@ def run_process() -> "_AppTask":
             def _assets_cache_job():
                 try:
                     assets_ok[0] = _populate_assets_cache(
-                        bin_folder=_job_bin,
-                        game_version=_job_ver,
-                        wows_type=_job_type,
-                        game_path=_job_game)
+                        bin_folder=_job_bin, game_version=_job_ver,
+                        wows_type=_job_type, game_path=_job_game,
+                        models=models, removed=removed, force_full=force_full)
                 except Exception as e:  # noqa: BLE001
                     bus.log_message.emit(f"❌ assets_data.db 写入失败: {e}")
                     assets_ok[0] = False
                 finally:
-                    # populate 完成后清理**历史遗留**的 assets.bin 落盘产物
-                    # （现流程全内存，不再产生 data/assets.bin / assets_*.bin / .uncode_cache）
                     _cleanup_assets_temp()
                     assets_done.set()
 
             run_async(_assets_cache_job)
         except Exception:  # noqa: BLE001
-            assets_done.set()  # 启动失败兜底，避免主流程等待卡死
-        # 主线程：写 game_data.db（与 assets 后台缓存并行）
-        bus.log_message.emit(f"📦 步骤 3/3: 数据入库写入: {len(db_batch)} 条, 映射 {sum(ms.values())} 条 ({db.db_size_mb} MB)")
-        bus.task_progress.emit(100, "步骤 3/3: 完成")
-
-    # Gun 复用数据层已有的武器类型识别：不单独新增分析。
-    # 数据层 DatabaseManager._entity_type("Gun")→"gun"、ENTITY_TYPES 含 "gun"、
-    # guns_names.json 名称映射、entity_registry 注册与 entity_snapshots 快照均
-    # 已覆盖 Gun（data/split/Gun/ 大量真实主炮/鱼雷/防空等实体）。这里保留
-    # "Gun" 映射使其继续进入基础实体/快照管线；Gun 无独立分析桶，若日后需要
-    # 结构化炮数据再另立 store_gun 功能。
-    TYPE_CATEGORY_MAP = {
-        "Ship": "Ship", "Gun": "Gun", "Projectile": "Projectile",
-        "Aircraft": "Aircraft", "Ability": "Ability",
-        "Modernization": "Modernization", "Crew": "Crew",
-        "Other": "Other", "Exterior": "Exterior",
-    }
-
-    # 当前服务器生效的类型→类别映射：WG 若在 wg_compat 已填充则用 WG 版，否则回退 Lesta 默认
-    # （WG 的 TypeInfo.type 集合/命名与 Lesta 可能有差异，差异由 wg_compat 预留，人工填充）
-    _cat_map = wg_compat.get_type_category_map(app_ctx.ctx.wows_type) or TYPE_CATEGORY_MAP
-
-    def _collect_one(k: str, v: dict, index):
-        """线程安全收集单实体：返回独立结果，不共享可变状态（供并行收集）。
-
-        返回 (cat, k, v, db_item, snap_item)：主线程合并到分类/批量列表。
-        """
-        t = v.get('typeinfo', {}).get('type', 'UnknownType')
-        cat = _cat_map.get(t, None)
-        db_item = (str(t), k, v)
-        snap_item = (
-            k,
-            DatabaseManager._entity_type(str(t)),
-            str(v.get('typeinfo', {}).get('nation', '')),
-            json.dumps(v, sort_keys=True, ensure_ascii=False),
-        )
-        return cat, k, v, db_item, snap_item
-
-    def _collect_all(ej, ti, db_batch, snapshots_batch, data_by_category):
-        """并行收集一批实体：CPU 密集的 json.dumps 在线程池，主线程合并。
-
-        ej 是只读 dict；每项在子线程独立序列化，返回独立结果，主线程 append
-        到共享列表（无竞争）。比原主线程逐条 json.dumps 明显提速。
-        """
-        with ThreadPoolExecutor(max_workers=8) as tpe:
-            collect_futs = []
-            for k, v in ej.items():
-                collect_futs.append(tpe.submit(_collect_one, k, v, ti))
-            for f in collect_futs:
-                cat, k, v, db_item, snap_item = f.result()
-                if cat:
-                    data_by_category.setdefault(cat, {})[k] = v
-                db_batch.append(db_item)
-                snapshots_batch.append(snap_item)
+            assets_done.set()
 
     def _process():
         nonlocal db
-        # split 已不再产出（导入直接进 DB + 内存 dict）。清掉旧版本残留，避免
-        # 后续步骤误读上一次导入遗留的 JSON。
+        # split 已不再产出；清掉旧版本残留，避免后续步骤误读
         if split_dir.exists():
             shutil.rmtree(str(split_dir))
 
@@ -204,56 +201,74 @@ def run_process() -> "_AppTask":
         elif isinstance(data, dict) and '' in data and isinstance(data[''], dict):
             source_dict = data['']
 
-        # 使用服务器对应的数据库文件
-        from utils.path_utils import get_data_dir
-        db_path = str(get_data_dir() / DatabaseManager._db_name(app_ctx.ctx.wows_type))
-        db = DatabaseManager(db_path=db_path)
-        db.initialize()
+        # 实体 → 舰船（只保留 Ship：导出链路只读舰船）
+        ships: dict[str, dict] = {}
 
-        # 创建新版本记录
-        version_code = db.begin_version(
-            game_version=app_ctx.ctx.game_version,
-            wows_type=app_ctx.ctx.wows_type,
-            bin_folder=app_ctx.ctx.bin_folder)
-
-        db_batch: list[tuple[str, str, dict]] = []
-        snapshots_batch: list[tuple[str, str, str, str]] = []
-        data_by_category: dict[str, dict[str, dict]] = {}
-        msg = ""
+        def _take(ej: dict) -> None:
+            for k, v in ej.items():
+                # ★ 先按 typeinfo.type 过滤再序列化：2.3 万实体全做一次
+                #   json 往返要几十秒，而只有舰船会被保留。
+                if _cat_map.get(_entity_type(v)) != "Ship":
+                    continue
+                ships[k] = json.loads(json.dumps(v, cls=_GPEncode, ensure_ascii=False))
 
         if source_dict:
-            ej = json.loads(json.dumps(source_dict, cls=_GPEncode, ensure_ascii=False))
-            _collect_all(ej, None, db_batch, snapshots_batch, data_by_category)
+            _take(source_dict)
             msg = "Wargaming 拆分完成"
         else:
             for idx, elem in enumerate(data):
-                if not isinstance(elem, dict):
-                    continue
-                ti = None if idx == 0 else idx
-                ej = json.loads(json.dumps(elem, cls=_GPEncode, ensure_ascii=False))
-                _collect_all(ej, ti, db_batch, snapshots_batch, data_by_category)
+                if isinstance(elem, dict):
+                    _take(elem)
             msg = "Lesta 拆分完成"
 
-        if db_batch:
-            _finalize_import(db, db_batch, snapshots_batch, data_by_category, data_dir, version_code)
-            # 等 assets_data.db 后台缓存跑完（成功或失败都等）
+        if not ships:
+            return False, "GameParams 里没有解析出舰船实体"
+
+        ship_rows, links, model_info = _build_ship_rows(ships)
+
+        # 模型清单（idx 视角）：只读 idx，约 5 s，不解包任何几何
+        from services.model_index import scan as scan_models
+        game_path = app_ctx.ctx.game_path
+        bin_folder = app_ctx.ctx.bin_folder or ""
+        bus.log_message.emit(f"🔍 扫描 idx 建立模型清单（build {bin_folder}）...")
+        models = scan_models(game_path, bin_folder) if game_path else {}
+        for mid, info in model_info.items():
+            entry = models.get(mid)
+            if entry is not None:
+                entry.model_path = info["model_path"]
+                entry.kind = info["kind"]
+        bus.log_message.emit(f"📦 模型清单: {len(models)} 个目录 / "
+                             f"{sum(e.file_count for e in models.values())} 个 geometry")
+
+        db_path = str(get_data_dir() / DatabaseManager._db_name(app_ctx.ctx.wows_type))
+        db = DatabaseManager(db_path=db_path, wows_type=app_ctx.ctx.wows_type)
+        db.initialize()
+        bus.task_progress.emit(30, "步骤 2/3: 写入战舰主数据")
+
+        stats = db.sync(
+            ship_rows, models, links,
+            build=bin_folder,
+            game_version=app_ctx.ctx.game_version or "",
+            wows_type=app_ctx.ctx.wows_type or "")
+        bus.log_message.emit("📦 %s（%s）" % (stats.summary(), stats.mode))
+        bus.task_progress.emit(60, "步骤 3/3: 同步 3D 缓存")
+
+        # 是否需要重建 3D 缓存：本次有模型变动，或上一轮没成功同步到本 build
+        assets_ready = db.get_meta("assets_build") == bin_folder
+        if rebuild or stats.rebuild_models or not assets_ready:
+            _start_assets_job(stats.rebuild_models or None,
+                              stats.removed_models or None,
+                              force_full=rebuild)
+            # 在**工作线程**里等：run_async 的回调跑在主线程，阻塞它会卡住界面
             if not assets_done.wait(timeout=900):
                 bus.log_message.emit("⚠️ 3D 缓存（assets_data.db）等待超时")
-            if not assets_ok[0]:
-                # assets_data.db 写入失败/超时 → 主流程以报错方式终止（不标「全部完成」）
-                return False, "3D 缓存（assets_data.db）写入失败，已终止加载流程"
-            # 全部写完才把版本标成「入库完成」（写 meta_import_state）——中途被强杀时不会执行，
-            # 于是半成品不会被 get_latest_version_code() 当成可用数据
-            n = db.mark_version_complete(version_code)
-            db.checkpoint("TRUNCATE")          # 大 WAL 会拖慢后续开库/写入，收主库里
-            bus.log_message.emit(f"✅ 入库完成（{n} 个实体），已回收 WAL")
+            if assets_ok[0]:
+                db.set_meta({"assets_build": bin_folder})
+        else:
+            bus.log_message.emit("✅ 3D 缓存已是最新（本 build 无模型变动），跳过重建")
         return True, msg
 
     def _ok(ret):
-        # 由 threading_utils.run_async 投递到主线程执行：所有 UI 信号发射与
-        # 数据库收尾（reset_db 关闭连接）都在主线程串行进行，避免后台线程
-        # 关闭主线程正在使用的 sqlite 连接，引发"进度到最后时莫名崩溃"
-        # （sqlite C 扩展段错误，无 traceback，打包后更易触发）。
         ok, msg = ret
         if ok:
             try:
@@ -262,17 +277,13 @@ def run_process() -> "_AppTask":
                     if p.exists():
                         p.unlink()
                         bus.log_message.emit(f"🧹 已删除原始数据文件: {n}")
-                # assets.bin 临时文件（data/assets.bin / assets_{bin_folder}.bin / .uncode_cache）
-                # 由后台 _assets_cache_job 完成后统一清理（本流程可能仍在后台读取，避免竞争）
-                # 只保留最新 2 个版本，滚动删除更旧的
-                deleted = db.purge_old_versions(keep_count=2)
-                if deleted:
-                    bus.log_message.emit(f"📂 已清理旧版本数据 ({deleted} 条版本记录)")
                 if assets_started[0]:
                     if assets_ok[0]:
                         bus.log_message.emit("✅ 3D 缓存（assets_data.db）已就绪")
                     else:
-                        bus.log_message.emit("❌ 3D 缓存（assets_data.db）写入失败——3D 查看器可能缺少骨架/材质数据")
+                        bus.log_message.emit("❌ 3D 缓存写入失败——下次 import 会自动重试")
+                if db is not None:
+                    db.checkpoint("TRUNCATE")
                 bus.log_message.emit(f"✅ 数据解析完成: {msg}")
                 bus.task_progress.emit(100, "全部完成")
                 app_ctx.set_game_data_state(True)
@@ -282,22 +293,22 @@ def run_process() -> "_AppTask":
                 if db is not None:
                     try:
                         db.close()
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         pass
                 reset_db()
         else:
             bus.log_message.emit(f"❌ {msg}")
             bus.data_processed.emit(False)
-            # 失败终止同样收尾：关闭并重置数据库连接（避免 sqlite WAL 锁残留）
+            if assets_started[0]:
+                assets_done.set()
             try:
                 if db is not None:
                     db.close()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
             reset_db()
 
     def _err(msg: str):
-        # 由 run_async 在主线程执行，保证信号只在主线程发射
         bus.log_message.emit(f"❌ 解析失败: {msg}")
         bus.data_processed.emit(False)
 
@@ -305,18 +316,25 @@ def run_process() -> "_AppTask":
 
 
 def _populate_assets_cache(bin_folder: str, game_version: str, wows_type: str,
-                           game_path: str = "") -> bool:
-    """把当前客户端 assets.bin 的 3D 查看器数据预提取到 assets_data.db。
+                           game_path: str = "", models: set[str] | None = None,
+                           removed: set[str] | None = None,
+                           force_full: bool = False) -> bool:
+    """把当前客户端 assets.bin 的 3D 数据同步到 assets_data.db。
 
-    game_path/bin_folder/wows_type 均由调用方在**开始前**固定：不能在中途
-    重新读上下文（用户切服会让类型表与客户端错配）。
-
-    返回是否成功写入；过程中分阶段打日志（骨架/渲染集/材质）。
+    models 为 None 表示全量；给了集合则只重建这些模型目录。
     """
     try:
         from services.assets_cache_service import AssetsCacheService
-        # 全内存：现场从**指定**客户端 .pkg 读 assets.bin 字节，不落盘、
-        # 不用共享 extractor（共享缓存可能还绑在上一个客户端上）。
+        cache = AssetsCacheService(wows_type=wows_type)
+        cache.initialize()
+        # 库不是本 build 建的（或刚被 schema 重建）→ 只能全量
+        if force_full:
+            models, removed = None, None
+        elif cache.build != (bin_folder or "") or cache._schema_rebuilt:
+            if models is not None:
+                bus.log_message.emit("⏳ 3D 缓存库与当前 build 不符，改走全量重建")
+            models, removed = None, None
+
         if game_path:
             from uncode_assets.service import read_assets_bin_bytes
             data = read_assets_bin_bytes(game_path, bin_folder=bin_folder or None)
@@ -324,25 +342,21 @@ def _populate_assets_cache(bin_folder: str, game_version: str, wows_type: str,
             from services.geometry_service import GeometryService
             data = GeometryService.instance().load_assets_bytes()
         if not data:
-            bus.log_message.emit("⚠️ assets.bin 不可用，跳过 3D 数据缓存（3D 查看器将现场解析）")
+            bus.log_message.emit("⚠️ assets.bin 不可用，跳过 3D 数据缓存")
             return False
-        cache = AssetsCacheService(wows_type=wows_type)
-        bus.log_message.emit("⏳ 步骤 3/3: 后台预提取 3D 数据（assets_data.db）...")
+
+        bus.log_message.emit(
+            "⏳ 同步 3D 缓存（%s）..." % ("全量" if models is None else "%d 个模型" % len(models)))
         counts = cache.populate(
             assets_bytes=data, bin_folder=bin_folder or "",
-            game_version=game_version or "",
-            wows_type=wows_type or "",
-            game_dir=(game_path or None),
+            game_version=game_version or "", wows_type=wows_type or "",
+            game_dir=(game_path or None), models=models, removed=removed,
             progress_cb=lambda msg: bus.log_message.emit(f"⏳ 3D 缓存: {msg}"))
-        del data    # 解析完即释放（3D 查看器后续只读 assets_data.db）
+        del data
         bus.log_message.emit(
-            f"📦 assets.bin 数据已缓存（骨架挂点 {counts['skeleton']} / "
-            f"骨骼 {counts['skeleton_bones']} / 渲染集 {counts['render_sets']} / "
-            f"材质 {counts['mfm_textures']} / 完整材质 {counts['material_full']}）")
-        if not counts.get("skeleton") and not counts.get("render_sets"):
-            bus.log_message.emit(
-                "⚠️ 3D 缓存内容为空（骨架 0 / 渲染集 0）：该客户端 assets.bin 布局"
-                "可能尚未适配，3D 查看器将缺少骨架/材质数据（船体仍可显示）")
+            f"📦 assets.bin 数据已缓存（模式 {counts.get('mode')} / "
+            f"骨架挂点 {counts['skeleton']} / 骨骼 {counts['skeleton_bones']} / "
+            f"渲染集 {counts['render_sets']} / 材质 {counts['mfm_textures']}）")
         return True
     except Exception as e:  # noqa: BLE001
         bus.log_message.emit(f"❌ assets.bin 缓存写入失败: {e}")
@@ -350,19 +364,14 @@ def _populate_assets_cache(bin_folder: str, game_version: str, wows_type: str,
 
 
 def _cleanup_assets_temp() -> None:
-    """清理**历史版本遗留**的 assets.bin 落盘产物（data/assets.bin、data/assets_*.bin、
-    data/.uncode_cache VFS 索引缓存）。
-
-    现流程 assets.bin 全程只在内存中流转，既不落盘也不复用任何既有文件做缓存，
-    因此本函数只用于回收旧版本残留；在后台 3D 缓存入库完成后调用。"""
+    """清理**历史版本遗留**的 assets.bin 落盘产物（现流程全程内存流转）。"""
     try:
-        from utils.path_utils import get_data_dir
         dd = get_data_dir()
         targets = [dd / "assets.bin"] + list(dd.glob("assets_*.bin")) + [dd / ".uncode_cache"]
         for p in targets:
             try:
                 if p.is_dir():
-                    shutil.rmtree(str(p), ignore_errors=True)
+                    shutil.rmtree(str(p))
                 elif p.exists():
                     p.unlink()
             except OSError:

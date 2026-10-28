@@ -1,20 +1,26 @@
 """
-assets.bin 数据缓存服务 —— 把 3D 查看器需要的数据预提取到独立数据库。
+assets.bin 数据缓存服务 —— 把导出/查看需要的数据预提取到独立数据库。
 
-assets.bin（约 217MB）每次启动 3D 查看器都要现场提取+解析，很重。使用
-「加载数据」功能时，把骨架挂点、视觉渲染集、材质贴图映射一次性写入
-`assets_data.db`；后续 3D 查看器直接从数据库读取，不再现场解包 assets.bin。
+assets.bin（约 217 MB）现场解析要 90 s，所以 import 时把骨架挂点、视觉渲染集、
+材质贴图映射写进 `assets_data.db`；之后 `ship`/`batch` 只查库。
 
-架构：数据库优先 + 现场兜底（数据库缺数据时才现场解析 assets.bin）。
+单版本镜像：库只反映最后一次同步的客户端 build（记在 meta.build）。
+元信息表按 model_id 组织、**不带 build 维度** —— 否则 build 一变，未变动的
+那上百万行也要 UPDATE 到新 build，等于全量重写，增量就无从谈起。
 
-表结构（均以 bin_folder 绑定客户端版本，避免跨版本串用）：
-- meta:            客户端版本元信息
-- skeleton_mounts: 舰体骨架 HP_/MP_ 挂点矩阵（行主序渲染空间 16 float；
-                   MP_ 为甲板设备挂点，v5 起纳入）
-- render_sets:     visual 渲染集 shape → 材质/mfm（按 geometry 路径）
-- mfm_textures:    材质 .mfm → diffuseMap 贴图基础名
-- material_full:   材质完整信息（shader/fx 路径/全部贴图路径/INDEXED vec4 数组）
+表结构：
+- meta:            库级元信息（build / game_version / wows_type / last_sync_*）
+- skeleton_mounts: 模型骨架 HP_/MP_ 挂点矩阵（按 model_id）
+- skeleton_bones:  模型完整骨骼世界矩阵（按 model_id）
+- render_set:      visual 渲染集 shape → 材质/mfm（按 geom_path，model_id 冗余一列）
+- mfm_textures:    材质 .mfm → diffuseMap 贴图路径（全局表）
+- material_full:   材质完整信息（全局表）
+- shape_names:     *.vertices 名哈希 → 名（全局表）
+- exteriors / camouflages / camo_*: 涂装（全局表）
 - meta_schema_version: schema 版本记录（同 database_new.sql 规则）
+
+增量：`populate(models=...)` 只重建指定模型的骨架/渲染集；全局表（材质/贴图/
+形状名/涂装，合计约 30 MB）每次全刷 —— 它们被多船共用，无法归属单个模型。
 """
 
 from __future__ import annotations
@@ -51,7 +57,10 @@ from utils.path_utils import get_data_dir
 #:    炮塔 Rotate_Y 的权重落到 Rotate_X）。
 #: v18（2026-10-20）：material_full 新增 fx_path 列（material_hash 即 fx 资源
 #:    selfId，入库时在 assets.bin 路径树里解析；不再依赖固定映射表）。
-ASSETS_SCHEMA_VERSION = 18
+#: v19（2026-10-28）：去掉 bin_folder 维度改按 model_id 组织（单版本镜像 + 增量同步）；
+#:    render_sets 更名 render_set，并加 model_id 列供「按模型整片删」；
+#:    meta 改为 key/value；删除 exteriors/camouflages 的 display_name。
+ASSETS_SCHEMA_VERSION = 19
 
 # ── 分批落库阈值（模块级常量，便于测试时覆盖）────────────────
 # 背景：Lesta 有 39793 个骨架 / 119631 个 visual → 骨骼 100 万+ 行、渲染集 40 万行。
@@ -81,6 +90,8 @@ class AssetsCacheService:
             db_path = get_data_dir() / self._db_name(wows_type)
         self._db_path = Path(db_path)
         self._local = threading.local()
+        #: initialize() 因 schema 版本落后而整库重建时置 True（上层据此提示需重跑 import）
+        self._schema_rebuilt = False
 
     def _schema_subdir(self) -> str:
         """按服务器返回 SQL 架构子目录（lesta / wargaming）。"""
@@ -101,10 +112,12 @@ class AssetsCacheService:
 
     @staticmethod
     def _merge_render_set_into(merged: dict, row: tuple) -> None:
-        """把一条渲染集行并入汇总字典（按 PK = (bin_folder, geom_path, shape)）。
+        """把一条渲染集行并入汇总字典（按 PK = (geom_path, shape)）。
+
+        行格式：``(geom_path, shape, model_id, material, mfm, damage, skinned, nodes)``
 
         原始资产里同一 shape 可绑定多个骨骼节点（左右舷实例化，如 motor_cutter），
-        但 render_sets 表 PK 是 (bin_folder, geom_path, shape)，INSERT OR REPLACE 会把
+        但 render_set 表 PK 是 (geom_path, shape)，INSERT OR REPLACE 会把
         多条折叠成一条 → 丢失其余节点 → 只渲染一个实例。此处按 PK 合并，把节点并集
         写回单行 nodes 数组，供 geometry_service 逐节点实例化。
 
@@ -114,7 +127,7 @@ class AssetsCacheService:
 
         populate 现为**流式**调用本方法（内存有界）；_merge_render_set_rows 为批量包装。
         """
-        key = (row[0], row[1], row[2])
+        key = (row[0], row[1])
         sk = int(row[6])
         names: list[str] = []
         if row[7]:
@@ -125,20 +138,20 @@ class AssetsCacheService:
         m = merged.get(key)
         if m is None:
             # 首条：无论刚性/蒙皮都用它的节点调色板（蒙皮 shape 的调色板 = 蒙皮骨骼）
-            merged[key] = [row[3], row[4], row[5], sk, names]
+            merged[key] = [row[2], row[3], row[4], row[5], sk, names]
         else:
-            m[3] = int(m[3]) or sk
+            m[4] = int(m[4]) or sk
             # ★ 仅**刚性（skinned=0）**项并入额外节点（多实例，如左右舷）；
             #   蒙皮项节点是蒙皮调色板，保留首条即可，并集会污染骨骼调色板。
             if sk == 0 and names:
-                known = set(m[4])
-                m[4].extend(n for n in names if n not in known)
+                known = set(m[5])
+                m[5].extend(n for n in names if n not in known)
 
     @staticmethod
     def _materialize_render_set(merged: dict) -> list[tuple]:
         """汇总字典 → 待写库行（nodes 保序 JSON，不得排序）。"""
-        return [(k[0], k[1], k[2], v[0], v[1], v[2], int(v[3]),
-                 json.dumps(v[4])) for k, v in merged.items()]
+        return [(k[0], k[1], v[0], v[1], v[2], v[3], int(v[4]),
+                 json.dumps(v[5])) for k, v in merged.items()]
 
     @staticmethod
     def _merge_render_set_rows(rows: list[tuple]) -> list[tuple]:
@@ -169,17 +182,16 @@ class AssetsCacheService:
         return self._local.conn
 
     def initialize(self) -> None:
-        """创建表（幂等；建表 SQL 从 assets_database.sql 读取，与 database_new.sql 同目录）。
+        """建表（幂等；建表 SQL 从 assets_database.sql 读取）。
 
-        schema 版本规则同 database_service：库内 meta_schema_version 记录已应用版本，
-        若低于 ASSETS_SCHEMA_VERSION 则 drop 全部表重建（避免旧结构残留），随后记录当前版本。
+        schema 版本低于 ASSETS_SCHEMA_VERSION → 整库重建（旧结构不兼容），
+        之后一律走增量同步，不再重建。表结构只有 SQL 文件一处维护，
+        不再保留内嵌副本（两份定义必然漂移）。
         """
-        # 低版本 → 重建全表（同 database_new.sql 规则）
-        current_ver = self.get_current_version()
-        if 0 < current_ver < ASSETS_SCHEMA_VERSION:
+        if 0 < self.get_current_version() < ASSETS_SCHEMA_VERSION:
             self._drop_all_tables()
-        # 源码模式优先文件系统（assets_database.sql 是维护源，QRC 可能滞后于热改）；
-        # 打包/无文件系统时回退 QRC（与 database_new.sql 的 QRC 打包一致）
+            self._schema_rebuilt = True
+
         sql_text = None
         sub = self._schema_subdir()
         try:
@@ -191,192 +203,13 @@ class AssetsCacheService:
                 sql_text = sql_path.read_text(encoding="utf-8")
         except Exception:  # noqa: BLE001
             sql_text = None
-        if sql_text:
-            self._conn.executescript(sql_text)
-        else:
-            self._init_core_tables_inline()
+        if not sql_text:
+            raise RuntimeError("缺少 resources/database/%s/assets_database.sql，无法建立 3D 缓存库" % sub)
+
+        self._conn.executescript(sql_text)
         self._conn.commit()
-        # 记录 schema 版本（同 database_new.sql 规则）
         if self.get_current_version() < ASSETS_SCHEMA_VERSION:
             self._record_version(ASSETS_SCHEMA_VERSION)
-        # 迁移：mfm_textures 旧 schema（diffuse_base 列）→ 新（texture_path）
-        try:
-            cols = {r[1] for r in self._conn.execute(
-                "PRAGMA table_info(mfm_textures)").fetchall()}
-            if cols and "texture_path" not in cols:
-                self._conn.execute("DROP TABLE IF EXISTS mfm_textures")
-                self._conn.execute("""
-                CREATE TABLE mfm_textures (
-                    bin_folder TEXT NOT NULL,
-                    mfm_path TEXT NOT NULL,
-                    texture_path TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY(bin_folder, mfm_path)
-                );""")
-                self._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 迁移：exteriors 旧库补 icon_path 列（易用包图标列）
-        try:
-            cols = {r[1] for r in self._conn.execute(
-                "PRAGMA table_info(exteriors)").fetchall()}
-            if cols and "icon_path" not in cols:
-                self._conn.execute("ALTER TABLE exteriors ADD COLUMN icon_path TEXT DEFAULT ''")
-                self._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 迁移：camouflages 旧库补 icon_path 列
-        try:
-            cols = {r[1] for r in self._conn.execute(
-                "PRAGMA table_info(camouflages)").fetchall()}
-            if cols and "icon_path" not in cols:
-                self._conn.execute("ALTER TABLE camouflages ADD COLUMN icon_path TEXT DEFAULT ''")
-                self._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 迁移：exteriors / camouflages 补 display_name 列（涂装本地化名）
-        for tbl in ("exteriors", "camouflages"):
-            try:
-                cols = {r[1] for r in self._conn.execute(
-                    f"PRAGMA table_info({tbl})").fetchall()}
-                if cols and "display_name" not in cols:
-                    self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN display_name TEXT DEFAULT ''")
-                    self._conn.commit()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _init_core_tables_inline(self) -> None:
-        """内嵌建表（assets_database.sql 读取失败时的兜底，与 SQL 文件保持一致）。"""
-        self._conn.executescript("""
-        CREATE TABLE IF NOT EXISTS meta (
-            bin_folder TEXT PRIMARY KEY,
-            game_version TEXT,
-            wows_type TEXT,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS skeleton_mounts (
-            bin_folder TEXT NOT NULL,
-            stem TEXT NOT NULL,
-            hp_name TEXT NOT NULL,
-            pos_x REAL NOT NULL DEFAULT 0,
-            pos_y REAL NOT NULL DEFAULT 0,
-            pos_z REAL NOT NULL DEFAULT 0,
-            rot_qx REAL NOT NULL DEFAULT 0,
-            rot_qy REAL NOT NULL DEFAULT 0,
-            rot_qz REAL NOT NULL DEFAULT 0,
-            rot_qw REAL NOT NULL DEFAULT 1,
-            scale_x REAL NOT NULL DEFAULT 1,
-            scale_y REAL NOT NULL DEFAULT 1,
-            scale_z REAL NOT NULL DEFAULT 1,
-            PRIMARY KEY(bin_folder, stem, hp_name)
-        );
-        CREATE INDEX IF NOT EXISTS idx_skel_stem ON skeleton_mounts(bin_folder, stem);
-        CREATE TABLE IF NOT EXISTS skeleton_bones (
-            bin_folder TEXT NOT NULL,
-            stem TEXT NOT NULL,
-            bone_name TEXT NOT NULL,
-            pos_x REAL NOT NULL DEFAULT 0,
-            pos_y REAL NOT NULL DEFAULT 0,
-            pos_z REAL NOT NULL DEFAULT 0,
-            rot_qx REAL NOT NULL DEFAULT 0,
-            rot_qy REAL NOT NULL DEFAULT 0,
-            rot_qz REAL NOT NULL DEFAULT 0,
-            rot_qw REAL NOT NULL DEFAULT 1,
-            scale_x REAL NOT NULL DEFAULT 1,
-            scale_y REAL NOT NULL DEFAULT 1,
-            scale_z REAL NOT NULL DEFAULT 1,
-            PRIMARY KEY(bin_folder, stem, bone_name)
-        );
-        CREATE INDEX IF NOT EXISTS idx_bones_stem ON skeleton_bones(bin_folder, stem);
-        CREATE TABLE IF NOT EXISTS render_sets (
-            bin_folder TEXT NOT NULL,
-            geom_path TEXT NOT NULL,
-            shape TEXT NOT NULL,
-            material TEXT NOT NULL DEFAULT '',
-            mfm TEXT NOT NULL DEFAULT '',
-            damage INTEGER NOT NULL DEFAULT 0,
-            skinned INTEGER NOT NULL DEFAULT 0,
-            nodes TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY(bin_folder, geom_path, shape)
-        );
-        CREATE INDEX IF NOT EXISTS idx_rs_geom ON render_sets(bin_folder, geom_path);
-        CREATE TABLE IF NOT EXISTS mfm_textures (
-            bin_folder TEXT NOT NULL,
-            mfm_path TEXT NOT NULL,
-            texture_path TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY(bin_folder, mfm_path)
-        );
-        CREATE TABLE IF NOT EXISTS material_full (
-            bin_folder TEXT NOT NULL,
-            mfm_path TEXT NOT NULL,
-            shader_id TEXT NOT NULL DEFAULT '0x0',
-            family TEXT NOT NULL DEFAULT '',
-            material_hash TEXT NOT NULL DEFAULT '',
-            fx_path TEXT NOT NULL DEFAULT '',
-            textures TEXT NOT NULL DEFAULT '',
-            indexed TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY(bin_folder, mfm_path)
-        );
-        CREATE TABLE IF NOT EXISTS shape_names (
-            bin_folder TEXT NOT NULL,
-            hash INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            PRIMARY KEY(bin_folder, hash)
-        );
-        CREATE INDEX IF NOT EXISTS idx_sn_bin ON shape_names(bin_folder);
-        CREATE TABLE IF NOT EXISTS meta_schema_version (
-            version INTEGER PRIMARY KEY,
-            applied_at TEXT DEFAULT (datetime('now','localtime'))
-        );
-        CREATE TABLE IF NOT EXISTS exteriors (
-            version_code TEXT NOT NULL,
-            ext_index    TEXT NOT NULL,
-            name         TEXT NOT NULL,
-            camouflage   TEXT NOT NULL DEFAULT '',
-            species      TEXT NOT NULL DEFAULT '',
-            nation       TEXT NOT NULL DEFAULT '',
-            cost_gold    INTEGER DEFAULT 0,
-            can_buy      INTEGER DEFAULT 0,
-            parts_json   TEXT DEFAULT '[]',
-            custom_json  TEXT DEFAULT '{}',
-            unpeculiar_camouflage TEXT DEFAULT '',
-            color_scheme_id INTEGER DEFAULT 0,
-            icon_path    TEXT DEFAULT '',
-            display_name TEXT DEFAULT '',
-            data_json    TEXT DEFAULT '{}',
-            PRIMARY KEY(version_code, ext_index)
-        );
-        CREATE INDEX IF NOT EXISTS idx_exteriors ON exteriors(version_code, species);
-        CREATE TABLE IF NOT EXISTS camouflages (
-            version_code TEXT NOT NULL,
-            name         TEXT NOT NULL,
-            realm        TEXT NOT NULL DEFAULT '',
-            tiled        INTEGER DEFAULT 0,
-            use_color_scheme INTEGER DEFAULT 0,
-            color_scheme TEXT DEFAULT '',
-            textures_json TEXT DEFAULT '{}',
-            uv_json      TEXT DEFAULT '{}',
-            ship_groups_json TEXT DEFAULT '[]',
-            target_ships_json TEXT DEFAULT '[]',
-            icon_path    TEXT DEFAULT '',
-            display_name TEXT DEFAULT '',
-            PRIMARY KEY(version_code, name)
-        );
-        CREATE TABLE IF NOT EXISTS camouflage_color_schemes (
-            version_code TEXT NOT NULL,
-            name         TEXT NOT NULL,
-            color0 TEXT, color1 TEXT, color2 TEXT, color3 TEXT,
-            PRIMARY KEY(version_code, name)
-        );
-        CREATE TABLE IF NOT EXISTS camo_ship_groups (
-            version_code TEXT NOT NULL,
-            group_name  TEXT NOT NULL,
-            ship        TEXT NOT NULL,
-            PRIMARY KEY(version_code, group_name, ship)
-        );
-        """)
 
     # ── schema 版本管理（同 database_service 规则）───────────
 
@@ -423,6 +256,42 @@ class AssetsCacheService:
         except (sqlite3.OperationalError, TypeError, ValueError):
             return 0
 
+    # ── 库级元信息 ──────────────────────────────────────────
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            return str(row["value"]) if row else default
+        except sqlite3.OperationalError:
+            return default
+
+    def _set_meta(self, items: dict) -> None:
+        rows = [(str(k), str(v)) for k, v in items.items()]
+        if rows:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", rows)
+
+    @property
+    def build(self) -> str:
+        """本库数据对应的客户端 build（增量同步据此判断是否换版本）。"""
+        return self.get_meta("build")
+
+    def _delete_models(self, models: set[str]) -> None:
+        """删掉指定模型目录在派生表里的全部行（增量重建前调用）。"""
+        if not models:
+            return
+        items = list(models)
+        for i in range(0, len(items), 400):
+            chunk = items[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            self._conn.execute(
+                "DELETE FROM skeleton_mounts WHERE model_id IN (%s)" % ph, chunk)
+            self._conn.execute(
+                "DELETE FROM skeleton_bones WHERE model_id IN (%s)" % ph, chunk)
+            self._conn.execute(
+                "DELETE FROM render_set WHERE model_id IN (%s)" % ph, chunk)
+
     def _record_version(self, ver: int) -> None:
         """记录已应用的 schema 版本。"""
         try:
@@ -443,15 +312,23 @@ class AssetsCacheService:
     def populate(self, assets_path: str | None = None, bin_folder: str = "",
                  game_version: str = "", wows_type: str = "",
                  game_dir: str | Path | None = None,
-                 progress_cb=None, assets_bytes: bytes | None = None) -> dict:
-        """现场解析 assets.bin 并写入缓存数据库。
+                 progress_cb=None, assets_bytes: bytes | None = None,
+                 models: set[str] | None = None,
+                 removed: set[str] | None = None) -> dict:
+        """解析 assets.bin 并写入缓存数据库（全量或按模型增量）。
 
         assets_bytes: 内存中的 assets.bin 字节（**推荐**：加载流程全程不落盘）；
                       给了它就不读任何文件、也不写任何文件。
         assets_path:  兼容旧调用方的已解压文件路径（仅当 assets_bytes 为 None 时使用）。
+        models:      要重建的模型目录集合；``None`` = 全量重建（首次/强制）。
+        removed:     已从客户端消失的模型目录，删掉它们的行。
         progress_cb: 可选阶段进度回调（str 消息），用于把骨架/渲染集/材质各阶段
         显示到日志区。
-        返回 {skeleton, render_sets, mfm_textures} 各条数。
+        返回各表写入条数。
+
+        增量语义：`render_set` / `skeleton_*` 只重建 `models` 里的模型；
+        材质 / 贴图 / 形状名 / 外观这几张全局表（合计约 30 MB）每次全刷 ——
+        它们被多船共用，无法归属到单个模型，全刷是唯一正确做法。
         """
         from uncode_assets.service import AssetsBinService
 
@@ -459,11 +336,6 @@ class AssetsCacheService:
             raise ValueError("populate 需要 assets_bytes 或 assets_path 之一")
 
         self.initialize()
-        # ── 全量重建（覆盖全部内容，无视 bin 版本号）─────────────
-        # ⚠️ 用 DELETE FROM 在同一事务里清空（**不** DROP TABLE + commit）：
-        # 这样中途失败可 rollback，旧缓存原样恢复 —— 不会出现「导入失败 →
-        # 缓存库被清空 → 3D 查看器没骨架/没材质」的连带故障。
-        # 清空动作在下方的 try 内执行，与写入共用同一个事务。
         # 全内存路径：assets_bytes 直接解析（不落盘、不读既有文件）
         # wows_type 传入：WG 服用 10 类型表 + WG 布局（渲染集 0x70/材质 0x78）
         if assets_bytes is not None:
@@ -481,24 +353,39 @@ class AssetsCacheService:
 
         # 共享 pkg 提取器（Exterior/涂装图标；仅在需要时惰性创建），最后由 finally 统一关闭
         _shared_ext = None
+        full = models is None
 
         try:
             counts = {"skeleton": 0, "render_sets": 0, "mfm_textures": 0,
                       "material_full": 0, "skeleton_bones": 0, "shape_names": 0,
                       "exteriors": 0, "camouflages": 0, "camouflage_color_schemes": 0,
-                      "camo_ship_groups": 0}
-            # 清空旧行（同一事务；失败时和后续写入一起回滚，旧数据原样保留）
-            self._clear_all_rows()
+                      "camo_ship_groups": 0, "models": 0, "mode": "full" if full else "incremental"}
             # 共用：字符串 dict + self_id 索引（渲染集/材质解析都要用）
             sdict = self._strings_dict(db)
             self_id_idx = db.build_self_id_index()
-            # 表已全量清空重建，无需按 bin_folder 逐表 DELETE；直接写入元信息
-            self._conn.execute(
-                "INSERT INTO meta(bin_folder, game_version, wows_type, created_at) "
-                "VALUES (?,?,?,datetime('now'))",
-                (bin_folder, game_version, wows_type))
 
-            _p("清空旧缓存（事务内，失败可回滚）并写入元信息，扫描 VFS 全树...")
+            if full:
+                # 全量：清空全部行（同一事务，失败可回滚 → 旧缓存原样保留，
+                # 不会出现「导入失败 → 库被清空 → 3D 数据全丢」的连带故障）
+                self._clear_all_rows()
+            else:
+                # 增量：只删要重建的模型 + 已消失的模型；全局表全刷
+                drop = set(models or ()) | set(removed or ())
+                self._delete_models(drop)
+                for t in ("material_full", "mfm_textures", "shape_names",
+                          "exteriors", "camouflages", "camouflage_color_schemes",
+                          "camo_ship_groups"):
+                    self._conn.execute('DELETE FROM "%s"' % t)
+
+            self._set_meta({
+                "build": bin_folder or "",
+                "game_version": game_version or "",
+                "wows_type": wows_type or self._wows_type,
+                "last_sync_mode": "full" if full else "incremental",
+                "last_sync_models": str(len(models or ())),
+            })
+
+            _p("清空目标模型（事务内，失败可回滚）并扫描 VFS 全树...")
 
             # 收集骨架/视觉/扩展/材质文件（一次遍历全树）：
             #   skel_files: Korabli SkeletonPrototype（HP_/MP_ 挂点 + 骨骼）
@@ -557,18 +444,18 @@ class AssetsCacheService:
                 if skel_rows:
                     self._conn.executemany(
                         "INSERT OR REPLACE INTO skeleton_mounts "
-                        "(bin_folder, stem, hp_name, "
+                        "(model_id, hp_name, "
                         "pos_x, pos_y, pos_z, rot_qx, rot_qy, rot_qz, rot_qw, "
-                        "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         skel_rows)
                     tot_mounts += len(skel_rows)
                     skel_rows.clear()
                 if bone_rows:
                     self._conn.executemany(
                         "INSERT OR REPLACE INTO skeleton_bones "
-                        "(bin_folder, stem, bone_name, "
+                        "(model_id, bone_name, "
                         "pos_x, pos_y, pos_z, rot_qx, rot_qy, rot_qz, rot_qw, "
-                        "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         bone_rows)
                     tot_bones += len(bone_rows)
                     bone_rows.clear()
@@ -583,6 +470,9 @@ class AssetsCacheService:
                        f"已用 {time.time() - _t_skel:.0f}s）...")
                 stem = self._stem_of_skeleton(f.path)
                 if not stem:
+                    continue
+                # 增量：只重建变更集里的模型，其余整个跳过（省掉解码 + 写库）
+                if not full and stem not in models:
                     continue
                 try:
                     sk = svc.decode_skeleton_path(f.path)
@@ -612,7 +502,7 @@ class AssetsCacheService:
                                 # 否则 Root_BlendBone 等 Z 镜像骨骼会被存成恒等 → 主炮/副炮方向翻转）
                                 pos, quat, scale = self._decompose_mat(w[i])
                                 bone_rows.append((
-                                    bin_folder, stem, str(nm),
+                                    stem, str(nm),
                                     float(pos[0]), float(pos[1]), float(pos[2]),
                                     quat[0], quat[1], quat[2], quat[3],
                                     scale[0], scale[1], scale[2]))
@@ -629,17 +519,17 @@ class AssetsCacheService:
                         continue
                     m = np.array(mats[i], dtype=np.float32).reshape(4, 4).T
                     pos, quat, scale = self._decompose_mat(m)
-                    skel_rows.append((bin_folder, stem, n,
+                    skel_rows.append((stem, n,
                                       pos[0], pos[1], pos[2],
                                       quat[0], quat[1], quat[2], quat[3],
                                       scale[0], scale[1], scale[2]))
             # WG：Visual nodes（HP_ 挂点 + 骨骼）+ SkeletonExtender（MP_/SP_/EP_ 挂点）
             if self._is_wg():
                 self._populate_wg_skeleton(
-                    svc, db, sdict, self_id_idx, bin_folder,
+                    svc, db, sdict, self_id_idx,
                     vis_files, ext_files, skel_rows, bone_rows, skel_failed,
                     flush_cb=_flush_skel,
-                    note_cb=_p,
+                    models=models, note_cb=_p,
                     log_cb=lambda i, n: _p(
                         f"WG 骨架解析 {i}/{n}"
                         f"（骨骼 {tot_bones + len(bone_rows):,} / "
@@ -667,7 +557,7 @@ class AssetsCacheService:
             _t_rs = time.time()
 
             def _add_rs(row: tuple) -> None:
-                """按 PK(bin_folder, geom_path, shape) 汇总节点调色板（流式，内存有界）。"""
+                """按 PK(geom_path, shape) 汇总节点调色板（流式，内存有界）。"""
                 self._merge_render_set_into(rs_merged, row)
 
             def _write_rs() -> None:
@@ -677,19 +567,19 @@ class AssetsCacheService:
                     return
                 buf: list[tuple] = []
                 for k, v in rs_merged.items():
-                    buf.append((k[0], k[1], k[2], v[0], v[1], v[2], int(v[3]),
-                                json.dumps(v[4])))
+                    buf.append((k[0], k[1], v[0], v[1], v[2], v[3], int(v[4]),
+                                json.dumps(v[5])))
                     if len(buf) >= RS_CHUNK:
                         self._conn.executemany(
-                            "INSERT OR REPLACE INTO render_sets "
-                            "(bin_folder, geom_path, shape, material, mfm, damage, "
+                            "INSERT OR REPLACE INTO render_set "
+                            "(geom_path, shape, model_id, material, mfm, damage, "
                             "skinned, nodes) VALUES (?,?,?,?,?,?,?,?)", buf)
                         tot_rs += len(buf)
                         buf.clear()
                 if buf:
                     self._conn.executemany(
-                        "INSERT OR REPLACE INTO render_sets "
-                        "(bin_folder, geom_path, shape, material, mfm, damage, "
+                        "INSERT OR REPLACE INTO render_set "
+                        "(geom_path, shape, model_id, material, mfm, damage, "
                         "skinned, nodes) VALUES (?,?,?,?,?,?,?,?)", buf)
                     tot_rs += len(buf)
                     buf.clear()
@@ -705,6 +595,7 @@ class AssetsCacheService:
                     isize = vis.item_size
                     nrec = vis.record_count
                     wg = self._is_wg()
+                    rs_failed: list[str] = []
                     for ri in range(nrec):
                         if (ri + 1) % RS_LOG == 0 and nrec > RS_LOG:
                             _p(f"渲染集解析 {ri + 1}/{nrec}"
@@ -719,16 +610,21 @@ class AssetsCacheService:
                                 # 渲染集 relptr 在 +0x60，记录头字段与 Korabli 完全不同，
                                 # 走专用 WG 解析（每记录一 geometry → 渲染集 0x28 步长）
                                 self._render_sets_wg(data, off, db, self_id_idx, sdict,
-                                                     bin_folder, _add_rs)
+                                                     _add_rs, models)
                                 continue
                             if off + 0x40 > len(data):
                                 break
                             self._render_sets_lesta_one(data, off, db, self_id_idx,
-                                                        sdict, bin_folder, _add_rs)
-                        except Exception:  # noqa: BLE001
+                                                        sdict, _add_rs, models)
+                        except Exception as exc:  # noqa: BLE001
+                            # 只留前几条：整库为 0 时这就是唯一线索
+                            if len(rs_failed) < 5:
+                                rs_failed.append(repr(exc))
                             continue
-            except Exception:  # noqa: BLE001
-                pass
+                    if rs_failed:
+                        _p(f"⚠️ {len(rs_failed)}+ 条渲染集记录解析失败: {rs_failed[0]}")
+            except Exception as exc:  # noqa: BLE001
+                _p(f"⚠️ 渲染集解析中断，已入库的仍保留: {exc}")
             _write_rs()
             counts["render_sets"] = tot_rs
             _p(f"渲染集已入库: {tot_rs:,} 条")
@@ -736,17 +632,17 @@ class AssetsCacheService:
             sn_rows: list[tuple] = []
             for h, nm in sdict.items():
                 if nm.endswith(".vertices"):
-                    sn_rows.append((bin_folder, h, nm))
+                    sn_rows.append((h, nm))
                     if len(sn_rows) >= 50000:
                         self._conn.executemany(
                             "INSERT OR REPLACE INTO shape_names "
-                            "(bin_folder, hash, name) VALUES (?,?,?)", sn_rows)
+                            "(hash, name) VALUES (?,?)", sn_rows)
                         tot_sn += len(sn_rows)
                         sn_rows.clear()
             if sn_rows:
                 self._conn.executemany(
-                    "INSERT OR REPLACE INTO shape_names (bin_folder, hash, name) "
-                    "VALUES (?,?,?)", sn_rows)
+                    "INSERT OR REPLACE INTO shape_names (hash, name) "
+                    "VALUES (?,?)", sn_rows)
                 tot_sn += len(sn_rows)
                 sn_rows.clear()
             counts["shape_names"] = tot_sn
@@ -779,15 +675,15 @@ class AssetsCacheService:
                 if mfm_rows:
                     self._conn.executemany(
                         "INSERT OR REPLACE INTO mfm_textures "
-                        "(bin_folder, mfm_path, texture_path) VALUES (?,?,?)",
+                        "(mfm_path, texture_path) VALUES (?,?)",
                         mfm_rows)
                     tot_mfm += len(mfm_rows)
                     mfm_rows.clear()
                 if mf_rows:
                     self._conn.executemany(
                         "INSERT OR REPLACE INTO material_full "
-                        "(bin_folder, mfm_path, shader_id, family, material_hash, "
-                        "fx_path, textures, indexed) VALUES (?,?,?,?,?,?,?,?)", mf_rows)
+                        "(mfm_path, shader_id, family, material_hash, "
+                        "fx_path, textures, indexed) VALUES (?,?,?,?,?,?,?)", mf_rows)
                     tot_mf += len(mf_rows)
                     mf_rows.clear()
 
@@ -896,7 +792,7 @@ class AssetsCacheService:
                     elif ptype == 7 and nm:
                         vec4s.append((i, raw_name, pidx))
                 if diff_base:
-                    mfm_rows.append((bin_folder, self._norm_vfs_path(f.path), diff_base))
+                    mfm_rows.append((self._norm_vfs_path(f.path), diff_base))
                 # INDEXED vec4 数组（长度按 material_array_lengths 推断）
                 indexed: dict = {}
                 if vec4s and vec4_ptr:
@@ -918,7 +814,7 @@ class AssetsCacheService:
                 # 解析逻辑独立在 uncode_assets.mfm_fx，浏览器/场景浏览器共用，
                 # 不依赖任何随源码打包的固定映射表。
                 fx_path = resolve_fx_path(db, f"0x{mat_hash:016X}")
-                mf_rows.append((bin_folder, self._norm_vfs_path(f.path), f"0x{shader_id:08X}", family,
+                mf_rows.append((self._norm_vfs_path(f.path), f"0x{shader_id:08X}", family,
                                 f"0x{mat_hash:016X}", fx_path,
                                 json.dumps(textures), json.dumps(indexed)))
             if mfm_failed:
@@ -930,7 +826,6 @@ class AssetsCacheService:
             counts["material_full"] = tot_mf
 
             _p("写入外观（Exterior）与涂装（camouflages.xml）数据...")
-            material_to_display: dict[str, str] = {}
             # 共享单个 GameExtractor（仅当需要从 pkg 读涂装时才建），惰性建一次复用。
             def _ext_factory():
                 nonlocal _shared_ext
@@ -953,10 +848,10 @@ class AssetsCacheService:
                 ext_rows: list[tuple] = []
                 # data_json 只存涂装相关字段，不存整份 Exterior（数千条会撑爆库）
                 ext_sql = ("INSERT OR REPLACE INTO exteriors "
-                           "(version_code, ext_index, name, camouflage, species, nation, "
+                           "(ext_index, name, camouflage, species, nation, "
                            "cost_gold, can_buy, parts_json, custom_json, "
-                           "unpeculiar_camouflage, color_scheme_id, icon_path, display_name, data_json) "
-                           "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                           "unpeculiar_camouflage, color_scheme_id, icon_path, data_json) "
+                           "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
                 tot_ext = 0
                 ext_total = len(ext_items)
                 # 外观条目极多，分批输出进度，避免长时间无任何日志（显得卡死）
@@ -971,12 +866,7 @@ class AssetsCacheService:
                     # icon_path 列保留但不再生产（缩略图链路已移除）
                     icon_rel = ""
                     camo_mat = d.get("camouflage", "") or ""
-                    # display_name 列保留但不再生产（本地化 .po/.mo 读取已移除）
-                    display_name = ""
-                    if camo_mat:
-                        material_to_display[camo_mat.lower()] = display_name
                     ext_rows.append((
-                        bin_folder,
                         ext_index,
                         ext_name,
                         camo_mat,
@@ -989,7 +879,6 @@ class AssetsCacheService:
                         d.get("unpeculiarCamouflage", "") or "",
                         int(d.get("unpeculiarCamouflageColorSchemeId", 0) or 0),
                         icon_rel,
-                        display_name,
                         json.dumps({k: d.get(k) for k in EXTERIOR_DATA_KEYS
                                     if d.get(k) is not None}, ensure_ascii=False),
                     ))
@@ -1005,8 +894,8 @@ class AssetsCacheService:
                     ext_rows.clear()
                 counts["exteriors"] = tot_ext
                 _p(f"外观数据已入库: {counts['exteriors']} 条")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _p(f"⚠️ 外观数据入库失败: {exc}")
 
             # 10) camouflages.xml（包根，含 shipgroups/colorschemes/camouflages 三段）
             #     → camouflages + camouflage_color_schemes 表，供涂装切换器按索引查询。
@@ -1037,9 +926,8 @@ class AssetsCacheService:
                             continue
                         entry = variants[0]
                         icon_rel = ""   # 缩略图链路已移除，列保留
-                        display_name = material_to_display.get(entry.name.lower(), "")
                         crows.append((
-                            bin_folder, name, entry.realm, int(entry.tiled),
+                            name, entry.realm, int(entry.tiled),
                             int(entry.use_color_scheme),
                             ",".join(entry.color_schemes
                                      or ([entry.color_scheme] if entry.color_scheme else [])),
@@ -1051,33 +939,32 @@ class AssetsCacheService:
                             json.dumps(entry.ship_groups, ensure_ascii=False),
                             json.dumps(entry.target_ships, ensure_ascii=False),
                             icon_rel,
-                            display_name,
                         ))
                     for cname, cs in (parsed.get("color_schemes") or {}).items():
                         cols = cs.colors or [[0.0] * 4 for _ in range(4)]
-                        csrows.append((bin_folder, cname) + tuple(
+                        csrows.append((cname,) + tuple(
                             json.dumps(list(cols[i]), ensure_ascii=False) for i in range(4)))
                     if crows:
                         self._conn.executemany(
                             "INSERT OR REPLACE INTO camouflages "
-                            "(version_code, name, realm, tiled, use_color_scheme, "
+                            "(name, realm, tiled, use_color_scheme, "
                             "color_scheme, textures_json, uv_json, "
-                            "ship_groups_json, target_ships_json, icon_path, display_name) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", crows)
+                            "ship_groups_json, target_ships_json, icon_path) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?)", crows)
                     if csrows:
                         self._conn.executemany(
                             "INSERT OR REPLACE INTO camouflage_color_schemes "
-                            "(version_code, name, color0, color1, color2, color3) "
-                            "VALUES (?,?,?,?,?,?)", csrows)
+                            "(name, color0, color1, color2, color3) "
+                            "VALUES (?,?,?,?,?)", csrows)
                     # shipgroups.xml 全局船组映射
                     sgrows: list[tuple] = []
                     for gname, ships in (parsed.get("ship_groups") or {}).items():
                         for s in ships:
-                            sgrows.append((bin_folder, gname, s))
+                            sgrows.append((gname, s))
                     if sgrows:
                         self._conn.executemany(
                             "INSERT OR REPLACE INTO camo_ship_groups "
-                            "(version_code, group_name, ship) VALUES (?,?,?)", sgrows)
+                            "(group_name, ship) VALUES (?,?)", sgrows)
                     counts["camouflages"] = len(crows)
                     counts["camouflage_color_schemes"] = len(csrows)
                     counts["camo_ship_groups"] = len(sgrows)
@@ -1087,6 +974,11 @@ class AssetsCacheService:
             except Exception:  # noqa: BLE001
                 pass
 
+            counts["models"] = len(models or ())
+            self._set_meta({
+                "synced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "built_models": str(counts["models"]),
+            })
             self._conn.commit()
             return counts
         except Exception:
@@ -1109,17 +1001,14 @@ class AssetsCacheService:
     # ── 查询（3D 查看器用）─────────────────────────────────
 
 
-    def get_exteriors(self, bin_folder: str) -> list[dict]:
-        """该版本全部外观/涂装（Exterior JSON 索引）：[{index,name,species,nation,icon_path,display_name,...}]。"""
-        bin_folder = self._effective_bin_folder(bin_folder)
+    def get_exteriors(self) -> list[dict]:
+        """全部外观/涂装（Exterior 索引）：[{index,name,species,nation,icon_path,...}]。"""
         out: list[dict] = []
         try:
             rows = self._conn.execute(
                 "SELECT ext_index, name, camouflage, species, nation, cost_gold, can_buy, "
                 "parts_json, custom_json, unpeculiar_camouflage, color_scheme_id, "
-                "icon_path, display_name, data_json "
-                "FROM exteriors WHERE version_code=? ORDER BY ext_index",
-                (bin_folder,)).fetchall()
+                "icon_path, data_json FROM exteriors ORDER BY ext_index").fetchall()
             for r in rows:
                 out.append({
                     "index": r["ext_index"],
@@ -1134,24 +1023,20 @@ class AssetsCacheService:
                     "unpeculiar_camouflage": r["unpeculiar_camouflage"],
                     "color_scheme_id": r["color_scheme_id"],
                     "icon_path": r["icon_path"] or "",
-                    "display_name": r["display_name"] or r["name"],
                     "data": json.loads(r["data_json"] or "{}"),
                 })
         except (sqlite3.OperationalError, ValueError):
             out = []
         return out
 
-
-    def get_all_camouflages(self, bin_folder: str) -> list[dict]:
-        """该版本全部 camouflages.xml 条目。"""
-        bin_folder = self._effective_bin_folder(bin_folder)
+    def get_all_camouflages(self) -> list[dict]:
+        """全部 camouflages.xml 条目。"""
         out: list[dict] = []
         try:
             rows = self._conn.execute(
                 "SELECT name, realm, tiled, use_color_scheme, color_scheme, textures_json, "
-                "uv_json, ship_groups_json, target_ships_json, icon_path, display_name "
-                "FROM camouflages WHERE version_code=? ORDER BY name",
-                (bin_folder,)).fetchall()
+                "uv_json, ship_groups_json, target_ships_json, icon_path "
+                "FROM camouflages ORDER BY name").fetchall()
         except sqlite3.OperationalError:
             return []
         for r in rows:
@@ -1164,19 +1049,16 @@ class AssetsCacheService:
                 "ship_groups": json.loads(r["ship_groups_json"] or "[]"),
                 "target_ships": json.loads(r["target_ships_json"] or "[]"),
                 "icon_path": r["icon_path"] or "",
-                "display_name": r["display_name"] or r["name"],
             })
         return out
 
-    def get_all_camo_color_schemes(self, bin_folder: str) -> dict[str, list]:
-        """该版本全部颜色方案：{name: [color0..3] 各 4 float}。"""
-        bin_folder = self._effective_bin_folder(bin_folder)
+    def get_all_camo_color_schemes(self) -> dict[str, list]:
+        """全部颜色方案：{name: [color0..3] 各 4 float}。"""
         out: dict[str, list] = {}
         try:
             rows = self._conn.execute(
                 "SELECT name, color0, color1, color2, color3 "
-                "FROM camouflage_color_schemes WHERE version_code=?",
-                (bin_folder,)).fetchall()
+                "FROM camouflage_color_schemes").fetchall()
         except sqlite3.OperationalError:
             return {}
         for r in rows:
@@ -1185,37 +1067,32 @@ class AssetsCacheService:
                 txt = r[f"color{i}"]
                 try:
                     cols.append(json.loads(txt) if txt else [0.0] * 4)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     cols.append([0.0] * 4)
             out[r["name"]] = cols
         return out
 
-    def get_all_camo_ship_groups(self, bin_folder: str) -> dict[str, set]:
-        """该版本全部船组映射：{group_name: set(ship)}。"""
-        bin_folder = self._effective_bin_folder(bin_folder)
+    def get_all_camo_ship_groups(self) -> dict[str, set]:
+        """全部船组映射：{group_name: set(ship)}。"""
         out: dict[str, set] = {}
         try:
             rows = self._conn.execute(
-                "SELECT group_name, ship FROM camo_ship_groups WHERE version_code=?",
-                (bin_folder,)).fetchall()
+                "SELECT group_name, ship FROM camo_ship_groups").fetchall()
         except sqlite3.OperationalError:
             return {}
         for r in rows:
             out.setdefault(r["group_name"], set()).add(r["ship"])
         return out
 
-
-    def get_skeleton_mounts(self, bin_folder: str, stem: str) -> dict:
-        """某舰体骨架的 HP_ 挂点：{hp_name: (4,4) 行主序渲染空间矩阵（由解码值重建）}。"""
-        import numpy as np
-        bin_folder = self._effective_bin_folder(bin_folder)
+    def get_skeleton_mounts(self, model_id: str) -> dict:
+        """某模型骨架的 HP_ 挂点：{hp_name: (4,4) 行主序渲染空间矩阵（由解码值重建）}。"""
         out: dict = {}
         try:
             rows = self._conn.execute(
                 "SELECT hp_name, pos_x, pos_y, pos_z, "
                 "rot_qx, rot_qy, rot_qz, rot_qw, scale_x, scale_y, scale_z "
-                "FROM skeleton_mounts WHERE bin_folder=? AND stem=?",
-                (bin_folder, stem)).fetchall()
+                "FROM skeleton_mounts WHERE model_id=?",
+                (model_id,)).fetchall()
             for r in rows:
                 out[r["hp_name"]] = self._quat_to_mat(
                     r["rot_qx"], r["rot_qy"], r["rot_qz"], r["rot_qw"],
@@ -1225,17 +1102,15 @@ class AssetsCacheService:
             out = {}
         return out
 
-    def get_skeleton_bones(self, bin_folder: str, stem: str) -> dict:
+    def get_skeleton_bones(self, model_id: str) -> dict:
         """某模型骨架的全部骨骼世界矩阵：{bone_name: (4,4)（由解码值重建）}。"""
-        import numpy as np
-        bin_folder = self._effective_bin_folder(bin_folder)
         out: dict = {}
         try:
             rows = self._conn.execute(
                 "SELECT bone_name, pos_x, pos_y, pos_z, "
                 "rot_qx, rot_qy, rot_qz, rot_qw, scale_x, scale_y, scale_z "
-                "FROM skeleton_bones WHERE bin_folder=? AND stem=?",
-                (bin_folder, stem)).fetchall()
+                "FROM skeleton_bones WHERE model_id=?",
+                (model_id,)).fetchall()
             for r in rows:
                 out[r["bone_name"]] = self._quat_to_mat(
                     r["rot_qx"], r["rot_qy"], r["rot_qz"], r["rot_qw"],
@@ -1245,8 +1120,7 @@ class AssetsCacheService:
             out = {}
         return out
 
-
-    def get_render_sets(self, bin_folder: str, geom_paths: list[str]) -> list[dict]:
+    def get_render_sets(self, geom_paths: list[str]) -> list[dict]:
         """某批 geometry 路径的全部渲染集（含整合模型共享记录）。
 
         返回 [{geom_path, shape, material, mfm, damage, skinned, nodes}]。
@@ -1255,14 +1129,13 @@ class AssetsCacheService:
         out: list[dict] = []
         if not geom_paths:
             return out
-        bin_folder = self._effective_bin_folder(bin_folder)
         try:
             ph = ",".join("?" * len(geom_paths))
             rows = self._conn.execute(
                 f"SELECT geom_path, shape, material, mfm, damage, skinned, nodes "
-                f"FROM render_sets "
-                f"WHERE bin_folder=? AND geom_path IN ({ph}) "
-                f"ORDER BY geom_path, shape", (bin_folder, *geom_paths)).fetchall()
+                f"FROM render_set "
+                f"WHERE geom_path IN ({ph}) "
+                f"ORDER BY geom_path, shape", tuple(geom_paths)).fetchall()
             for r in rows:
                 nodes: list[str] = []
                 if r["nodes"]:
@@ -1281,42 +1154,35 @@ class AssetsCacheService:
             out = []
         return out
 
-    def get_shape_names(self, bin_folder: str) -> dict:
+    def get_shape_names(self) -> dict:
         """*.vertices 名字哈希 → 名字（LOD/crack 兜底跳过用；**只从 DB 读取**）。"""
-        bin_folder = self._effective_bin_folder(bin_folder)
         out: dict = {}
         try:
-            rows = self._conn.execute(
-                "SELECT hash, name FROM shape_names WHERE bin_folder=?",
-                (bin_folder,)).fetchall()
+            rows = self._conn.execute("SELECT hash, name FROM shape_names").fetchall()
             for r in rows:
                 out[r["hash"]] = r["name"]
         except sqlite3.OperationalError:
             out = {}
         return out
 
-    def get_mfm_textures(self, bin_folder: str) -> dict:
+    def get_mfm_textures(self) -> dict:
         """全部材质贴图映射：{mfm_path: texture_path（原始路径，含扩展名）}。"""
-        bin_folder = self._effective_bin_folder(bin_folder)
         out: dict = {}
         try:
             rows = self._conn.execute(
-                "SELECT mfm_path, texture_path FROM mfm_textures WHERE bin_folder=?",
-                (bin_folder,)).fetchall()
+                "SELECT mfm_path, texture_path FROM mfm_textures").fetchall()
             for r in rows:
                 out[r["mfm_path"]] = r["texture_path"]
         except sqlite3.OperationalError:
             out = {}
         return out
 
-    def get_material_full(self, bin_folder: str, mfm_path: str) -> dict | None:
+    def get_material_full(self, mfm_path: str) -> dict | None:
         """材质完整信息：{shader_id, family, material_hash, fx_path, textures, indexed}。"""
-        bin_folder = self._effective_bin_folder(bin_folder)
         try:
             row = self._conn.execute(
                 "SELECT shader_id, family, material_hash, fx_path, textures, indexed "
-                "FROM material_full WHERE bin_folder=? AND mfm_path=?",
-                (bin_folder, mfm_path)).fetchone()
+                "FROM material_full WHERE mfm_path=?", (mfm_path,)).fetchone()
             if row is None:
                 return None
             return {
@@ -1334,7 +1200,7 @@ class AssetsCacheService:
     def _name_of(sdict: dict, db, hid: int) -> str:
         """哈希 → 名字：先查批量字典 sdict，缺失时回退完整字符串表。
 
-        sdict 是“全表扫描一次”的快速字典；若构建时被异常截断（部分条目缺失），
+        sdict 是「全表扫描一次」的快速字典；若构建时被异常截断（部分条目缺失），
         回落 db.strings 避免整套名字为空（否则骨骼/渲染集会被全部跳过 → 入库 0 条）。
         """
         nm = sdict.get(hid & 0xFFFFFFFF)
@@ -1344,29 +1210,6 @@ class AssetsCacheService:
             return db.strings.get_string_by_id(hid) or ''
         except Exception:  # noqa: BLE001
             return ''
-
-    def _effective_bin_folder(self, bin_folder: str) -> str:
-        """把传入的 bin_folder 校正为库里**实际存在数据**的版本号。
-
-        场景：切服 / 重新扫描后 `ctx.bin_folder` 可能为空或与库内版本号不同
-        （刚切回服务器、还没回填就打开 3D 查看器）→ 按 bin_folder 查询全部落空，
-        表现为「船体正常但贴图 0 张、挂载 0 个」。这里查不到时回退到 meta 里
-        最新写入的 bin_folder（库本身就是按它建的表）。
-        """
-        key = (bin_folder or "").strip()
-        try:
-            if key:
-                row = self._conn.execute(
-                    "SELECT 1 FROM meta WHERE bin_folder=? LIMIT 1", (key,)).fetchone()
-                if row is not None:
-                    return key
-            row = self._conn.execute(
-                "SELECT bin_folder FROM meta ORDER BY created_at DESC LIMIT 1").fetchone()
-            if row is not None and row["bin_folder"]:
-                return str(row["bin_folder"])
-        except sqlite3.OperationalError:
-            pass
-        return key
 
     @staticmethod
     def _find_gameparams_file(game_dir, wows_type: str = "") -> str:
@@ -1401,12 +1244,21 @@ class AssetsCacheService:
 
     # ── 工具 ────────────────────────────────────────────────
 
+    @staticmethod
+    def _model_of(geom_path: str) -> str:
+        """geometry 的 VFS 路径 → 模型目录名（= 父目录，如 BSD100_Waterloo_1956）。"""
+        if not geom_path:
+            return ""
+        return geom_path.replace("\\", "/").rsplit("/", 2)[-2]
+
     def _render_sets_lesta_one(self, data, off, db, self_id_idx, sdict,
-                               bin_folder, add_row) -> None:
+                               add_row, models=None) -> None:
         """Korabli VisualPrototype（0x40 布局）单条记录的渲染集解析。
 
         独立成方法是为了让 populate 的渲染集循环能**逐条记录**捕获异常
         （单条坏记录不应让整库渲染集为 0）。
+
+        models 非 None 时只解析该集合里的模型（增量重建）。
         """
         cnt = struct.unpack_from('<Q', data, off + 0x30)[0]
         rel = struct.unpack_from('<Q', data, off + 0x38)[0]
@@ -1415,6 +1267,9 @@ class AssetsCacheService:
         h = struct.unpack_from('<Q', data, off + 0x20)[0]
         gp = self._path_of(h, db, self_id_idx)
         if not (gp and gp.endswith(".geometry")):
+            return
+        model_id = self._model_of(gp)
+        if models is not None and model_id not in models:
             return
         # 渲染集数组：+0x38 rel 为 **record-relative**（相对记录起始），
         # 数组从 rel 起、每项 0x50 步长；+0x30 count 为权威条数。
@@ -1453,11 +1308,11 @@ class AssetsCacheService:
                             nm = self._name_of(sdict, db, nid)
                             if nm:
                                 nodes.append(nm)
-            add_row((bin_folder, gp, shp, mat, mfm, damage,
+            add_row((gp, shp, model_id, mat, mfm, damage,
                      int(skinned), json.dumps(nodes)))
 
     def _render_sets_wg(self, data, off, db, self_id_idx, sdict,
-                        bin_folder, add_row) -> None:
+                        add_row, models=None) -> None:
         """WG VisualPrototype 渲染集解析（0x70 记录 + 0x28 渲染集，wows-toolkit visual.rs）。
 
         add_row: 单行回调（= populate 里的 _add_rs，边解析边汇总，内存有界）。
@@ -1478,6 +1333,9 @@ class AssetsCacheService:
         gp = self._path_of(struct.unpack_from('<Q', data, off + 0x30)[0],
                            db, self_id_idx)
         if not (gp and gp.endswith(".geometry")):
+            return
+        model_id = self._model_of(gp)
+        if models is not None and model_id not in models:
             return
         cnt = struct.unpack_from('<H', data, off + 0x3A)[0]
         rel = struct.unpack_from('<q', data, off + 0x60)[0]
@@ -1513,13 +1371,13 @@ class AssetsCacheService:
                             nm = self._name_of(sdict, db, nid)
                             if nm:
                                 nodes.append(nm)
-            add_row((bin_folder, gp, shp, mat, mfm, damage,
+            add_row((gp, shp, model_id, mat, mfm, damage,
                      int(skinned), json.dumps(nodes)))
 
-    def _populate_wg_skeleton(self, svc, db, sdict, self_id_idx, bin_folder,
+    def _populate_wg_skeleton(self, svc, db, sdict, self_id_idx,
                               vis_files, ext_files, skel_rows, bone_rows,
                               skel_failed, flush_cb=None, log_cb=None,
-                              note_cb=None) -> None:
+                              note_cb=None, models=None) -> None:
         """WG 骨架：VisualPrototype nodes（基础骨架，含 HP_ 挂点）+ SkeletonExtender（MP_/SP_/EP_）。
 
         数据来源（wows-toolkit）：
@@ -1572,12 +1430,12 @@ class AssetsCacheService:
                     if not nm or i >= len(w) or w[i] is None:
                         continue
                     pos, quat, scale = self._decompose_mat(w[i])
-                    bone_rows.append((bin_folder, stem, nm,
+                    bone_rows.append((stem, nm,
                                       float(pos[0]), float(pos[1]), float(pos[2]),
                                       quat[0], quat[1], quat[2], quat[3],
                                       scale[0], scale[1], scale[2]))
                     if nm.startswith("HP_"):
-                        skel_rows.append((bin_folder, stem, nm,
+                        skel_rows.append((stem, nm,
                                           float(pos[0]), float(pos[1]), float(pos[2]),
                                           quat[0], quat[1], quat[2], quat[3],
                                           scale[0], scale[1], scale[2]))
@@ -1597,12 +1455,12 @@ class AssetsCacheService:
                         continue
                     mtx = np.array(mats[i], dtype=np.float32).reshape(4, 4).T
                     pos, quat, scale = self._decompose_mat(mtx)
-                    bone_rows.append((bin_folder, stem, nm,
+                    bone_rows.append((stem, nm,
                                       float(pos[0]), float(pos[1]), float(pos[2]),
                                       quat[0], quat[1], quat[2], quat[3],
                                       scale[0], scale[1], scale[2]))
                     if nm.startswith(("MP_", "SP_", "EP_")):
-                        skel_rows.append((bin_folder, stem, nm,
+                        skel_rows.append((stem, nm,
                                           float(pos[0]), float(pos[1]), float(pos[2]),
                                           quat[0], quat[1], quat[2], quat[3],
                                           scale[0], scale[1], scale[2]))
