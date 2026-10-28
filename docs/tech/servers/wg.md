@@ -31,7 +31,6 @@
 | Material 条目尺寸 | `0x78` |
 | Visual 条目尺寸 | `0x70` |
 | Model 条目尺寸 | `0x28` |
-| `.visual` 明文导出 | `uncode_assets/visual_wg_text.py`：`<skeleton>` / `<properties>` / `<boundingBox>` / `<renderSets>` |
 | blob index → 类型 | 与 Lesta **完全不同**，按 magic 识别 |
 
 > 两服 **Material/Visual/Model 的 magic 相同，但 item_size 不同**。
@@ -92,7 +91,7 @@ WG 比 Lesta 大：材质更多（19.7k vs 16.4k）、涂装条目更多（2.3k 
 
 ## 7. WG 特有的坑
 
-1. **`.visual` 格式与 Lesta 完全不同** —— `visual_wg_text.py` 的
+1. **`.visual` 格式与 Lesta 完全不同** —— WG 是
    `<skeleton>/<properties>/<boundingBox>/<renderSets>` 结构。
 2. **item_size 不同** —— 套错表会静默读出错位数据，表现为材质/节点全错。
 3. **build 号过期** —— 见 §1，`shape_names` 会查空。

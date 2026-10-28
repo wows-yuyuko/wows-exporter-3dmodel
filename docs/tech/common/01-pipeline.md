@@ -12,7 +12,7 @@
 | `batch-worker` | 同上（内部） | 同上 | 读 |
 
 `batch` 自己**不做导出**：它按 `--jobs` 把船 key 切成 N 份，起 N 个
-`batch-worker` 子进程（`cli.py:225-241`）。所以 `batch` 与 `ship` 的行为差异
+`batch-worker` 子进程（`cli.py:cmd_batch()`）。所以 `batch` 与 `ship` 的行为差异
 只体现在"跳过已存在产物"与分片，导出逻辑完全共用 `_export_ship()`。
 
 ## 2. 运行期依赖关系
@@ -30,13 +30,13 @@ cli.py
      ├─ export_service.export_render_glb   # 渲染 GLB
      ├─ export_service.export_armor_glb    # 装甲 GLB（--armor）
      ├─ armor_export.write_armor_files     # armor.json + armor.bin（--armor）
-     ├─ skin_export.write_default_skin     # 必有
+     ├─ skin_export.write_default_skin     # 仅 --skins / --model-skins
      ├─ skin_export.export_mat_skins       # --skins
      ├─ skin_export.export_model_skins     # --model-skins
-     └─ web_manifest.write_web_manifest    # manifests/<ship>.json（必写）
+     └─ web_manifest.write_web_manifest    # manifests/<ship>/<ship>.json（必写）
 ```
 
-`_bootstrap` 里的 build 解析顺序（`cli.py:58-73`）：
+`_bootstrap()` 里的 build 解析顺序（`cli.py:_bootstrap()`）：
 
 1. `core.build_info.imported_build(server)` 读 `game_data*.db` 的 `meta_import_state`；
 2. 该目录不存在时，退到 `bin/` 下**数字最大**的目录。
@@ -50,24 +50,28 @@ cli.py
 
 ```text
 <out>/
-  geometry/<ship>.glb                 # 渲染模型（舰体 + 挂载）
-  geometry/<ship>.glb.zst             # --zstd（level 10）
-  geometry/<ship>__<skin>.glb         # --model-skins：换模型皮肤，各自一套
-  armor/<ship>.glb                    # --armor
-  armor/<ship>.json                   #   装甲索引（schema wows-armor/1）
-  armor/<ship>.bin                    #   位置/法线/板块 id，三段拼接
-  manifests/<ship>.json               # 网页清单（schema wows-web/1）
-  manifests/<ship>__<skin>.json       #   换模型皮肤各自的清单
-  textures/<sha1>.webp                # 外置贴图，文件名 = 内容 sha1
-  textures/indexed_<sha1>.bin         # INDEXED 的 6 个 196×4 float 数组
-  skins/<ship>/default.json           # 每次导出必写
-  skins/<ship>/<skin>.json            # --skins / --model-skins 的皮肤描述
+  geometry/<ship>/<ship>.glb           # 渲染模型（舰体 + 挂载）
+  geometry/<ship>/<ship>.glb.zst       # --zstd（level 10）
+  geometry/<ship>/<ship>__<skin>.glb   # --model-skins：换模型皮肤，各自一套
+  armor/<ship>/<ship>.glb              # --armor
+  armor/<ship>/<ship>.json             #   装甲索引（schema wows-armor/1）
+  armor/<ship>/<ship>.bin              #   位置/法线/板块 id，三段拼接
+  manifests/<ship>/<ship>.json         # 网页清单（schema wows-web/1，必写）
+  manifests/<ship>/<ship>__<skin>.json #   换模型皮肤各自的清单
+  textures/<sha1>.webp                 # 外置贴图，文件名 = 内容 sha1
+  textures/indexed_<sha1>.bin          # INDEXED 的 6 个 196×4 数组
+  skins/<ship>/default.json            # 仅 --skins / --model-skins
+  skins/<ship>/<skin>.json             # --skins / --model-skins 的皮肤描述
+  .export_index.json                   # 增量索引（仅 batch）
 ```
+
+> 除 `textures/` 外每类产物都多一层船名目录；GLB 里的贴图 URI 因此是
+> `../../textures/…`，manifest 里的路径统一相对输出根。
 
 - 贴图文件名按内容哈希（`services/texture_export.write_webp`），同图不重复落盘；
 - `textures/` 是**共享目录**：多次导出到同一个 `<out>` 会累积历史贴图，
   改过 `--texture-size` 后旧图不会被自动删（体积会虚高，需手工清）。
-- `--no-textures` 时 `geometry/` 只有 GLB，不写 `textures/`；GLB 里也不嵌图。
+- `--no-textures` 时 `geometry/<ship>/` 只有 GLB，不写 `textures/`；GLB 里也不嵌图。
 
 ## 4. 线程、取消与内存
 
@@ -81,7 +85,7 @@ cli.py
 
 ## 5. 导出报告
 
-`export_service.ExportReport`（`export_service.py:204`）：
+`export_service.ExportReport`（`export_service.py:ExportReport`）：
 
 | 字段 | 含义 |
 |---|---|
@@ -99,14 +103,15 @@ CLI 直接 `print(report)`，输出形如：
 ✅ 导出渲染模型完成：429 网格 / 261,748 三角形 / 253 贴图，耗时 13.5s
 ```
 
-## 6. 实测耗时（Windows，本机）
+## 6. 实测耗时（Windows，本机，2026-10-27，`--slim` 与 INDEXED 烘焙均为默认）
 
 | 场景 | 耗时 |
 |---|---|
-| `ship` WG 大和（默认参数） | ~14 s |
-| `ship` 大和（两服各一次） | 28 s / 2 m 08 s（取决于是否首次解包） |
-| `ship` Waterloo（1,684→731 网格，INDEXED） | 2 m 45 s |
-| `--model-skins` 8 套皮肤 | 3 m 01 s（瓶颈是每套重新 `load_ship`） |
+| `ship` Waterloo（731 网格，INDEXED 烘焙 4096×2048） | 3.5–4.5 min（含加载；烘焙本身 13 s） |
+| `ship` WG 大和（全 PBS，429 网格） | ~14 s（冷启动另加解包） |
+| `batch` 同参数复跑（增量签名命中） | **2.3 s**（原本 3 m 14 s） |
+| `--model-skins` 3 套（WG 大和） | 62.7 s（每套 ~21 s；8 套约 167 s） |
 
 Waterloo 慢在网格碎片多（LOD2 下 731 个网格），每个网格都要单独解材质/贴图；
-大和虽然三角更多但网格少。
+大和虽然三角更多但网格少。`--model-skins` 的开销每套都是独立几何（模型皮肤会换
+`hull_config.model`，几何无法复用），只能省重复解码/编码，见 `../../todo-backlog.md` P2-3。

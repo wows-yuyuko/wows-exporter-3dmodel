@@ -42,13 +42,19 @@ pickle.loads(gpd, encoding='latin1') # 3) pickle → GPData / dict
 WG 的类型集合可能与 Lesta 不同，差异预留在 `services/wg_compat.py`
 （`get_type_category_map(wows_type)`；当前**未填充** → 回退 Lesta 默认）。
 
-落库分三路：
+落库实际只写这些：
 
 | 目标 | 内容 | 说明 |
 |---|---|---|
-| `data/split/<Category>/*.json` | 每实体一个 JSON | 仅 `keep_split_json=True` 时保留，默认导入结束即删 |
-| 结构化表（`ship_*` / `projectile_*` / `crew_*` …） | 分析用 | **导出链路不读**，见 §3 |
+| `data/split/<Category>/*.json` | 每实体一个 JSON | **导入过程的临时产物**，收尾即删（没有开关控制）。只供同一次导入里的后续步骤读，跨进程不再存在 |
 | `entity_snapshots` | 实体原始 JSON | **只写 `entity_type='ship'`**（见下） |
+| `ship_models` | 模型目录名 | 导出期取 `model_folder` |
+| `meta_import_state` / `data_version_registry` | build 号与版本状态 | `core/build_info.imported_build()` 读 |
+
+> ⚠️ **分析层已裁剪**：`processor_service._run_analysis()` 第一行就是 `return`
+> （函数体保留作参考）。所以 `ship_basic_info` / `projectile_*` / `crew_*` /
+> `name_mappings` 等结构化表**新导入不再写入**，库里现有的行数是旧版导入的遗留。
+> 不要再按"导入会刷新这些表"来做设计。
 
 ```python
 # processor_service._finalize_import
@@ -71,11 +77,10 @@ db.save_entity_snapshots([s for s in snapshots_batch if s[1] == "ship"], version
 | `ship_models` | 模型目录名（`model_folder`） | `database_service.load_ship_models()` |
 | `entity_registry` | 实体 id / 名称 / 国籍 | 列船兜底 |
 
-其余（`ship_basic_info`、`ship_module_*`、`projectile_*`、`crew_*`、
-`consumable_*`、`name_mappings`、`enum_translations`、`data_version_registry` …）
-属于原「数据浏览/对比」功能，导出不读。清理方案见
-[../../todo-backlog.md](../../todo-backlog.md) 与 [../../known-issues.md](../../known-issues.md)
-的「数据库精简」。
+其余（`ship_basic_info`、`ship_module_*`、`projectile_*`、`crew_*`、`consumable_*`、
+`name_mappings`、`enum_translations` …）属于原「数据浏览/对比」功能：导出不读，
+**新导入也不再写**（分析层已裁剪，见 §2 的警告）。可以直接删表瘦身；
+`assets_data` 侧的裁剪方案见 [../../known-issues.md](../../known-issues.md) 的「数据库精简」。
 
 ## 4. 版本与一致性
 

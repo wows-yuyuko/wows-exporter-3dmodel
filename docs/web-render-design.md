@@ -1,6 +1,7 @@
 # 网页端渲染设计参考（模型 / 材质 / 涂装 / 装甲）
 
-> 状态：设计稿（2026-10-26）
+> 状态：设计稿（2026-10-26），2026-10-27 复核：§1 布局、§5 装甲、§7 缓存三节已按实现更新，
+> 其余仍为设计意图
 > 适用：wows-exporter-3dmodel 的网页端产物
 > 决策：three.js、贴图统一 WebP（KTX2 已弃用）、贴图外置、涂装按游戏内叠加/图集还原
 
@@ -139,15 +140,18 @@ skins/<ship>/<skin_id>.json：
 
 ## 5. 装甲数据
 
-### 现状
+### 现状（2026-10-27 复核：本节「目标」已全部落地）
 
 - 渲染 GLB 里**不包含装甲**；
-- 装甲目前导出为单独的 <ship>_armor.glb；
-- 板块元数据（zone / material / thickness / hidden）写在装甲 GLB 的 material/node extras 里，**没有独立 JSON**。
+- 装甲是独立三件套：`armor/<ship>/<ship>.glb`（预览）、`armor/<ship>/<ship>.json`
+  （板块索引）、`armor/<ship>/<ship>.bin`（三角形，三段拼接）；
+- 板块元数据（zone / material / thickness / component / hidden / bounds）**在 JSON 里**，
+  同时冗余写进装甲 GLB 的 material/node extras；
+- 实现细节见 [tech/common/07-glb-armor.md](tech/common/07-glb-armor.md)。
 
-### 目标
+### 目标（已实现，保留作设计依据）
 
-新增 armor/<ship>.json，任何需要装甲数据的模块都读它，不必解析 GLB：
+任何需要装甲数据的模块读 armor/<ship>/<ship>.json，不必解析 GLB：
 
 ~~~json
 {
@@ -182,8 +186,8 @@ skins/<ship>/<skin_id>.json：
 
 两种落盘方式，二选一或并存：
 
-1. armor/<ship>.glb：每个板块一个节点，extras 带 id；适合直接渲染/描边；
-2. armor/<ship>.bin + JSON 索引：紧凑、便于拾取和高亮。
+1. armor/<ship>/<ship>.glb：每个板块一个节点，extras 带 id；适合直接渲染/描边；
+2. armor/<ship>/<ship>.bin + JSON 索引：紧凑、便于拾取和高亮。
 
 bin 布局（小端）：
 
@@ -197,7 +201,7 @@ JSON 里增加：
 
 ~~~json
 "buffers": {
-  "bin": "armor/PJSB520_Raiju.bin",
+  "bin": "armor/PJSB520_Raiju/PJSB520_Raiju.bin",
   "positions": { "offset": 0, "count": 25803 },
   "normals": { "offset": 309636, "count": 25803 },
   "plate_ids": { "offset": 619272, "count": 8601 }

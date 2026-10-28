@@ -1,6 +1,6 @@
 # 04 · `.geometry` → HullMesh / MountMesh
 
-> 入口：`GeometryService.load_ship()`（`services/geometry_service.py:630`）
+> 入口：`GeometryService.load_ship()`（`services/geometry_service.py`）
 > 解析器：`models/geometry_parser.py`；空间变换：`models/geometry_transform.py`
 
 ## 1. 文件发现

@@ -1,16 +1,16 @@
 # 06 · 渲染模型 GLB（舰体 + 挂载）
 
 > 入口：`export_service.export_render_glb(geometry, path, options)`
-> 产物：`geometry/<ship>.glb`（+ 外置 `textures/*.webp`）
+> 产物：`geometry/<ship>/<ship>.glb`（+ 外置 `textures/*.webp`）
 
 ## 1. 选项与默认值
 
-`GlbRenderOptions`（`export_service.py:120` 起）：
+`GlbRenderOptions`（`export_service.GlbRenderOptions`）：
 
 | 字段 | 默认 | 作用 |
 |---|---|---|
 | `embed_textures` | `True` | 为 False 时不写贴图（`--no-textures`） |
-| `textures_dir` / `texture_uri_prefix` | `""` / `../textures` | 外置贴图目录与 glTF 里的相对路径 |
+| `textures_dir` / `texture_uri_prefix` | `""` / `../textures` | 外置贴图目录与 glTF 里的相对路径。**dataclass 默认是给扁平布局用的**；CLI 与 `skin_export` 都显式传 `../../textures`（GLB 在 `geometry/<ship>/` 下），手写调用方必须自己传 |
 | `texture_format` | `webp` | 仅 WebP（KTX2 已弃用） |
 | `texture_max_size` | `1024` | 贴图最大边长（`--texture-size`） |
 | `export_mounts` | `True` | 是否导出挂载 |
@@ -68,7 +68,7 @@ Scene Root                                wows_export_version = 5
 
 ## 5. 材质映射
 
-按 `.mfm` **声明的键**映射，不做伪造（`export_service.py:1145` 起）：
+按 `.mfm` **声明的键**映射，不做伪造（`export_service._GlbBuilder` 的材质构造段）：
 
 | WoWS 键 | glTF 槽 | 变换 |
 |---|---|---|
@@ -147,17 +147,22 @@ Scene Root                                wows_export_version = 5
 
 ## 8. 写盘方式
 
-1. 先写 `<path>.tmp`，成功后 `os.replace()` 原子替换（`export_service.py:927`）；
+1. 先写 `<path>.tmp`，成功后 `os.replace()` 原子替换（`_GlbBuilder.save()` 结尾）；
 2. `pygltflib.save_binary()` 返回 False 视为失败并抛 `RuntimeError`；
 3. 所有 bufferView 都追加到单一二进制 blob（GLB 单文件，无外链 bin）。
 
 ## 9. 实测（默认参数）
 
-| 船 | 平台 | GLB | meshes | 三角形 | 材质 | 贴图 |
-|---|---|---|---|---|---|---|
-| Waterloo | Lesta | 18.0 MiB | 731 | 297,425 | 15 | 58 |
-| 大和 | Lesta | 17.2 MiB | 422 | 245,767 | 78 | 256 |
-| 大和 | WG | 22.8 MiB | 429 | 261,748 | 76 | 253 |
+样本产物的**权威统计只在** [`docs/known-issues.md`](../../known-issues.md) 的「测试样本」
+一节维护（路径、体积、贴图张数）；本文件不再重复一张必然过期的表。
 
-体积构成（Waterloo）：几何 18.0 MiB + 外置贴图 3.7 MB；
-大和贴图 3.3–3.5 MB。**体积大头是几何**，不是贴图。
+量级参考（2026-10-27，`--slim` + INDEXED 烘焙默认）：
+
+| 船 | 平台 | GLB | 网格 | 三角形 |
+|---|---|---|---|---|
+| Waterloo | Lesta | 8.9 MiB | 731 | 297,425 |
+| 大和 | Lesta | 8.6 MiB | 422 | 245,767 |
+| 大和 | WG | 9.1 MiB | 429 | 261,748 |
+
+体积大头仍是**几何**：Waterloo 单船引用约 58 张贴图（≈1.3 MB），
+而 lesta 整个贴图池 396 张才 9.1 MB。

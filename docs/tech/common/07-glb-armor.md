@@ -65,7 +65,7 @@
 - 顶层 `asset.extras = {game_key, display_name, model_folder, content:"armor",
   visible_only, wows_export_version: 2}`。
 
-## 4. `armor/<ship>.json` + `.bin`
+## 4. `armor/<ship>/<ship>.json` + `.bin`
 
 给网页用的独立索引（schema **`wows-armor/1`**）：
 
@@ -84,7 +84,7 @@
   ],
   "zones": {"Citadel": {"Belt": [200, 250, 300]}},
   "buffers": {
-    "bin": "armor/<ship>.bin",
+    "bin": "armor/<ship>/<ship>.bin",
     "positions": {"offset": 0, "count": N},
     "normals":   {"offset": ..., "count": N},
     "plate_ids": {"offset": ..., "count": T}

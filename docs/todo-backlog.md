@@ -26,7 +26,7 @@
 
 ### P0-1 artMap 没进 manifest —— INDEXED 涂装叠加层全程缺失 ✅ 已修复（2026-10-26）
 
-**现象**：`docs/sample/PBSD511_Waterloo/manifests/PBSD511_Waterloo.json` 里唯一的
+**现象**：`docs/sample/lesta/manifests/PBSD511_Waterloo/PBSD511_Waterloo.json` 里唯一的
 INDEXED 材质 `TL2_SHIPMAT_INDEXED_PBS_Hull`，`layers` 只有 `materialIdMap`，
 没有 `artMap`。`docs/threejs-example.html` 的 `buildIndexedMaterial()` 读的是
 `(m.layers || {}).artMap` → 拿到 `undefined` → `uArt` 为 null → 采样退化成
@@ -465,7 +465,7 @@ load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是�
    而且**烘焙默认开启后这条路径只影响 `--no-bake-indexed`**（烘焙材质走
    MeshStandardMaterial），优先级已降低
 
-### P2-6 判定逻辑分散（技术债，这一轮已经疼过）✅ 已收敛（2026-10-27）✅ 已收敛（2026-10-27）
+### P2-6 判定逻辑分散（技术债，这一轮已经疼过）✅ 已收敛（2026-10-27）
 
 `_lod` / `_crack` / `decal` 三套判定现在分散在：
 
@@ -553,7 +553,7 @@ load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是�
 | `_mg` 通道换算（G=1-gloss、R→metallic） | 待实现 | `_to_gltf_metallic_roughness()` |
 | 法线补 Z | 待实现 | `dds_to_png(kind=_TEX_NORMAL)` |
 | 装甲按 `plate_key` 分组 + 0mm 剔除 | 待实现 | `geometry_service._build_armor_mesh()` |
-| 原子写（临时文件 + `os.replace`） | 要求 | `export_service.py:927` |
+| 原子写（临时文件 + `os.replace`） | 要求 | `export_service._GlbBuilder.save()` |
 | INDEXED 图集 + 6 数组 bin 下发 | 待实现（P2） | `wows_indexed_textures` / `wows_indexed.arrays` |
 | 洋红占位 artMap → artStrength 置 0 | 已实现 | `geometry_service._resolve_material_full()` |
 | crack / 破损断面默认剔除 | 无 | `GlbRenderOptions.include_damage` |
@@ -562,11 +562,96 @@ load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是�
 
 ---
 
-## 七、建议的推进顺序
+## 七、剩余工作总表（2026-10-28 全量排查）
 
-1. **P0-1 / P0-2**（半天）：都是小改 + 各一条回归，改完 INDEXED 涂装才谈得上"对"。
-2. **P1-1 自发光**（半天）：通道已定版，直接照 §5.4 做。
-3. **P1-3 探针**（1 天）：产出报告，决定 P1-2 与 P2-1 的必要性。
-4. **P1-4 wire**（1 天）：影响所有船的观感（栏杆/索具），性价比高。
-5. **P1-5 验收脚本**（1 天）：之后每次改动都能自证，不用再靠截图。
-6. P2 项按实际需求插队。
+P0、P1 与 P2-1/3/4/5/6/7 已全部结清（逐项状态见各节标题）。下面是**还没做**的全部项，
+按「收益 ÷ 风险」排序，括号内为实测数据来源。
+
+### A. 数据体积（纯本地，不改导出结果）
+
+| # | 项 | 现状（实测） | 目标 | 风险 |
+|---|---|---|---|---|
+| A1 | `assets_data` 裁剪 | 555 MB（Lesta）/ 623 MB（WG）。`render_sets` 399,008 行里 `/ship/` 283,908、`location` 34,748、`gun` 14,873、`aircraft` 9,430、其余 56,049；两张骨骼表 + 索引约占 300 MB/库 | 按路径类型裁 → 估计 350 / 400 MB | 口径必须按**路径类型**，不能按船名；裁 `aircraft` 会丢水上飞机挂载 |
+| A2 | `game_data` 快照瘦身 | `entity_snapshots` 占 100.5 / 135.2 MB（分别为整库的 84% / 86%），1,165 / 1,246 条 × 均 105 KB | 只存导出用到的字段（`components[*].model`、装甲厚度、`permoflages`、`hull/nodes_config`）→ 估计 40 / 55 MB | **有漏字段风险**：漏一个 `A_*` 组件就少一批挂载；需逐船 A/B 对比网格数 |
+| A3 | 删二级索引 | `idx_rs_geom` 46+48 MB、`idx_bones_stem` 37+43 MB（`camo_thumbs` 空表已于 2026-10-28 删除） | 改为导出前临时建、用完删 | 无（导出是一次性扫描） |
+
+### B. 保真度（观感/正确性，需要对着游戏截图验）
+
+| # | 项 | 现状 |
+|---|---|---|
+| B1 | 颜色还原 | 整体偏灰，未与游戏内截图逐像素对齐。INDEXED 用近似光照 `c*(0.75+0.35*ndl)+spec*mg.r*0.35` 再 `*1.65`；PBS 的金属度/粗糙度是估算值 |
+| B2 | decal（P2-2） | 默认整片丢弃（Waterloo 少 960 片 / 383,536 三角 = 62%）。方案 B（独立节点 + BLEND）未做 |
+| B3 | `_alpha_n` 法线叠加层 | INDEXED 的 `normalMap` 是 alpha 叠加层，烘焙时未参与（P2-5 遗留） |
+| B4 | 自发光 | 实现但默认关：实测 `_mg.B` 不是掩码（船体 0.47、信号灯 0），开着会让整船半自发光 |
+
+### C. 性能
+
+| # | 项 | 现状（实测） |
+|---|---|---|
+| C1 | 模型皮肤每套独立几何（P2-3） | 已优化 26%（3 套 84.9 → 62.7 s）；几何无法复用（皮肤换 `hull_config.model`），只剩解码/编码可省 |
+| C2 | 跨船几何池（P2-8） | 同船 10 套皮肤 214.5 → 69.9 MiB（可省 67%），但**跨船命中率未测**；先写「只统计不导出」的探针 |
+
+### D. 工程化
+
+| # | 项 | 现状 |
+|---|---|---|
+| D1 | 自动化测试 | 没有 `tests/`。现有回归手段只有 `tools/ab_render_compare.py`（像素 A/B）和几个 `.workbuddy/tmp/probe_*.py` 一次性脚本 |
+| D2 | CI | 没有 `.github/workflows` |
+| D3 | NOTICE | 没有。`data_extractor/kraken.py` 是 **GPLv3**，其余 Apache-2.0，分发时必须带 NOTICE 说明 |
+| D4 | 文档行号 | `文件:行号` 会漂（本轮核对 18 处里 8 处失准，最大偏 290 行）。已在 `tech/README.md` 注明「按符号 grep」，彻底改符号锚点**暂不做** |
+
+### E. 已知不一致 / 预留骨架
+
+| # | 项 | 现状 |
+|---|---|---|
+| E1 | WG 库 build 过期 | `assets_data_wg.db` 的 `meta.bin_folder = 13488861`，客户端 `bin/` 是 13187581 / 13357625 → `shape_names` 查空（几何侧已改用 `render_sets.shape`，导出仍正确）。重跑 `import` 即修 |
+| E2 | `wg_compat` 4 处 `TODO(手动)` | WG 的类型映射 / 弹夹炮识别目前复制 Lesta 版，未按 WG 实测校准 |
+
+### F. 死代码 ✅ 已清理（2026-10-28）
+
+用 AST 扫「只有定义、无调用点」的函数（全仓标识符计数），逐个确认后删除：
+
+| 批次 | 内容 | 行数 |
+|---|---|---|
+| 配置/上下文 | `keep_split_json` 字段与 property、`AppContext.exe_dir/data_dir/split_dir`、`game_path_is_set`、`schema_mismatches`、`Application` 的 6 个死 setter、`ConfigManager.reset`、`signals.disconnect` | ~60 |
+| 导入链 | `processor_service._run_analysis()`（首行 return 的不可达体）、`_write_one()` 与写 split 分支、`data/split` 两处回退 | ~110 |
+| 涂装缩略图 | `camo_thumbs_dir` / `get_camo_thumb` / `put_camo_thumb` / `_camo_icon_map` / `_cache_camo_icon` / `_gui_ext_rel` / `_resolve_camo_icon` + `camo_thumbs` 表（两服 schema） | ~250 |
+| 实时预览（GUI 遗留） | `apply_camo`、`live_skeleton`、`apply_live_material`、`release_live_material_caches`、`resolve_material_live`、`_live_skel_path_index`、`_section_render_sets`、`_mfm_index`、`_ensure_visual_geom_index`、`_apply_rigid_binding`、`_bake_camo_art`、`_composite_camo_over_base`、`_camo_attr`、`release_load_caches`、`_parse_visual_render_sets` | ~500 |
+| 数据浏览查询 | `database_service` 的 18 个方法（`list_entities` / `count_entities` / `get_stats` / `get_entity` / `get_turret_arcs` / `has_turret_arcs` / `list_versions` / `ship_name_gaps` / `import_po_translations` / `vacuum` / `drop_all` / `check_schema_mismatches` / `save_ship_splash_protection` / `load_ship_splash_protection` / `backfill_ship_name_mapping_ids` / `read_latest_version_code` / `close_all_connections` / `schema_rebuilt` / `_read_schema_version`） | ~365 |
+| 其它 | `armor_scene` 的 4 个查询、`collision_materials` 的 2 个、`name_mapping` 的 6 个（含 `rich_tooltip` / `format_modifier`）、`camo_service` 的 `list_orphan_skins` / `entry_by_name` / `collect_all_permoflages` / `_geometry_folder_names`、`assets_cache_service` 的 3 个 getter | ~250 |
+
+顺手修掉两个**真问题**（不是死代码）：
+
+- `ExportReport` 没有 `__str__`，而 CLI 是 `print(report)` → 实际打印的是 dataclass repr，
+  `summary()` 白写了。已补 `__str__`，与文档描述一致。
+- `assets_cache_service` 里硬编码 `D:\战舰世界汉化\bin` 猜本地化文件 → 已删；
+  随后 `.po/.mo` 读取整条链路也删了（用不到，`display_name` 列保留但恒空）。
+
+### 第二轮：确认后全部清掉（同日）
+
+上一版「刻意不动」的 24 个，逐个复核后确认都是真死（均不在 `uncode_assets.__all__`、
+无 `getattr`/字符串调用），已删；连带删掉调用它们的封装层，以及 6 个整模块：
+
+| 内容 | 说明 |
+|---|---|
+| `kraken.py` 5 个（`_init_stream_reverse` / `peek_reverse` / `read_bits_nr` / `align_to_byte` / `refill_reverse`） | 反向位流支持，本项目的 `.geometry` 不走这条 |
+| `bc7prep.packed_sub`、`pkg_reader.read_file_direct`、`geometry_parser.unpack_vertices` | 未被调用的替代实现 |
+| `atlas_contour.encode_contours` / `format_contours_text`、`binary.parse_packed_string*`、`decoders.read_material_header` / `_extract_ascii_strings`、`fx.record_region_bounds` | 浏览/调试辅助 |
+| `service.wows_type_auto` / `auto_rule` / `auto_rule_reason` / `find_files` / `decode_mfm_by_self_id` / `decode_material_by_path`、`space.parse_geometry_header` / `parse_space_bin`、`types.default_item_sizes`、`vfs.pkg_has` / `logical_path` | 子模块公开接口，本仓库无调用方 |
+| **整模块删除**：`uncode_assets/{mfm_text, model_text, skel_ext_text, model_wg_text, visual_text, visual_wg_text}.py` | 「Prototype → 明文」实验性反导出，6 个模块共 688 行，全仓无引用 |
+| 级联孤儿：`config._path_valid`、`geometry_service._rgba_to_dds_bgra` / `_get_assets_service` / `_load_texture_tier_live` | 因上游删除而失去调用者 |
+
+> 删完后 `uncode_assets` 只剩实际用到的：`parser` / `decoders` / `types` / `vfs` /
+> `service` / `binary` / `space` / `fx` / `atlas_contour`（后者仅经 `decoders` 调 `decode_contours`）。
+>
+> 两轮合计 **−2900 行代码**（全仓 diff 含文档是 50 文件 +420/−3227）。
+> 验证：`compileall` 全包 + 三个核心包可导入 + 两次真实导出（`PJSD889_Kitakaze_PR`，
+> `--no-textures --lod 2`）都是 **265 网格 / 89,771 三角形**，与清理前完全一致。
+
+### 顺带：`data_extractor` 不再写死路径
+
+`python -m data_extractor.cli` 的所有子命令：
+`game_dir` 位置参数改为可选，新增 `--game/-g` 与 `--server lesta|wg`；
+都没给时读项目 `config.json` 的 `game_path_lesta` / `game_path_wargaming`，
+取不到就打印「怎么配」的三种做法后退出。省略目录、直接把 glob 写在第一个位置参数
+（`list "content/**/*.data"`）也能正确识别 —— 不是已存在目录时还回 `patterns`。

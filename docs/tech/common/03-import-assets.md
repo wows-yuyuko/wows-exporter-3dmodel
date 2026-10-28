@@ -24,7 +24,7 @@
 | 2 | 视觉渲染集：`shape → 材质 / mfm` | `render_sets` |
 | 3 | 材质：贴图路径 + 完整参数 | `mfm_textures`、`material_full` |
 | 9 | Exterior 实体（**GameParams 直读**，split 仅回退） | `exteriors` |
-| 10 | 包根 `camouflages.xml`（三段） | `camouflages`、`camouflage_color_schemes`、`camo_ship_groups`、`camo_thumbs` |
+| 10 | 包根 `camouflages.xml`（三段） | `camouflages`、`camouflage_color_schemes`、`camo_ship_groups` |
 
 > 步骤号直接取自源码注释（4–8 未使用，历史上属于武器/涂装段，导出不需要）。
 
@@ -62,7 +62,7 @@
 | `textures` | `{贴图键: VFS 路径}` JSON（最多 9 张） |
 | `indexed` | `{数组名: [[x,y,z,w] × 196]}` JSON |
 
-INDEXED 数组提取要点（`assets_cache_service.py:905-935`）：
+INDEXED 数组提取要点（`assets_cache_service.populate()` 的材质入库段）：
 - 数组长度由 `material_array_lengths` 推断（不能按固定 196 读）；
 - 每项 `parse_vec4` 后 `round(..., 6)`，控制 JSON 体积；
 - 字段名来自字符串表（`sdict.get(nid)`），拿不到才退化成 `vec4_<i>`。
@@ -92,7 +92,7 @@ peculiarityModels / renderSetsStates / miscFilter / planesConfig / decalsEnabled
 | Prototype 类型数 | **12**（多 `ModelFbxPrototype`） | **10** |
 | Material item_size | `0x88` | `0x78` |
 | Visual item_size | `0x40` | `0x70` |
-| Model item_size | `0x28` | `0x20` |
+| Model item_size | `0x20` | `0x28` |
 | blob index → 类型映射 | 与 WG **完全不同** | 参考 wowsunpack |
 | INDEXED 材质数 | 192 | **0** |
 

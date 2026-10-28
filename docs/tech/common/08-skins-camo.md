@@ -1,17 +1,23 @@
 # 08 · 皮肤与涂装（default / mat / model）
 
-> 入口：`cli.py` 的 `--skins` / `--permoflage` / `--model-skins`
+> 入口：`cli.py` 的 `--skins` / `--permoflage` / `--model-skins` / `--model-skin`
 > 服务：`services/skin_export.py` + `services/camo_service.py`
 
 ## 1. 三种产物
 
+**皮肤不是默认产物**：不给 `--skins` / `--model-skins` 时不写 `skins/`，
+`manifest.skins` 是空数组（页面把皮肤下拉置灰）。
+
 | 类型 | 开关 | 产物 | 说明 |
 |---|---|---|---|
-| `default` | **总是** | `skins/<ship>/default.json` | 空 overrides，主 GLB 用这套 |
+| `default` | `--skins` 或 `--model-skins` | `skins/<ship>/default.json` | 空 overrides，主 GLB 用这套 |
 | `mat` | `--skins` | `skins/<ship>/<id>.json` + 外置贴图 | 只换材质/贴图，不生成 GLB |
-| `model` | `--model-skins` | `geometry/<ship>__<id>.glb` + `manifests/<ship>__<id>.json` + skin json | 换整船模型，各出一套 |
+| `model` | `--model-skins` | `geometry/<ship>/<ship>__<id>.glb` + `manifests/<ship>/<ship>__<id>.json` + skin json | 换整船模型，各出一套 |
 
 `--permoflage` 只是把 `permoflage` 这个 species 也纳入 `--skins`（默认不含）。
+
+另有 `--model-skin <ID|auto>`（默认 `auto`）：把**某套模型皮肤当基准几何**，
+产物仍是 `<ship>.glb`，不写 `skins/`，manifest 记 `base_skin`。见 §5.1。
 
 ## 2. 数据源
 
@@ -68,8 +74,10 @@ list_camos(ship_indexes, ship_permoflages) -> list[CamoSchemeInfo]
 ```
 
 > 现状：mat 皮肤**只覆盖贴图 + UV + 颜色**。INDEXED 材质的
-> `artMap / artStrength / albedoTint` 数组覆盖**未实现**（见 `../../todo-backlog.md` P1-2），
-> `skin_export.py:90` 的注释已标注"INDEXED arrays … handled separately"，但别处没有实现。
+> `artMap / artStrength / albedoTint` 数组覆盖**不做**（见 `../../todo-backlog.md` P1-2
+> 与 [../../camo-probe.md](../../camo-probe.md)：同船所有 INDEXED mfm 的 6 组数组哈希一致，
+> DB 里没有 camo 专属数组可覆盖）。`export_mat_skins()` 的注释里那句
+> "INDEXED arrays … handled separately" 是历史遗留，实际别处没有实现。
 
 实测 WG 大和：`--skins` → 8 个（PCEM004/017/027/188/210/215/221 + PJES360），
 追加 `--permoflage` → 10 个（+ PCEP120、PCEP120_2）。
@@ -80,9 +88,9 @@ list_camos(ship_indexes, ship_permoflages) -> list[CamoSchemeInfo]
 
 1. `load_ship(info, skin=scheme.skin, model_replace=scheme.model_replace)`
    → 换掉船体与各挂载的 `.model`；
-2. `export_render_glb()` 写 `geometry/<ship>__<id>.glb`（默认参数，不受 CLI 的
+2. `export_render_glb()` 写 `geometry/<ship>/<ship>__<id>.glb`（默认参数，不受 CLI 的
    `--lod/--texture-size` 影响）；
-3. `write_web_manifest()` 写 `manifests/<ship>__<id>.json`（`skins: [<id>]`）；
+3. `write_web_manifest()` 写 `manifests/<ship>/<ship>__<id>.json`（`skins: [<id>]`）；
 4. skin json：
 
 ```json
@@ -91,14 +99,34 @@ list_camos(ship_indexes, ship_permoflages) -> list[CamoSchemeInfo]
   "display_name": "…",
   "origin": "model",
   "species": "Skin",
-  "geometry": "geometry/<ship>__<id>.glb",
-  "manifest": "manifests/<ship>__<id>.json",
+  "geometry": "geometry/<ship>/<ship>__<id>.glb",
+  "manifest": "manifests/<ship>/<ship>__<id>.json",
   "overrides": {}
 }
 ```
 
-> 每套皮肤都完整跑一次 `load_ship`，8 套 ≈ 3 分 01 秒。瓶颈是几何重复加载，
-> 不是数据（见 `../../todo-backlog.md` P2-3）。
+> 每套皮肤都完整跑一次 `load_ship`：模型皮肤会换 `hull_config.model` 与一批
+> `peculiarityModels` 挂载，**几何无法复用**。能省的只有重复解码/编码
+> （`keep_load_caches()` + 跨 builder 的贴图磁盘缓存）：WG 大和 3 套
+> 84.9 s → **62.7 s**（每套 ~21 s，8 套约 167 s）。见 `../../todo-backlog.md` P2-3。
+
+## 5.1 `--model-skin ID|auto`（基准外观）
+
+与 `--model-skins` 的区别：**不生成额外一套产物**，而是把某套模型皮肤当作
+`<ship>.glb` 的基准几何，manifest 记 `base_skin`。
+
+判据（`cli._resolve_model_skin()`）：**只有 `permoflages[0]` 的 species 是模型皮肤时才套用
+那一套**。数据依据：科技树船首个 permoflage 是 `Permoflage`（大和 `PCEP120`、北风
+`PCEP119`），联动/PR 船首个就是 `Skin`。
+
+| 船 | 首个 permoflage | `auto` 结果 |
+|---|---|---|
+| 大和 `PJSB018` | `PCEP120_Permo_Upgr_10_lvl`（Permoflage） | 不套，导原版 |
+| ARP 大和 `PJSB700` | `PJES340_Yamato_ARP`（Skin） | 套 `PJES340` |
+| 星之北风 `PJSD889` | `PJES509_Kitakaze_ranger`（Skin） | 套 `PJES509` |
+
+`--no-model-skin` 等价于 `--model-skin none`；指定具体 ID 时按 `ext_index` /
+`raw_name` / `display_name` 匹配，找不到会列出可选项后退出。
 
 ## 6. 贴图的 `kind` 判定
 

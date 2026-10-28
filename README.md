@@ -8,6 +8,31 @@
 
     pip install -r requirements.txt
 
+## 会读游戏目录里的哪些文件
+
+本工具**只读客户端、不改它**。唯一例外：`<game>/data/` 里没有 GameParams 时，会从
+`bin/<build>/` 的 pkg 现场解包一份写回去（下次直接复用）。双服目录结构一致，下面以
+`D:\Games\Korabli` 为例。
+
+### 建库（`import`）时读
+
+| 路径 | 用途 | 必需 |
+|---|---|---|
+| `<game>/data/GameParams_py3.data`、`GameParams_py2.data`（Lesta）<br>`<game>/data/GameParams.data`（WG） | 舰船 / 涂装 / 模块等全部实体数据 | ✅ |
+| `<game>/content/assets.bin` | PrototypeDatabase：材质、视觉渲染集、骨架、模型路径 | ✅ |
+| `<game>/bin/<build>/idx/*.idx` + 同级 `*.pkg` | 解包索引与数据块（所有 `.geometry` / `.mfm` / 贴图都在这里） | ✅ |
+
+### 导出（`ship` / `batch`）时读
+
+| 路径 | 用途 |
+|---|---|
+| `data/game_data*.db` | 舰船快照（装甲厚度、各挂载 `model` 路径、`permoflages`）、`ship_models`、build 号 |
+| `data/assets_data*.db` | 材质 / 渲染集 / 骨骼 / 涂装索引（表清单见 `docs/tech/common/03-import-assets.md`） |
+| `<game>/data/GameParams*.data` | 取 `ShipInfo` 与 `permoflages`（决定 `--model-skin auto` 套不套皮肤）；**不存在时从 pkg 解包并写回该目录** |
+| `<game>/bin/<build>/**.pkg` | `.geometry`、`.mfm`、贴图（按 `.dd0 → .dd1 → .dd2 → .dds` 分层取） |
+
+`list` / `export-keys` 只读 GameParams，不进数据库。`data/split/` 不再产出也不会被读。
+
 ## 首次：建库
 
     python cli.py import --game D:\Games\Korabli --server lesta
@@ -17,6 +42,8 @@
 
 `config.json` 只存两个游戏路径；build 号（`bin/` 下的版本目录）不落盘，每次自动取
 **数字最大**的那个目录，所以客户端更新后不需要改配置。`--server` 必须显式给，没有默认值。
+独立的 `python -m data_extractor.cli` 也读同一份配置：命令里不写游戏目录就用这里的
+`game_path_lesta` / `game_path_wargaming`（`--server` 选槽位），两处都没配会提示怎么填。
 
 ## 使用
 
@@ -55,7 +82,7 @@
 
     geometry/<ship>/<ship>.glb            渲染模型（顶点属性已量化，见下）
     geometry/<ship>/<ship>.glb.zst
-    geometry/<ship>/<ship>__<skin>.glb    模型皮肤（仅 --skins / --model-skins）
+    geometry/<ship>/<ship>__<skin>.glb    模型皮肤（仅 --model-skins）
     armor/<ship>/<ship>.glb               装甲模型（可选预览）
     armor/<ship>/<ship>.glb.zst
     armor/<ship>/<ship>.json              装甲板块数据（zone/material/thickness/component/bounds）

@@ -3,6 +3,9 @@
 > 面向维护者：**已经落地**的实现是怎么做的。不改设计、不提需求，
 > 遇到"为什么这么写"先看这里；未解决的问题看 [../known-issues.md](../known-issues.md)，
 > 待办看 [../todo-backlog.md](../todo-backlog.md)。
+>
+> 代码位置用「模块.符号」指代（如 `export_service.GlbRenderOptions`）。少数地方还留着
+> `文件:行号`，那是写文档时的快照 —— 加过函数就会漂，**找不到时按符号名 grep**。
 
 ## 目录
 
@@ -57,7 +60,6 @@ content/assets.bin ┴─ import ─→ assets_data*.db ┘                armor
 | Material 条目尺寸 | `0x88` | `0x78` | 同上 |
 | Visual 条目尺寸 | `0x40` | `0x70` | 同上 |
 | Model 条目尺寸 | `0x20` | `0x28` | 同上 |
-| `.visual` 明文导出格式 | `visual_text.py`（`<node>`/`<renderSet>`） | `visual_wg_text.py`（`<skeleton>`/`<properties>`） | `uncode_assets/` |
 | INDEXED 材质（视觉 2.0） | **有**（当前库 192 个） | **无**（0 个） | `material_full.family` |
 | 当前导入 build | `8867689` | `13488861`（与 bin 目录不一致，见 wg.md） | `meta` / `meta_import_state` |
 | 舰船数 | 1,165 | 1,246 | `ship_basic_info` |
@@ -81,13 +83,21 @@ content/assets.bin ┴─ import ─→ assets_data*.db ┘                armor
    贴图字节在导出时按 `.dd0 → .dd1 → .dd2 → .dds` 分层实时读取。
    → `03-import-assets.md` / `05-materials-textures.md`
 
-## 样本产物（2026-10-26，默认参数 texture 1024 / LOD2 / 无皮肤）
+## 样本产物（2026-10-27，默认参数：texture 1024 / LOD2 / `--slim` / INDEXED 烘焙开 / 无皮肤）
 
-| 目录 | 平台 | GLB | meshes | 三角形 | 材质 | 贴图 |
-|---|---|---|---|---|---|---|
-| `docs/sample/PBSD511_Waterloo` | Lesta | 18.0 MiB | 731 | 297,425 | 15 | 58 |
-| `docs/sample/PJSB018_Yamato_1944` | Lesta | 17.2 MiB | 422 | 245,767 | 78 | 256 |
-| `docs/sample/PJSB018_Yamato_1944_WG` | WG | 22.8 MiB | 429 | 261,748 | 76 | 253 |
+一个服务器一个输出根（船 key 同名会互相覆盖，见 `README.md`）：
+
+| 目录（相对 `docs/sample/`） | 平台 | GLB | 网格 | 三角形 |
+|---|---|---|---|---|
+| `lesta/geometry/PBSD511_Waterloo/` | Lesta | 8.9 MiB | 731 | 297,425 |
+| `lesta/geometry/PJSB018_Yamato_1944/` | Lesta | 8.6 MiB | 422 | 245,767 |
+| `lesta/geometry/PJSD889_Kitakaze_PR/` | Lesta | 4.0 MiB | 265 | 89,771 |
+| `wg/geometry/PJSB018_Yamato_1944/` | WG | 9.1 MiB | 429 | 261,748 |
+| `wg/geometry/PJSB700_ARP_Yamato/` | WG | 9.1 MiB | 429 | 264,772 |
+
+逐文件体积、贴图张数与预览命令以
+[`../known-issues.md`](../known-issues.md) 的「测试样本」为准（本表只列量级）。
 
 Waterloo 是**唯一**带 INDEXED 舰体的样本（`TL2_SHIPMAT_INDEXED_PBS_Hull`），
-另外两艘全 PBS —— 对比这两类船就能看出 INDEXED 差异。
+其余全 PBS —— 对比这两类船就能看出 INDEXED 差异。星之北风与 ARP 大和还各带一个
+`base_skin`（默认 `--model-skin auto` 套上的模型皮肤，扫描 `permoflages[0]` 得出）。

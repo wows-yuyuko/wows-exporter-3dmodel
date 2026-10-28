@@ -1,4 +1,4 @@
-# 09 · `manifests/<ship>.json`（schema `wows-web/1`）
+# 09 · `manifests/<ship>/<ship>.json`（schema `wows-web/1`）
 
 > 生成：`services/web_manifest.write_web_manifest()`，每次 `ship` 导出**必写**
 > 用途：网页（`docs/threejs-example.html`）不解析 GLB 也能知道材质/贴图/节点结构
@@ -10,13 +10,14 @@
   "schema": "wows-web/1",
   "ship": "PBSD511_Waterloo",
   "build": "8867689",
-  "geometry": "geometry/PBSD511_Waterloo.glb",
+  "geometry": "geometry/PBSD511_Waterloo/PBSD511_Waterloo.glb",
   "materials": { "m_8866c7c5c2": { … } },
   "meshes": [ { "node": "BowShape", "mesh": "BowShape",
                 "material": "m_8866c7c5c2", "component": "hull" } ],
-  "skins": ["default"],
+  "skins": [],
+  "base_skin": "PJES340",                          // 仅套了模型皮肤时存在
   "hashes": { "geometry": "…", "materials": "…", "textures": "…" },
-  "armor": "armor/PBSD511_Waterloo.json"          // 仅 --armor 时存在
+  "armor": "armor/PBSD511_Waterloo/PBSD511_Waterloo.json"   // 仅 --armor 时存在
 }
 ```
 
@@ -24,12 +25,13 @@
 |---|---|
 | `schema` | 固定 `wows-web/1` |
 | `ship` / `build` | 舰船 key、客户端 build 号 |
-| `geometry` | 相对 manifest 目录的 GLB 路径 |
-| `materials` | 以 `m_<sha1(name|source)[:10]>` 为键的材质表（见 §2） |
+| `geometry` | GLB 路径，**相对输出根**（多一层船名目录） |
+| `materials` | 以 `m_<sha1(name\|source)[:10]>` 为键的材质表（见 §2） |
 | `meshes` | 扁平列表，每条 = GLB 里一个节点（名/材质键/归属） |
-| `skins` | 该套模型可用的皮肤 id；换模型皮肤的 manifest 只有自己那一个 |
+| `skins` | 该套模型可用的皮肤 id；**默认空数组**（皮肤非默认产物），换模型皮肤的 manifest 只有自己那一个 |
+| `base_skin` | `--model-skin` 套用的模型皮肤 id；未套用时**整个键不出现** |
 | `hashes` | 三个缓存指纹，见 §4 |
-| `armor` | `--armor` 时指向 `armor/<ship>.json` |
+| `armor` | `--armor` 时指向 `armor/<ship>/<ship>.json` |
 
 ## 2. 材质条目
 
@@ -66,8 +68,10 @@
 - `indexed.textures` 里的 `tile/cols/rows/count` 由图集生成时写入，
   网页用 `atlasUV(slice, uv) = (cell + fract(uv)) / grid` 取层。
 
-> 已知：`layers.artMap` 现在**恒缺失**（`_is_dds_array()` 8 MB 阈值误判），
-> 见 [../../todo-backlog.md](../../todo-backlog.md) P0-1。
+> 历史坑（已修）：`layers.artMap` 曾**恒缺失** —— `_is_dds_array()` 用「文件 > 8 MB」
+> 当数组捷径，把 4096×2048 BC7 的单图 artMap（8,388,756 B）误判成数组整张丢弃。
+> 现在只按结构判定（无 DX10 → 单图；`arraySize>1` → 数组；否则单层字节×2 兜底），
+> 见 [../../todo-backlog.md](../../todo-backlog.md) P0-1 的六船对拍表。
 
 ## 3. `meshes` 条目
 

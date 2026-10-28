@@ -2,12 +2,12 @@
 
 > 材质解析：`GeometryService._resolve_material_full()`
 > 入库：`assets_cache_service` 步骤 3；导出：`export_service.dds_to_png/_to_gltf_*`
-> 参考语义：[Wows_Paragrams_Unpack `docs/materials-format.md`] 与 `d3d11_renderer.md` §5.4
+> 参考语义：**外部仓库** Wows_Paragrams_Unpack 的 `docs/materials-format.md` 与
+> `d3d11_renderer.md` §5.4（不在本仓库，勿当本地路径找）
 
 ## 1. `.mfm` → 材质参数
 
-`.mfm` 是 MaterialPrototype 的明文形态（本仓库有 `uncode_assets/mfm_text.py`
-做反向导出，实验性）。入库时只取程序真正需要的三样：
+`.mfm` 是 MaterialPrototype 的明文形态。入库时只取程序真正需要的三样：
 
 | 字段 | 来源 | 用途 |
 |---|---|---|
@@ -76,7 +76,8 @@ c = lerp(c, art.rgb, clamp(art.a × artStrength, 0, 1))
 ```
 
 **洋红占位规则**：无涂装时 `artMap` 是洋红占位图。加载阶段检测到就把
-`artStrengthMatIdArr[:,0]` 全部置 0（`geometry_service.py:2825`），否则整船会泛粉
+`artStrengthMatIdArr[:,0]` 全部置 0（`geometry_service._resolve_material_full()` 里
+用 `_is_magenta_placeholder()` 判定），否则整船会泛粉
 （`CIA000_instances_atlas` 实测）。占位图仍会导出，只是强度为 0。
 
 ## 5. DDS 分层读取
