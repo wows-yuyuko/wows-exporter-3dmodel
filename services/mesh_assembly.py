@@ -18,6 +18,8 @@ import numpy as np
 
 from models.collision_materials import collision_material_name, thickness_to_color
 from models.geometry_parser import ArmorModel
+
+from services import mesh_filters
 from models.ship_mesh import (
     COMPONENT_HULL, HIDDEN_GENERIC_MATERIALS,
     ArmorMesh, ArmorTriangleInfo, HullMesh, MountMesh, ShipGeometry,
@@ -477,3 +479,391 @@ def merge_hull(part_name: str, primitives, shape_names: list | None = None,
         instance_matrices=list(instance_matrices or []),
         shape_spans=shape_spans,
     )
+
+def split_primitives_by_material(primitives, global_rs: dict, sdict: dict | None = None,
+                              geom_path: str | None = None,
+                              instancing: bool = False,
+                              lod: int = -1, bones_of=None,
+                              skinning_stem: str | None = None) -> dict:
+    """按渲染集索引把 primitives 分组：{material_key: {material, mfm, prims}}。
+
+    - 用 murmur3(shape.vertices) == primitive.mapping_id 连接渲染集与几何
+    - **damage/crack 渲染集**（断面、`*_in` 盖板等）归 `__crack__` 组并标
+      is_crack：查看器不渲染，GLB 导出默认剔除（`--damage` 才导出）
+    - LOD：`lod<0` 只用 LOD0；`lod>=0` 尽量用该级，部件没有该级时回退 LOD0
+    - 匹配到材质的按材质分组；未匹配的归 None（用舰体默认贴图）
+    - sdict 兜底：无渲染集匹配的 primitive 用字符串表反查 shape 名，
+      LOD 低模跳过；`_crack_`/Crack 名归 `__crack__` 组
+    - 多个 shape 同材质（如 Hull 本体 + DeckHouse）自动合并
+    """
+    # 目标 LOD 过滤：名字里的 `_lodN` 决定级别（`Bow_lod2Shape` → 2，`BowShape` → 0）。
+    # 级别表取自 render_sets（DB），不依赖 shape_names 表——后者按 bin_folder 存储，
+    # 换版本后可能查不到（会导致 LOD 参数失效）。
+    levels_by_base: dict = {}
+    if lod >= 0:
+        for _rs in global_rs.values():
+            _base, _lv = shape_lod(_rs.get('shape') or '')
+            if _base:
+                levels_by_base.setdefault(_base, set()).add(_lv)
+
+    mat_by_mid: dict = {}
+    damage_mids: set = set()
+    alt_mat_by_mid: dict = {}  # 目标 LOD 变体的材质（它们被 DB 标 damage，不在 mat_by_mid 里）
+    norm_to_rs: dict = {}   # 归一化 shape stem → 渲染集（模糊兜底：处理视觉/几何笔误）
+    rs_by_mid: dict = {}    # 任意一个 entry（按 mid 兜底）
+    rs_by_gp_mid: dict = {} # (geom_path, mid) → 分段精确（刚性绑定用）
+    for key, rs in global_rs.items():
+        mid = key[1] if isinstance(key, tuple) else key
+        _mm = (rs.get('material') or '', rs.get('mfm') or '')
+        mat_by_mid[mid] = _mm
+        if lod >= 0 and shape_lod(rs.get('shape') or '')[1] == lod:
+            alt_mat_by_mid[mid] = _mm
+        rs_by_mid.setdefault(mid, rs)
+        if isinstance(key, tuple):
+            rs_by_gp_mid[key] = rs
+        if rs.get('damage'):
+            damage_mids.add(mid)
+            continue
+        nk = norm_shape_stem(rs.get('shape') or '')
+        if nk and nk not in norm_to_rs:
+            norm_to_rs[nk] = rs
+
+    def _rs_for(mid: int):
+        """优先当前几何分段的渲染集条目（保留各自骨骼节点），否则任一兜底。"""
+        if geom_path:
+            rs = rs_by_gp_mid.get((geom_path, mid))
+            if rs is not None:
+                return rs
+        return rs_by_mid.get(mid)
+
+    # 每个 (基名, LOD 级) 的三角数：用于「最小面数保护」。某些船的低级 LOD 会把
+    # 船首/船尾压成 2 个三角形的占位块（Waterloo Bow/Stern_lod2Shape），
+    # 目标级面数远低于 LOD0 时回退 LOD0，否则正面会直接看穿船壳。
+    tri_by_base_lod: dict = {}
+    if lod >= 0:
+        _tri_by_mid: dict = {}
+        for _p in primitives:
+            _n = 0 if _p.indices is None else int(_p.indices.size) // 3
+            _tri_by_mid[_p.mapping_id] = _tri_by_mid.get(_p.mapping_id, 0) + _n
+        for _mid, _n in _tri_by_mid.items():
+            _nm = (sdict or {}).get(_mid) or ((_rs_for(_mid) or {}).get("shape") or "")
+            _base, _lv = shape_lod(_nm)
+            _k = (_base, _lv)
+            tri_by_base_lod[_k] = tri_by_base_lod.get(_k, 0) + _n
+
+    def _lod_skip(name: str) -> bool:
+        # 判据统一在 services/mesh_filters.py（LOD 级别 + 面数保护 + 辅助几何豁免）
+        return mesh_filters.should_skip_lod(name, lod, levels_by_base,
+                                            tri_by_base_lod,
+                                            shape_lod)
+
+    def _annotate(p) -> None:
+        """写入该 primitive 的 .visual 形状名与绑定节点名（GLB 导出命名用）。
+
+        只在这里做一次：后续所有分支（蒙皮/实例化/克隆）都直接读这两个字段。
+        """
+        if getattr(p, "shape_name", ""):
+            return
+        if sdict is not None:
+            p.shape_name = norm_shape_stem(
+                sdict.get(p.mapping_id) or "")
+        rs = _rs_for(p.mapping_id) or {}
+        nodes = rs.get('nodes') or []
+        if nodes:
+            p.node_name = str(nodes[0])
+
+    groups: dict = {}
+
+    def _new_group(mat: str, mfm: str, damage: bool = False) -> dict:
+        return {'material': mat, 'mfm': mfm, 'prims': [],
+                'shape_names': [], 'node_names': [], 'damage': damage}
+
+    def _crack_group(mat: str, mfm: str) -> dict:
+        """damage/crack 网格组（按材质分键，避免多种 crack 材质混入同一网格）。"""
+        key = f"__crack__#{mat}" if mat else "__crack__"
+        return groups.setdefault(key, _new_group(mat, mfm, damage=True))
+
+    def _add_names(g: dict, p, rs=None) -> None:
+        """收集该 primitive 的形状名（sdict 反查）与**全部**骨骼节点名到分组，供调试标签用。"""
+        if sdict is not None:
+            _sn = sdict.get(p.mapping_id) or ''
+            if _sn and _sn not in g['shape_names']:
+                g['shape_names'].append(_sn)
+        nodes = (rs or {}).get('nodes') or []
+        for _nn in nodes:
+            if _nn and _nn not in g['node_names']:
+                g['node_names'].append(_nn)
+
+    for p in primitives:
+        _annotate(p)
+        _rs0 = _rs_for(p.mapping_id) or {}
+        _sname0 = _rs0.get('shape') or ''
+        if _lod_skip(_sname0):
+            continue
+        # DB 把 LOD 变体也标 damage=1；按名字/材质区分真 crack 与普通 LOD 变体
+        if p.mapping_id in damage_mids:
+            _mat0, _mfm0 = mat_by_mid.get(p.mapping_id) or ('', '')
+            # 名字取不到时按旧行为当 damage 处理（宁可少导不可混入断面）
+            if not _sname0 or '_crack_' in _sname0 or 'Crack' in _mat0:
+                # 损伤网格：真 crack（含其 LOD 变体）进 __crack__ 组，导出时剔除
+                _crack_group(_mat0, _mfm0)['prims'].append(p)
+                continue
+        entry = mat_by_mid.get(p.mapping_id) or alt_mat_by_mid.get(p.mapping_id)
+        if entry is None:
+            # 无渲染集匹配：字符串表反查 shape 名，LOD 低模跳过；crack 名保留
+            if sdict is not None:
+                _name = sdict.get(p.mapping_id) or ''
+                if _lod_skip(_name):
+                    continue
+                if '_crack_' in _name or 'Crack' in _name:
+                    _crack_group('', '')['prims'].append(p)
+                    continue
+                # 模糊兜底：归一化 shape 名匹配渲染集（游戏数据笔误，
+                # 如 JGA180 视觉写 TurretShapeff.vertices、几何是 TurretShape.vertices）
+                if _name:
+                    fuz = norm_to_rs.get(norm_shape_stem(_name))
+                    if fuz is not None:
+                        mat = fuz.get('material') or ''
+                        mfm = fuz.get('mfm') or ''
+                        g = groups.setdefault(mat, _new_group(mat, mfm))
+                        applied = apply_skinning(p, fuz, bones_of, skinning_stem)
+                        if applied:
+                            g['prims'].append(p)
+                            g['skinned_applied'] = True
+                            _add_names(g, p, fuz)
+                        elif instancing:
+                            bake, instmats = rigid_instance_matrices(p, fuz, bones_of, skinning_stem)
+                            if instmats:
+                                ig = groups.setdefault(
+                                    f"__inst__#{mat}#{p.mapping_id}",
+                                    _new_group(mat, mfm))
+                                ig['prims'].append(p)
+                                ig['instance_matrices'] = instmats
+                                ig['skinned_applied'] = True
+                                _add_names(ig, p, fuz)
+                            elif bake is not None:
+                                bake_rigid(p, bake)
+                                g['prims'].append(p)
+                                g['skinned_applied'] = True
+                                _add_names(g, p, fuz)
+                            else:
+                                g['prims'].append(p)
+                                _add_names(g, p, fuz)
+                        else:
+                            clones = apply_rigid_multi(p, fuz, bones_of, skinning_stem)
+                            if clones:
+                                g['prims'].extend(clones)
+                                g['skinned_applied'] = True
+                            else:
+                                g['prims'].append(p)
+                            _add_names(g, p, fuz)
+                        continue
+            groups.setdefault(None, _new_group(None, ''))['prims'].append(p)
+        else:
+            mat, mfm = entry
+            rs = _rs_for(p.mapping_id)
+            applied = apply_skinning(p, rs, bones_of, skinning_stem)
+            g = groups.setdefault(mat, _new_group(mat, mfm))
+            if applied:
+                g['prims'].append(p)
+                g['skinned_applied'] = True
+            else:
+                if instancing:
+                    # 只存各节点坐标：网格一份原始几何，渲染时逐节点各画一次
+                    bake, instmats = rigid_instance_matrices(p, rs, bones_of, skinning_stem)
+                    if instmats:
+                        ig = groups.setdefault(
+                            f"__inst__#{mat}#{p.mapping_id}", _new_group(mat, mfm))
+                        ig['prims'].append(p)
+                        ig['instance_matrices'] = instmats
+                        ig['skinned_applied'] = True
+                        _add_names(ig, p, rs)
+                    elif bake is not None:
+                        bake_rigid(p, bake)
+                        g['prims'].append(p)
+                        g['skinned_applied'] = True
+                        _add_names(g, p, rs)
+                    else:
+                        g['prims'].append(p)
+                        _add_names(g, p, rs)
+                else:
+                    # 非蒙皮：按绑定节点实例化（同一 shape 可绑多节点 → 左右舷多实例）
+                    clones = apply_rigid_multi(p, rs, bones_of, skinning_stem)
+                    if clones:
+                        g['prims'].extend(clones)
+                        g['skinned_applied'] = True
+                    else:
+                        g['prims'].append(p)
+                    _add_names(g, p, rs)
+    return groups
+def apply_skinning(prim, rs: dict | None, bones_of, stem: str | None) -> bool:
+    """对蒙皮图元施加 bind pose 混合（原地修改 positions/normals）。
+
+    返回是否**实际变换了顶点**（True → Root_BlendBone 已烘焙进几何，
+    挂载矩阵不得再乘 rb，否则双重镜像导致朝向翻转）。
+
+    背景（PASA111 实证）：Korabli 的蒙皮网格（如 Bow_Antenna / Bow_Antenna_wire，
+    材质 *_skinned）顶点存于 **BlendBone 局部帧**，渲染集调色板节点（*_BlendBone /
+    Root_BlendBone）的 bind pose 世界矩阵多为 **原点 Z 镜像 diag(1,1,-1)**（det=-1）。
+    游戏引擎按权重混合这些矩阵把顶点摆到舰船空间；我们此前直接渲染原始坐标，
+    导致 Z 镜像骨骼的网格整体前后（艏艉）翻转 —— 即用户报告的 180° 朝向错误。
+
+    修正：按渲染集调色板 + 顶点骨骼索引/权重做标准线性混合蒙皮：
+        p' = Σ_j w_j · (R_j · p + t_j)
+    顶点组索引 = 调色板 slot × 3（Korabli 实测）；iiiww 的 8B 布局为
+    ``u8 idx[3] + 2B pad + u8 w[2] + 1B pad``：i0↔w0、i1↔w1，
+    第三个顶点组权重 = 1-w0-w1（解析层已转换为 4 列）。
+
+    - 调色板缺失 / 骨架缺失 / 全部骨骼为恒等 → 不修改（保持原样，安全回退）。
+    - 法线用旋转部分（忽略平移）混合后归一化。
+    - 反射骨骼（det=-1）会翻转三角形绕序，但渲染器不启用背面剔除，无碍。
+    """
+    if prim is None or not prim.is_skinned:
+        return False
+    if prim.bone_indices is None or prim.bone_weights is None:
+        return False
+    if rs is None or not rs.get('skinned'):
+        return False
+    palette = rs.get('nodes') or []
+    if not palette:
+        return False
+    # 骨架 stem：渲染集 shape 名 → 模型目录（如 Bow_AntennaShape → ASA031_...）
+    # 用当前舰船 model_folder 的骨架（调色板节点名在舰船骨架里）
+    if not stem:
+        return False
+    bones = bones_of(stem)
+    if not bones:
+        return False
+    # 收集调色板骨骼世界矩阵（缺失的跳过）
+    mats: list[np.ndarray | None] = []
+    any_non_identity = False
+    for nm in palette:
+        m = bones.get(nm)
+        mats.append(m)
+        if m is not None and not np.allclose(m, np.eye(4), atol=1e-4):
+            any_non_identity = True
+    if not any_non_identity:
+        # 骨骼全为恒等：无需变换顶点，但仍保留 skin 数据（供 GLB 导出 skin）
+        prim.skin_bones = list(palette)
+        prim.skin_bind = mats
+        return False
+
+    idx = prim.bone_indices  # (N,4) uint8
+    wts = prim.bone_weights  # (N,4) float32
+    pos = prim.positions
+    nrm = prim.normals
+    n = pos.shape[0]
+    # 顶点索引 → 调色板 slot（Korabli：slot × 3）
+    slots = (idx.astype(np.int32) // 3)
+    # 越界 slot 置 -1（权重归零，不参与混合）
+    valid = slots < len(mats)
+    slots = np.where(valid, slots, -1)
+
+    new_pos = np.zeros_like(pos, dtype=np.float64)
+    new_nrm = np.zeros_like(nrm, dtype=np.float64)
+    for j in range(4):
+        s = slots[:, j]
+        w = wts[:, j]
+        for slot in np.unique(s):
+            if slot < 0 or slot >= len(mats):
+                continue
+            m = mats[slot]
+            if m is None:
+                continue
+            mask = s == slot
+            if not mask.any():
+                continue
+            R = m[:3, :3].astype(np.float64)
+            t = m[:3, 3].astype(np.float64)
+            wm = w[mask, None]
+            new_pos[mask] += wm * ((pos[mask].astype(np.float64) @ R.T) + t)
+            new_nrm[mask] += wm * (nrm[mask].astype(np.float64) @ R.T)
+    prim.positions = new_pos.astype(np.float32)
+    ln = np.linalg.norm(new_nrm, axis=1, keepdims=True)
+    ln[ln == 0] = 1.0
+    prim.normals = (new_nrm / ln).astype(np.float32)
+    # 保留蒙皮调色板与 bind 世界矩阵（GLB 导出 skin 用；bones 保持原样）
+    prim.skin_bones = list(palette)
+    prim.skin_bind = mats
+    return True
+def apply_rigid_multi(prim, rs: dict | None, bones_of, stem: str | None) -> list:
+    """对**非蒙皮但刚性绑定**的子模型：按每个绑定节点烘焙一份顶点，返回列表。
+
+    同一 shape 可绑定多个骨骼节点（左右舷实例化，如 BIA400_Motor_Cutter_25ftShape
+    在 `_0`/`_1` 两节点各一份）。每节点烘焙一份 → `_merge_hull` 合并为一网格，
+    从而在两个位置各渲染一个实例。
+    - 单节点：原地烘焙（保留既有行为），返回 [prim]。
+    - 多节点：每节点克隆一份并烘焙，返回克隆列表（不改原 prim）。
+    - 无法定位（无骨骼/全恒等/蒙皮）：返回 []（调用方追加原始 prim）。
+    """
+    if prim is None or rs is None:
+        return []
+    if rs.get('skinned'):
+        return []
+    nodes = rs.get('nodes') or []
+    if not nodes:
+        return []
+    if not stem:
+        return []
+    bones = bones_of(stem)
+    if not bones:
+        return []
+    mats: list[tuple[str, object]] = []
+    for nd in nodes:
+        m = bones.get(nd)
+        if m is None:
+            continue
+        if np.allclose(m, np.eye(4), atol=1e-4):
+            continue
+        mats.append((nd, m))
+    if not mats:
+        return []
+    if len(mats) == 1:
+        bake_rigid(prim, mats[0][1])
+        return [prim]
+    out = []
+    for _nd, m in mats:
+        clone = clone_prim(prim)
+        bake_rigid(clone, m)
+        out.append(clone)
+    return out
+def rigid_instance_matrices(prim, rs: dict | None, bones_of, stem: str | None):
+    """刚性绑定：返回 (bake_matrix, instance_matrices)。
+
+    只存各骨架节点坐标，不复制顶点——网格只含一份原始几何，渲染时按每个节点
+    矩阵各画一次（左右舷/多处实例）。比逐节点烘焙复制顶点更省内存。
+
+    返回：
+      (None, None)                  —— 不可刚性绑定（蒙皮/无节点/无骨骼/全恒等），
+                                        调用方保留原始几何（原样放入网格）。
+      (M_game, [])                  —— 恰一个有效节点：调用方用 M_game 原地烘焙
+                                        （既有单节点行为）。
+      (None, [M_render_i, ...])     —— 多节点：调用方保留原始几何，并把 M_render_i
+                                        写入网格 instance_matrices；渲染时逐实例绘制。
+    M_render = MirrorZ @ M_game @ MirrorZ（游戏空间 → 渲染空间模型矩阵）。
+    """
+    if prim is None or rs is None or rs.get('skinned'):
+        return None, None
+    nodes = rs.get('nodes') or []
+    if not nodes:
+        return None, None
+    if not stem:
+        return None, None
+    bones = bones_of(stem)
+    if not bones:
+        return None, None
+    negz = np.diag([1.0, 1.0, -1.0, 1.0]).astype(np.float32)
+    game_mats: list[np.ndarray] = []
+    for nd in nodes:
+        m = bones.get(nd)
+        if m is None:
+            continue
+        if np.allclose(m, np.eye(4), atol=1e-4):
+            continue
+        game_mats.append(np.asarray(m, dtype=np.float32))
+    if not game_mats:
+        return None, None
+    if len(game_mats) == 1:
+        return game_mats[0], []
+    inst = [(negz @ m @ negz).astype(np.float32) for m in game_mats]
+    return None, inst
