@@ -7,7 +7,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from services import GameParams as _GP
+from core import gameparams_stub as _GP
 
 #: `<game>/data/` 下的候选文件名，按优先级排列。WG 正式包只出 GameParams.data；
 #: Lesta 同时有 py2/py3 时优先 py3（py2 是给老客户端留的）。
@@ -90,6 +90,9 @@ def _extract_to_data(game: Path) -> None:
 
 
 def load_gameparams(path: str):
+    # 反序列化依赖 sys.modules["GameParams"] 里的桩类；这里自给自足，
+    # 不指望调用方先 import processor_service。
+    _ensure_stub()
     with open(path, "rb") as fh:
         raw = fh.read()
     # Lesta：反转 + zlib；WG：raw 是 deflate，解出 %bin 后整体反转再 zlib

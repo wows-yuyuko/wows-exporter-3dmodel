@@ -24,7 +24,7 @@ from utils.threading_utils import run_async
 from utils.path_utils import get_data_dir, get_split_dir, model_id_of
 from services.database_service import DatabaseManager, ShipRow, reset_db
 
-from services import GameParams as _GameParamsModule
+from core import gameparams_stub as _GameParamsModule
 from services import wg_compat
 sys.modules['GameParams'] = _GameParamsModule
 
