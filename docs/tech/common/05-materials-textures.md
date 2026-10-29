@@ -15,7 +15,7 @@
 | `material_hash` | SelfId | 解析 fx 资源路径（`material_hash` → assets.bin 路径树） |
 | 属性表 | `property` 列表 | 贴图（type 4 → 路径）与 vec4 数组（type 7） |
 
-fx 路径**不用固定映射表**：`uncode_assets.mfm_fx.resolve_fx_path(db, hash)`
+fx 路径**不用固定映射表**：`uncode_assets.service.resolve_fx_path(db, hash)`
 在 assets.bin 的路径树里按 selfId 反查，客户端更新后自动跟着变。
 
 ## 2. 技术族判定

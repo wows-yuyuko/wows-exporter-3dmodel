@@ -107,27 +107,43 @@ def safe_join(base: str | Path, *parts: str | Path) -> Path:
 
 # ── 游戏目录辅助 ────────────────────────────────────────
 
-def find_latest_bin_folder(game_path, require_idx: bool = False) -> str | None:
-    """在游戏目录 bin/ 下查找最大的数字版本号子目录，返回该目录名。
+def list_builds(game_path, count: int | None = None, require_idx: bool = False) -> list[str]:
+    """``<game>/bin`` 下按**数值**从新到旧排列的版本目录名。
 
-    ``require_idx=True`` 时只考虑含 ``idx/`` 的目录（客户端更新中断时最新数字
-    目录可能不完整），用于需要读写 .idx/.pkg 的调用方。
-    供 extractor_service / data_extractor / localization_service 共用，
-    消除三处"找最新 bin 目录"的重复实现。无 bin 目录或无版本文件夹返回 None。
+    ⚠️ 只认全数字目录、按数值比较：字符串排序会出错（``999999`` 字典序大于
+    ``8867689``，但数值更小）。旧客户端里还可能有非数字目录（``tmp`` 之类）。
+
+    ``require_idx=True`` 时只保留含 ``idx/`` 的目录 —— 客户端更新中断时，最新
+    的数字目录可能不完整，而读写 ``.idx`` / ``.pkg`` 的调用方必须能真的取到索引。
     """
-    import os
-    bin_path = os.path.join(str(game_path), "bin")
-    if not os.path.exists(bin_path):
-        return None
-    folders = [f for f in os.listdir(bin_path)
-               if f.isdigit() and os.path.isdir(os.path.join(bin_path, f))]
+    bin_path = Path(str(game_path or "")) / "bin"
+    if not bin_path.is_dir():
+        return []
+    names = [p.name for p in bin_path.iterdir() if p.is_dir() and p.name.isdigit()]
     if require_idx:
-        folders = [f for f in folders
-                   if os.path.isdir(os.path.join(bin_path, f, "idx"))]
-    if not folders:
-        return None
-    folders.sort(key=int)
-    return folders[-1]
+        names = [n for n in names if (bin_path / n / "idx").is_dir()]
+    names.sort(key=int, reverse=True)
+    return names if count is None else names[:count]
+
+
+def latest_build(game_path, require_idx: bool = False) -> str:
+    """``<game>/bin`` 下数字最大的版本目录名；没有则空串。"""
+    builds = list_builds(game_path, 1, require_idx)
+    return builds[0] if builds else ""
+
+
+def model_id_of(vfs_path) -> str:
+    """VFS 路径 → 模型目录名（倒数第二段）。
+
+    ``content/.../ASB107_North_Dakota_1953/ASB107_North_Dakota_1953.visual``
+    → ``ASB107_North_Dakota_1953``。
+
+    geometry / visual / skeleton / model 四类路径的目录层级一致，所以同一个
+    提取规则对它们都成立 —— 这也是 3D 缓存把 ``model_id`` 当增量单位的前提。
+    兼容 ``/@content/...`` 前缀与反斜杠。
+    """
+    parts = [p for p in str(vfs_path or "").replace("\\", "/").replace("/@", "/").split("/") if p]
+    return parts[-2] if len(parts) >= 2 else ""
 
 
 def detect_wows_type(game_dir) -> str:
@@ -159,18 +175,10 @@ def detect_wows_type(game_dir) -> str:
     hit = _probe(root)
     if hit:
         return hit
-    bin_dir = os.path.join(root, "bin")
-    if os.path.isdir(bin_dir):
-        try:
-            # 与 find_latest_bin_folder 同口径：只认数字目录、按数值从新到旧
-            subs = [f for f in os.listdir(bin_dir)
-                    if f.isdigit() and os.path.isdir(os.path.join(bin_dir, f))]
-            for sub in sorted(subs, key=int, reverse=True):
-                hit = _probe(os.path.join(bin_dir, sub, "bin64"))
-                if hit:
-                    return hit
-        except OSError:
-            pass
+    for sub in list_builds(root):
+        hit = _probe(os.path.join(root, "bin", sub, "bin64"))
+        if hit:
+            return hit
     return ""
 
 

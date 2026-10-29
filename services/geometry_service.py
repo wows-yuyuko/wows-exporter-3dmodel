@@ -26,7 +26,7 @@ from app.application import app as app_ctx
 from app.signals import bus
 from models.geometry_parser import parse_geometry, ArmorModel, GeometryError
 from models.collision_materials import collision_material_name, thickness_to_color
-from services.fx_mapping import tech_family as fx_tech_family
+from utils.asset_utils import murmur3_32, tech_family as fx_tech_family
 from utils.threading_utils import TaskCancelled
 
 from services import mesh_filters
@@ -73,7 +73,7 @@ def _is_magenta_placeholder(dds_bytes: bytes, sample: int = 256) -> bool:
     实例图集(CIA000_instances_atlas_art)实测全 mode0 纯洋红 (238,51,127)。
     """
     try:
-        from models.dds_reader import parse_dds
+        from services.texture_io import parse_dds
         dds = parse_dds(dds_bytes)
         if dds.bc_kind != 8 or not dds.mips:
             return False
@@ -435,7 +435,7 @@ class ShipGeometry:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 舰船发现
+# 服务入口
 # ────────────────────────────────────────────────────────────────────────────
 
 class GeometryService:
@@ -445,8 +445,6 @@ class GeometryService:
     _lock = threading.Lock()
 
     def __init__(self):
-        self._ships: list[ShipInfo] | None = None
-        self._ships_error: str | None = None
         self._extractor = None  # 懒创建
         # assets.bin 骨架/材质服务（懒加载，跨船复用）
         self._assets_svc = None
@@ -551,39 +549,6 @@ class GeometryService:
         if cancel_event is not None and cancel_event.is_set():
             raise TaskCancelled
 
-    def list_ships(self, refresh: bool = False) -> list[ShipInfo]:
-        """发现可载入舰船（DB-first：只读主库 ship_models 表）。
-
-        ship_models 在「加载数据」入库时写入；数据库无记录提示先加载数据，
-        不再回退扫描 data/split JSON。
-        """
-        if self._ships is not None and not refresh:
-            return self._ships
-
-        ships: list[ShipInfo] = []
-        try:
-            from services.database_service import get_db
-            db = get_db(app_ctx.ctx.wows_type)
-            if db.exists:
-                for row in db.load_ships():
-                    ships.append(ShipInfo(
-                        game_key=row["name"],
-                        display_name=row["name"],
-                        model_folder=row["model_folder"],
-                        model_path="",
-                        nation=row["nation"],
-                        ship_type=row["ship_class"] or "",
-                        tier=int(row["tier"] or 0),
-                        group=row["ship_group"] or "",
-                        has_geometry=bool(row["model_folder"]),
-                    ))
-        except Exception as exc:  # noqa: BLE001
-            ships = []
-            bus.log_message.emit(f"⚠️ 舰船列表加载异常: {exc}")
-        if not ships:
-            self._ships_error = "数据库无可载入舰船（请先「加载数据」）"
-        self._ships = ships
-        return ships
 
     # ── 舰船几何加载 ────────────────────────────────────
 
@@ -1391,15 +1356,6 @@ class GeometryService:
             self._assets_cache_wows_type = cur
         return self._assets_cache
 
-    @staticmethod
-    def _matrix_to_render(m: list) -> np.ndarray:
-        """骨架挂点矩阵（列主序 16 float）→ 行主序 4x4（原始矩阵，不做坐标变换）。
-
-        方向/位置匹配改由 **基于骨骼** 完成（_load_mounts 组合模型 Root_BlendBone
-        并用 negz 共轭转渲染空间），这里仅转换矩阵布局。
-        """
-        from utils.asset_utils import mat_col_to_row_np
-        return mat_col_to_row_np(m)
 
     def _mount_root_blend(self, folder: str) -> np.ndarray:
         """挂载模型骨架的 `Root_BlendBone` 矩阵（静息朝向修正，仅用于**视觉**网格）。
@@ -1605,12 +1561,6 @@ class GeometryService:
         return out
 
     # ── 挂载模型几何/贴图加载 ───────────────────────────
-
-    @staticmethod
-    def _murmur3_32(data: bytes, seed: int = 0) -> int:
-        """MurmurHash3_x86_32：Korabli 字符串哈希（渲染集 shape 名 ↔ geometry mapping_id）。"""
-        from utils.asset_utils import murmur3_32
-        return murmur3_32(data, seed)
 
 
     def _geometry_folder_index(self, extractor) -> dict:
@@ -1827,7 +1777,7 @@ class GeometryService:
                 # 校验可解析出 mip/层（bc7prep 的 .dd0 若未正确解码会得到空 mip，
                 # 上传后是空纹理 → 采样 (0,0,0,1) 黑不透明 → 全黑），回退下一层级
                 try:
-                    from models.dds_reader import parse_dds
+                    from services.texture_io import parse_dds
                     d = parse_dds(data)
                     if not (d.mips or d.layers):
                         continue
@@ -2214,7 +2164,7 @@ class GeometryService:
                 paths = [e.path for e in entries]
                 rows = c.get_render_sets(paths)
                 for r in rows:
-                    mid = self._murmur3_32(r["shape"].encode())
+                    mid = murmur3_32(r["shape"].encode())
                     mat, mfm, damage = r["material"], r["mfm"], r["damage"]
                     entry = {'shape': r["shape"], 'material': mat, 'mfm': mfm,
                              'damage': damage, 'skinned': r.get('skinned', False),
@@ -2284,22 +2234,13 @@ class GeometryService:
 
     # ── 材质技术族 + INDEXED 分块渲染 ───────────────────
 
-    @staticmethod
-    def _material_family(shader_id: str) -> str:
-        """shader_id（0xHHHHLLLL）高 16 位 → 技术族。
-
-        INDEXED 分块(0x0009, ship_material_indexed.fx) / 标准 ship PBS(0x0005,
-        PBS_ship_camo*.fx) / 其他。
-        """
-        from utils.asset_utils import material_family
-        return material_family(shader_id)
 
     def _resolve_material_full(self, mfm_path: str, extractor) -> dict:
         """完整解析材质渲染信息：技术族 + fx + 贴图集 + INDEXED 参数。
 
         - shader_id / material_hash / fx_path / textures / indexed：来自
           assets_data.db 的 material_full 表（「加载数据」时预提取入库；fx_path
-          由 uncode_assets.mfm_fx 从 material_hash 解析）
+          由 uncode_assets.service.resolve_fx_path 从 material_hash 解析）
         - tech_family：由 fx_path 判定；fx_path 缺失时才退回 shader_id 高 16 位族
         - textures: {贴图键: (vfs_path, bytes)}（diffuseMap/albedoArray/materialIdMap/artMap/...）
         - indexed_params: {arrays: {名: (N,4)f32}, grid:(rows,cols), offset:(x,y)}
@@ -2316,7 +2257,7 @@ class GeometryService:
             if info:
                 sid = info.get("shader_id") or "0x0"
                 mh = info.get("material_hash") or ""
-                # fx 路径入库时由 uncode_assets.mfm_fx 解析（material_hash = fx 资源
+                # fx 路径入库时由 uncode_assets.service.resolve_fx_path 解析（material_hash = fx 资源
                 # selfId），随客户端更新；不依赖任何固定映射表。
                 fx_path = info.get("fx_path") or ""
                 family = fx_tech_family(fx_path, sid)

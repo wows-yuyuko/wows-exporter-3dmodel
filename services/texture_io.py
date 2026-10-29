@@ -1,18 +1,21 @@
-"""
-dds_reader.py —— 读取 DDS 纹理头，识别压缩格式并取回各级 mipmap 数据。
+"""纹理 I/O：DDS 头解析（BC1/2/3/4/5/7 与未压缩 BGRA）+ WebP 落盘。
 
-支持格式（直接作为 GPU 压缩纹理上传，无需软件解压）：
-  - DXT1 / DXT3 / DXT5（legacy fourCC，BC1/BC2/BC3）
-  - DX10 头下的 BC4 / BC5 / BC7
-  - 未压缩 BGRA / BGR（回退）
+导出链路只做两件事：
+  1. 从 pkg 取到的 `.dds` 字节里切出各级 mipmap / 拿到块压缩格式（不解码像素）；
+  2. 需要给人看或给网页用时，把某级 mip 编码成 WebP，按内容 sha1 命名去重。
 
-数据来源：`data_extractor` 提取的 .dds 文件（可能含 bc7prep，先经
-pkg_reader.decode_bc7prep_file 解码为标准 BC7）。
+`parse_dds` 不做软件解压：调用方拿到的是 GPU 可直接上传的块数据。
 """
 
 from __future__ import annotations
 
+import hashlib
+import io
 import struct
+from pathlib import Path
+
+from services.export_service import _TEX_COLOR, _TEX_MR, _TEX_NORMAL, dds_to_png
+
 
 #: DXGI 格式（Windows）
 DXGI_FORMAT_BC1_UNORM = 71
@@ -199,3 +202,38 @@ def parse_dds(data: bytes) -> DdsTexture:
     internal_srgb = GL_SRGB_COMPRESSED_FORMAT.get(bc_kind, internal) if bc_kind else 0
     return DdsTexture(width, height, bc_kind, mips, internal, rgba_bpp, internal_srgb,
                       array_size=array_size, layers=layers)
+
+
+def dds_to_webp(dds: bytes, kind: str = "color", max_size: int = 2048) -> bytes | None:
+    k = {"color": _TEX_COLOR, "normal": _TEX_NORMAL, "mr": _TEX_MR}.get(kind, _TEX_COLOR)
+    png = dds_to_png(dds, max_size=max_size, kind=k)
+    if not png:
+        return None
+    try:
+        from PIL import Image as PILImage
+        im = PILImage.open(io.BytesIO(png)).convert("RGBA")
+        if max(im.size) > max_size:
+            im.thumbnail((max_size, max_size), PILImage.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, "WEBP", quality=85, method=2)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def write_webp(out_dir: Path, data: bytes) -> str:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(data).hexdigest()
+    path = out_dir / (digest + ".webp")
+    if not path.exists():
+        path.write_bytes(data)
+    return "textures/" + digest + ".webp"
+
+
+def kind_for_path(path: str) -> str:
+    lower = path.lower()
+    if lower.endswith(("_n.dds", "_n.dd0", "_n.dd1", "_n.dd2", "_normal.dds")):
+        return "normal"
+    if lower.endswith(("_mg.dds", "_mg.dd0", "_mg.dd1", "_mg.dd2")):
+        return "mr"
+    return "color"

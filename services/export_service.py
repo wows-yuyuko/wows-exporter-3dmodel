@@ -283,7 +283,7 @@ def dds_to_rgba(data: bytes) -> np.ndarray | None:
     这里统一交换为 RGBA。
     """
     try:
-        from models.dds_reader import parse_dds
+        from services.texture_io import parse_dds
         dds = parse_dds(data)
     except Exception:  # noqa: BLE001
         return None

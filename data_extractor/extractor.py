@@ -212,9 +212,9 @@ class GameExtractor:
 
         客户端更新中断时最新数字目录可能不完整（缺 idx/），此时回退到较早的可用目录。
         """
-        from utils.path_utils import find_latest_bin_folder
-        result = find_latest_bin_folder(self._game_dir, require_idx=True)
-        if result is None:
+        from utils.path_utils import latest_build
+        result = latest_build(self._game_dir, require_idx=True)
+        if not result:
             raise ExtractorError(
                 f"bin 下没有可用的版本文件夹（需含 idx/）: {self._game_dir / 'bin'}")
         return result

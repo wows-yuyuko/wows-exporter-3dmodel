@@ -81,11 +81,10 @@ WG 比 Lesta 大：材质更多（19.7k vs 16.4k）、涂装条目更多（2.3k 
 
 ## 6. GameParams 类型映射
 
-`services/wg_compat.py` 是 WG 的 GameParams 差异**预留骨架**：
+`services/wg_compat.py` 只剩一个扩展点（原本还有类别列表 / 标签 / 归一化函数的
+占位，2026-10-29 随分析层一起删掉 —— 那些函数没有调用方）：
 
-- `WG_TYPE_CATEGORY_MAP` / `WG_CATEGORIES` / `WG_CAT_LABELS` / `WG_NORMALIZE_ENTITY`
-  全部为 `None`；
-- 调用方（`processor_service`）在 `None` 时回退 Lesta 默认映射；
+- `WG_TYPE_CATEGORY_MAP` 为 `None` → `processor_service` 回退 Lesta 默认映射；
 - 当前 WG 导入正常，说明 `typeinfo.type` 命名与 Lesta 一致；
 - 若将来 WG 改了类型命名，只改这一个文件（不要往业务代码里加 `if wows_type`）。
 

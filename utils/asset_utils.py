@@ -1,9 +1,10 @@
-"""共享工具函数：assets_cache_service 与 geometry_service 的逐字重复提取。
+"""共享工具函数：材质分类、字符串表、矩阵/哈希换算。
 
-AC4  _strings_dict   — 字符串表哈希 map 构建
-AC5  _material_family — shader_id 高 16 位→技术族
-AC6  _to_render_row / _matrix_to_render — 列主序→行主序 4x4
-AC15 _murmur3_32    — MurmurHash3_x86_32
+build_strings_dict  — 字符串表哈希 map 构建
+material_family     — shader_id 高 16 位 → 技术族
+tech_family         — fx 路径 → 渲染技术族（缺失时退回 material_family）
+mat_col_to_row_np   — 列主序 16 float → 行主序 4×4
+murmur3_32          — MurmurHash3_x86_32
 """
 
 from __future__ import annotations
@@ -103,3 +104,42 @@ def murmur3_32(data: bytes, seed: int = 0) -> int:
     h1 = (h1 * 0xC2B2AE35) & 0xFFFFFFFF
     h1 ^= h1 >> 16
     return h1
+
+
+def tech_family(fx_path: str, shader_id: str = "") -> str:
+    """按 fx 路径判定渲染类别（渲染分支用）；路径缺失退回 shader_id 高 16 位族。
+
+    渲染类别（geometry_renderer.paintGL 按此分支）：
+      grid        → 网格/线网 alpha（透明 pass，无光照）
+      indexed     → INDEXED 分块渲染（materialIdMap+albedoArray）
+      emissive    → 自发光/燃烧（无光照亮色，u_mode=2 不透明）
+      transparent → 半透明（玻璃/螺旋桨/水/云/旗帜等，blend + 贴图 alpha）
+      decal       → 贴花叠加（普通光照）
+      wire        → 细线/栏杆材质（普通）
+      pbs         → 标准 PBS（光照实体）
+      other       → shader_id 高 16 位兜底
+    """
+    low = (fx_path or "").lower()
+    base = low.split("/")[-1]
+    if "grid_alpha" in low:
+        return "grid"
+    if "indexed" in low:
+        return "indexed"
+    # 自发光/燃烧：无光照亮色
+    if "emissive" in low or "blaze" in low:
+        return "emissive"
+    # 半透明：玻璃/透明/螺旋桨/水/瀑布/云平面/旗帜（blend + 贴图 alpha）
+    if ("glass" in low or "transparent" in low or "propeller" in low
+            or "water" in low or "waterfall" in low or "cloud_plane" in low
+            or base == "flag.fx" or "dirty_glass" in low
+            or "interior_behind_glass" in low):
+        return "transparent"
+    if "decal" in low or "mesh_decal" in low:
+        return "decal"
+    if "wire" in low:
+        return "wire"
+    if ("pbs" in low or "camo" in low or "ship_material" in low
+            or "diffuse" in low or "base_material" in low):
+        return "pbs"
+    # 无 fx 路径/无法归类：退回 shader_id 高 16 位族
+    return material_family(shader_id)

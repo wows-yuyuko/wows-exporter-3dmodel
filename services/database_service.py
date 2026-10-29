@@ -20,9 +20,8 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from utils.path_utils import get_bundled_dir, get_data_dir
+from services.sqlite_store import SqliteStore
 
 DB_SCHEMA_VERSION = 49
 
@@ -67,9 +66,6 @@ class SyncStats:
     #: 已从客户端消失的模型目录
     removed_models: set[str] = field(default_factory=set)
 
-    @property
-    def skipped_ships(self) -> int:
-        return self.ships_same
 
     def summary(self) -> str:
         return ("战舰 新增 %d / 变动 %d / 未变 %d / 下架 %d；"
@@ -79,206 +75,22 @@ class SyncStats:
                    self.models_removed, self.changed_now))
 
 
-class DatabaseManager:
-    """SQLite 数据库管理器（线程安全）。"""
+def imported_build(server: str) -> str:
+    """读 game_data*.db 的 meta.build（导入时写入的客户端 build 号）。"""
+    store = DatabaseManager(wows_type="Wargaming" if server == "wg" else "Lesta")
+    return store.build if store.exists else ""
 
-    def __init__(self, db_path: str | Path | None = None, wows_type: str = ""):
-        self._wows_type = wows_type or ""
-        if db_path:
-            self._db_path = Path(db_path)
-        else:
-            self._db_path = get_data_dir() / self._db_name(wows_type)
-        self._local = threading.local()
-        #: 本次 initialize 是否因 schema 版本落后而整库重建（旧数据被清空）。
-        self._schema_rebuilt = False
 
-    def _schema_subdir(self) -> str:
-        """按服务器返回 SQL 架构子目录（lesta / wargaming）。"""
-        wt = self._wows_type
-        if not wt:
-            try:
-                from app.application import app as app_ctx
-                wt = app_ctx.ctx.wows_type
-            except Exception:  # noqa: BLE001
-                wt = ""
-        return "wargaming" if wt == "Wargaming" else "lesta"
+class DatabaseManager(SqliteStore):
+    """game_data.db 访问层（线程安全）。连接 / schema / meta 见 SqliteStore。"""
 
-    @staticmethod
-    def _db_name(wows_type: str = "") -> str:
-        """按服务器返回数据库文件名（两服各一个库，绝不合并）。"""
-        if wows_type == "Wargaming":
-            return "game_data_wg.db"
-        return "game_data.db"
-
-    _all_connections: set[sqlite3.Connection] = set()
-
-    # ── 连接 ────────────────────────────────────────────────
-
-    @property
-    def _conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = self._create_connection()
-        else:
-            try:
-                self._local.conn.execute("SELECT 1")
-            except (sqlite3.ProgrammingError, sqlite3.OperationalError):
-                self._local.conn = self._create_connection()
-        return self._local.conn
-
-    def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-8000")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA wal_autocheckpoint=4000")
-        conn.row_factory = sqlite3.Row
-        type(self)._all_connections.add(conn)
-        return conn
-
-    def close(self) -> None:
-        if hasattr(self._local, "conn") and self._local.conn:
-            self._local.conn.close()
-            type(self)._all_connections.discard(self._local.conn)
-            self._local.conn = None
-
-    @property
-    def exists(self) -> bool:
-        return self._db_path.is_file()
-
-    @property
-    def db_size_mb(self) -> float:
-        try:
-            total = self._db_path.stat().st_size
-            for suffix in ("-wal", "-shm"):
-                p = Path(str(self._db_path) + suffix)
-                if p.is_file():
-                    total += p.stat().st_size
-            return round(total / 1048576, 1)
-        except OSError:
-            return 0.0
-
-    def checkpoint(self, mode: str = "TRUNCATE") -> None:
-        """把 WAL 收回主库（大 WAL 会拖慢后续开库/写入）。"""
-        try:
-            self._conn.execute("PRAGMA wal_checkpoint(%s)" % mode)
-        except sqlite3.OperationalError:
-            pass
-
-    # ── schema ─────────────────────────────────────────────
-
-    def get_current_version(self) -> int:
-        try:
-            row = self._conn.execute(
-                "SELECT version FROM meta_schema_version ORDER BY version DESC LIMIT 1").fetchone()
-            return int(row["version"]) if row else 0
-        except (sqlite3.OperationalError, TypeError, ValueError):
-            return 0
-
-    def _record_version(self, ver: int) -> None:
-        self._conn.execute(
-            "INSERT OR IGNORE INTO meta_schema_version (version) VALUES (?)", (ver,))
-        self._conn.commit()
-
-    def _drop_all_tables(self) -> None:
-        conn = self._conn
-        conn.execute("PRAGMA foreign_keys=OFF")
-        for (tname,) in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
-            try:
-                conn.execute('DROP TABLE IF EXISTS "%s"' % tname)
-            except sqlite3.OperationalError:
-                pass
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.commit()
-
-    def _vacuum_after_drop(self) -> None:
-        """删表只把页标成空闲，文件不会缩小（可残留数百 MB），真空回收。"""
-        try:
-            self._conn.execute("VACUUM")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
-
-    def _shrink_leftover_wal(self) -> None:
-        """上次被强杀会遗留大 WAL，先并回主库再继续。"""
-        try:
-            wal = Path(str(self._db_path) + "-wal")
-            if wal.is_file() and wal.stat().st_size > 8 * 1048576:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except (OSError, sqlite3.OperationalError):
-            pass
-
-    def initialize(self) -> None:
-        """建表（幂等）。schema 版本落后 → 整库重建，之后一直走增量。"""
-        current_ver = self.get_current_version()
-        self._shrink_leftover_wal()
-        self._schema_rebuilt = False
-        if 0 < current_ver < DB_SCHEMA_VERSION:
-            self._drop_all_tables()
-            self._schema_rebuilt = True
-            self._vacuum_after_drop()
-
-        sub = self._schema_subdir()
-        sql_path = get_bundled_dir() / "resources" / "database" / sub / "database_new.sql"
-        if not sql_path.exists():
-            sql_path = get_bundled_dir() / "resources" / "database" / "database_new.sql"
-        if not sql_path.exists():
-            raise RuntimeError("缺少 resources/database/%s/database_new.sql" % sub)
-        self._conn.executescript(sql_path.read_text(encoding="utf-8"))
-        self._conn.commit()
-        if self.get_current_version() < DB_SCHEMA_VERSION:
-            self._record_version(DB_SCHEMA_VERSION)
-
-    # ── meta ───────────────────────────────────────────────
-
-    def get_meta(self, key: str, default: str = "") -> str:
-        try:
-            row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-            return str(row["value"]) if row else default
-        except sqlite3.OperationalError:
-            return default
-
-    def set_meta(self, items: dict) -> None:
-        rows = [(str(k), str(v)) for k, v in items.items()]
-        if rows:
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", rows)
-            self._conn.commit()
-
-    @property
-    def build(self) -> str:
-        """库数据对应的客户端 build（空 = 空库/从未同步）。"""
-        return self.get_meta("build")
+    DB_STEM = "game_data"
+    SQL_FILE = "database_new.sql"
+    SCHEMA_VERSION = DB_SCHEMA_VERSION
+    EXTRA_PRAGMAS = ("PRAGMA foreign_keys=ON", "PRAGMA wal_autocheckpoint=4000")
 
     # ── 读 ─────────────────────────────────────────────────
 
-    def load_ships(self, active_only: bool = True,
-                   require_model: bool = True) -> list[sqlite3.Row]:
-        """可载入舰船列表（3D 查看器 / 导出用）。
-
-        require_model=True 只返回有船体模型的船 —— 库里也存了没模型的
-        （测试船/dummy），它们进不了导出链路，不该出现在下拉框里。
-        """
-        sql = ("SELECT id, idx, name, nation, tier, ship_class, ship_group, model_folder "
-               "FROM ship WHERE 1=1")
-        if active_only:
-            sql += " AND status='active'"
-        if require_model:
-            sql += " AND model_folder<>''"
-        sql += " ORDER BY name"
-        try:
-            return self._conn.execute(sql).fetchall()
-        except sqlite3.OperationalError:
-            return []
-
-    def count_ships(self) -> int:
-        try:
-            return int(self._conn.execute(
-                "SELECT COUNT(*) FROM ship WHERE status='active'").fetchone()[0])
-        except sqlite3.OperationalError:
-            return 0
 
     def load_ship_snapshot(self, ship_id: int | str) -> dict:
         """按数字 id 或 GameParams 名取舰船快照（不存在返回 {}）。"""
@@ -302,19 +114,6 @@ class DatabaseManager:
         except (sqlite3.OperationalError, ValueError):
             return {}
 
-    def load_models(self) -> dict[str, dict]:
-        """{model_id: {sig, main_crc, main_size, file_count, status, ...}}。"""
-        out: dict[str, dict] = {}
-        try:
-            rows = self._conn.execute(
-                "SELECT model_id, model_path, kind, sig, main_crc, main_size, file_count, "
-                "status, first_build, first_seen, last_build, last_changed, last_checked "
-                "FROM model").fetchall()
-        except sqlite3.OperationalError:
-            return out
-        for r in rows:
-            out[r["model_id"]] = dict(r)
-        return out
 
     def changed_ships(self, build: str = "") -> list[sqlite3.Row]:
         """本 build 内容有变化的船（含「引用了变动挂载」的船）。"""

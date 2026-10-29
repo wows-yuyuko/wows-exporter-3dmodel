@@ -130,7 +130,7 @@ list_camos(ship_indexes, ship_permoflages) -> list[CamoSchemeInfo]
 
 ## 6. 贴图的 `kind` 判定
 
-`texture_export.kind_for_path()`：
+`texture_io.kind_for_path()`：
 
 | 后缀 | kind | 变换 |
 |---|---|---|

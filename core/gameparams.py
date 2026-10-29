@@ -5,8 +5,16 @@ import pickle
 import sys
 import zlib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from services import GameParams as _GP
+
+#: `<game>/data/` 下的候选文件名，按优先级排列。WG 正式包只出 GameParams.data；
+#: Lesta 同时有 py2/py3 时优先 py3（py2 是给老客户端留的）。
+_GP_NAMES: dict[str, tuple[str, ...]] = {
+    "wg": ("GameParams.data", "GameParams_py3.data"),
+    "lesta": ("GameParams_py3.data", "GameParams_py2.data", "GameParams.data"),
+}
 
 
 @dataclass
@@ -23,6 +31,62 @@ class ShipEntry:
 
 def _ensure_stub():
     sys.modules.setdefault("GameParams", _GP)
+
+
+def locate(game_dir, server: str = "", extract: bool = False) -> str:
+    """定位客户端 GameParams 文件，返回绝对路径（找不到返回空串）。
+
+    ``server`` 决定候选顺序：WG 优先 ``GameParams.data``，Lesta 优先 ``py3``。
+    大小写不敏感，``"lesta"`` / ``"wg"`` / ``"Wargaming"`` 都认。
+
+    ``extract=True`` 时，若 ``<game>/data/`` 里一个都没有，就从 ``bin/<build>``
+    的 pkg 里解出来写回 ``<game>/data/`` —— 这是本项目**唯一**会写游戏目录的地方，
+    因为客户端解包后并不总是把 GameParams 落在 data/ 下。
+    """
+    if not game_dir:
+        return ""
+    game = Path(str(game_dir))
+    names = _GP_NAMES["wg" if _is_wg(server) else "lesta"]
+    for name in names:
+        f = game / "data" / name
+        if f.is_file():
+            return str(f)
+    if not extract:
+        return ""
+    _extract_to_data(game)
+    for name in names:
+        f = game / "data" / name
+        if f.is_file():
+            return str(f)
+    raise SystemExit("GameParams not found in package")
+
+
+def _is_wg(server: str) -> bool:
+    s = (server or "").lower()
+    return "wg" in s or "war" in s
+
+
+def _extract_to_data(game: Path) -> None:
+    """从 pkg 解出 ``content/GameParams*.data`` 写到 ``<game>/data/``。"""
+    from data_extractor import GameExtractor
+    from utils.path_utils import latest_build
+
+    build = latest_build(game)
+    if not build:
+        raise SystemExit("no game build under %s/bin" % game)
+    ex = GameExtractor(str(game), bin_folder=build)
+    try:
+        entries = [e for e in ex.list_files(["content/GameParams*.data"])
+                   if not e.is_directory]
+        if not entries:
+            raise SystemExit("GameParams not found in package")
+        target = game / "data"
+        target.mkdir(parents=True, exist_ok=True)
+        for e in entries:
+            ex.extract_single(e.path, target / e.path.rsplit("/", 1)[-1])
+        print("[extract]", [e.path for e in entries])
+    finally:
+        ex.close()
 
 
 def load_gameparams(path: str):

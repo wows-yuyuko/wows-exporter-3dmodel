@@ -96,7 +96,7 @@ def export_mat_skins(out_root: Path, ship, build: str, limit: int = 0,
     """
     from services.geometry_service import GeometryService
     from services.camo_service import CamoService
-    from services.texture_export import dds_to_webp, write_webp, kind_for_path
+    from services.texture_io import dds_to_webp, kind_for_path, write_webp
 
     gs = GeometryService.instance()
     extractor = gs.get_extractor()

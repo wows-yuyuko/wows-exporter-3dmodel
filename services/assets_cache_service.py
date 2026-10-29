@@ -28,11 +28,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import struct
-import threading
 import time
-from pathlib import Path
 
-from utils.path_utils import get_data_dir
+from services.sqlite_store import SqliteStore
+from utils.asset_utils import material_family
+from utils.path_utils import model_id_of
 
 #: assets_data.db schema 版本（与 database_new.sql 的 DB_SCHEMA_VERSION 规则一致：
 #: 库内 meta_schema_version 记录已应用版本，低于本值则 initialize 重建全表）
@@ -75,40 +75,23 @@ MF_LOG = 4000              # 材质：每 N 个文件报一次进度
 EXT_FLUSH = 400            # 外观：行数超过 N 条写一批（单条 data_json 可能很大）
 
 
-class AssetsCacheService:
-    """assets.bin 数据缓存（独立数据库 assets_data.db，线程安全）。"""
+class AssetsCacheService(SqliteStore):
+    """assets.bin 数据缓存（独立数据库 assets_data.db，线程安全）。
 
-    def __init__(self, db_path: str | Path | None = None, wows_type: str = ""):
-        if not wows_type:
-            try:
-                from app.application import app as app_ctx
-                wows_type = app_ctx.ctx.wows_type
-            except Exception:  # noqa: BLE001
-                wows_type = ""
-        self._wows_type = wows_type or ""
-        if db_path is None:
-            db_path = get_data_dir() / self._db_name(wows_type)
-        self._db_path = Path(db_path)
-        self._local = threading.local()
-        #: initialize() 因 schema 版本落后而整库重建时置 True（上层据此提示需重跑 import）
-        self._schema_rebuilt = False
+    连接 / schema 版本 / meta 见 `SqliteStore`；这里只负责解析与查询。
+    """
 
-    def _schema_subdir(self) -> str:
-        """按服务器返回 SQL 架构子目录（lesta / wargaming）。"""
-        return "wargaming" if self._wows_type == "Wargaming" else "lesta"
-
-    @staticmethod
-    def _db_name(wows_type: str = "") -> str:
-        """按服务器返回 3D 缓存库文件名（Lesta→assets_data.db, WG→assets_data_wg.db）。"""
-        if wows_type == "Wargaming":
-            return "assets_data_wg.db"
-        return "assets_data.db"
+    DB_STEM = "assets_data"
+    SQL_FILE = "assets_database.sql"
+    SCHEMA_VERSION = ASSETS_SCHEMA_VERSION
+    TIMEOUT = 15
+    BUSY_TIMEOUT = 8000
 
     def _is_wg(self) -> bool:
         """当前缓存库是否 WG 服（WG 的 assets.bin 用 10 类型表，布局与 Korabli 不同）。"""
         return self._wows_type == "Wargaming"
 
-    # ── 连接 ────────────────────────────────────────────────
+    # ── 渲染集合并（同一 shape 的多个实例节点）──────────────
 
     @staticmethod
     def _merge_render_set_into(merged: dict, row: tuple) -> None:
@@ -161,69 +144,7 @@ class AssetsCacheService:
             AssetsCacheService._merge_render_set_into(merged, r)
         return AssetsCacheService._materialize_render_set(merged)
 
-    @property
-    def _conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(
-                str(self._db_path), check_same_thread=False, timeout=15)
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn.execute("PRAGMA busy_timeout=8000")
-            self._local.conn.row_factory = sqlite3.Row
-        else:
-            try:
-                self._local.conn.execute("SELECT 1")
-            except (sqlite3.ProgrammingError, sqlite3.OperationalError):
-                self._local.conn = sqlite3.connect(
-                    str(self._db_path), check_same_thread=False, timeout=15)
-                self._local.conn.execute("PRAGMA journal_mode=WAL")
-                self._local.conn.execute("PRAGMA busy_timeout=8000")
-                self._local.conn.row_factory = sqlite3.Row
-        return self._local.conn
-
-    def initialize(self) -> None:
-        """建表（幂等；建表 SQL 从 assets_database.sql 读取）。
-
-        schema 版本低于 ASSETS_SCHEMA_VERSION → 整库重建（旧结构不兼容），
-        之后一律走增量同步，不再重建。表结构只有 SQL 文件一处维护，
-        不再保留内嵌副本（两份定义必然漂移）。
-        """
-        if 0 < self.get_current_version() < ASSETS_SCHEMA_VERSION:
-            self._drop_all_tables()
-            self._schema_rebuilt = True
-
-        sql_text = None
-        sub = self._schema_subdir()
-        try:
-            from utils.path_utils import get_bundled_dir
-            sql_path = get_bundled_dir() / "resources" / "database" / sub / "assets_database.sql"
-            if not sql_path.exists():
-                sql_path = get_bundled_dir() / "resources" / "database" / "assets_database.sql"
-            if sql_path.exists():
-                sql_text = sql_path.read_text(encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            sql_text = None
-        if not sql_text:
-            raise RuntimeError("缺少 resources/database/%s/assets_database.sql，无法建立 3D 缓存库" % sub)
-
-        self._conn.executescript(sql_text)
-        self._conn.commit()
-        if self.get_current_version() < ASSETS_SCHEMA_VERSION:
-            self._record_version(ASSETS_SCHEMA_VERSION)
-
-    # ── schema 版本管理（同 database_service 规则）───────────
-
-    def _drop_all_tables(self) -> None:
-        """删除全部表（schema 版本过低时重建用）。"""
-        conn = self._conn
-        tables = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        for (tname,) in tables:
-            try:
-                conn.execute(f'DROP TABLE IF EXISTS "{tname}"')
-            except sqlite3.OperationalError:
-                pass
-        conn.commit()
+    # ── 事务内清空（全量重建 / 按模型重建）─────────────────
 
     def _clear_all_rows(self) -> None:
         """清空全部表的数据行（**不提交**，与写入共用事务，失败可回滚）。
@@ -246,36 +167,7 @@ class AssetsCacheService:
             except sqlite3.OperationalError:
                 pass
 
-    def get_current_version(self) -> int:
-        """当前已应用的 schema 版本（meta_schema_version 最高版本；无表/异常返回 0）。"""
-        try:
-            row = self._conn.execute(
-                "SELECT version FROM meta_schema_version "
-                "ORDER BY version DESC LIMIT 1").fetchone()
-            return int(row["version"]) if row else 0
-        except (sqlite3.OperationalError, TypeError, ValueError):
-            return 0
-
-    # ── 库级元信息 ──────────────────────────────────────────
-
-    def get_meta(self, key: str, default: str = "") -> str:
-        try:
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-            return str(row["value"]) if row else default
-        except sqlite3.OperationalError:
-            return default
-
-    def _set_meta(self, items: dict) -> None:
-        rows = [(str(k), str(v)) for k, v in items.items()]
-        if rows:
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", rows)
-
-    @property
-    def build(self) -> str:
-        """本库数据对应的客户端 build（增量同步据此判断是否换版本）。"""
-        return self.get_meta("build")
+    # ── 按模型删行（增量重建）───────────────────────────────
 
     def _delete_models(self, models: set[str]) -> None:
         """删掉指定模型目录在派生表里的全部行（增量重建前调用）。"""
@@ -292,22 +184,8 @@ class AssetsCacheService:
             self._conn.execute(
                 "DELETE FROM render_set WHERE model_id IN (%s)" % ph, chunk)
 
-    def _record_version(self, ver: int) -> None:
-        """记录已应用的 schema 版本。"""
-        try:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO meta_schema_version (version) VALUES (?)", (ver,))
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
-
     # ── 入库（「加载数据」时调用）────────────────────────────
 
-    @staticmethod
-    def _murmur3_32(data: bytes, seed: int = 0) -> int:
-        """MurmurHash3_x86_32：渲染集 shape 名 ↔ geometry mapping_id 归属校验用。"""
-        from utils.asset_utils import murmur3_32
-        return murmur3_32(data, seed)
 
     def populate(self, assets_path: str | None = None, bin_folder: str = "",
                  game_version: str = "", wows_type: str = "",
@@ -377,13 +255,13 @@ class AssetsCacheService:
                           "camo_ship_groups"):
                     self._conn.execute('DELETE FROM "%s"' % t)
 
-            self._set_meta({
+            self.set_meta({
                 "build": bin_folder or "",
                 "game_version": game_version or "",
                 "wows_type": wows_type or self._wows_type,
                 "last_sync_mode": "full" if full else "incremental",
                 "last_sync_models": str(len(models or ())),
-            })
+            }, commit=False)
 
             _p("清空目标模型（事务内，失败可回滚）并扫描 VFS 全树...")
 
@@ -468,7 +346,7 @@ class AssetsCacheService:
                        f"（骨骼 {tot_bones + len(bone_rows):,} / "
                        f"挂点 {tot_mounts + len(skel_rows):,}，"
                        f"已用 {time.time() - _t_skel:.0f}s）...")
-                stem = self._stem_of_skeleton(f.path)
+                stem = model_id_of(f.path)
                 if not stem:
                     continue
                 # 增量：只重建变更集里的模型，其余整个跳过（省掉解码 + 写库）
@@ -658,7 +536,7 @@ class AssetsCacheService:
                 material_array_lengths,
                 material_ool_end,
             )
-            from uncode_assets.mfm_fx import resolve_fx_path
+            from uncode_assets.service import resolve_fx_path
             mfm_rows: list[tuple] = []
             mf_rows: list[tuple] = []
             mfm_failed: list[str] = []
@@ -809,9 +687,9 @@ class AssetsCacheService:
                                 vals.append([round(float(x), 6) for x in B.parse_vec4(data, o)])
                         if vals:
                             indexed[nm] = vals
-                family = self._material_family(f"0x{shader_id:08X}")
+                family = material_family(f"0x{shader_id:08X}")
                 # fx 路径：material_hash（fx 资源 selfId）→ assets.bin 路径树。
-                # 解析逻辑独立在 uncode_assets.mfm_fx，浏览器/场景浏览器共用，
+                # 解析逻辑在 uncode_assets.service.resolve_fx_path（只依赖 PrototypeDatabase），
                 # 不依赖任何随源码打包的固定映射表。
                 fx_path = resolve_fx_path(db, f"0x{mat_hash:016X}")
                 mf_rows.append((self._norm_vfs_path(f.path), f"0x{shader_id:08X}", family,
@@ -835,10 +713,12 @@ class AssetsCacheService:
                 return _shared_ext
             # 9) Exterior 实体（GameParams 直读）→ exteriors 表
             try:
-                from core.gameparams import exterior_entities, EXTERIOR_DATA_KEYS
-                # 数据源只有 GameParams 一份（split 目录已不再产出）
+                from core.gameparams import (EXTERIOR_DATA_KEYS, exterior_entities,
+                                             locate as gp_locate)
+                # 数据源只有 GameParams 一份（split 目录已不再产出）；
+                # 这里不解包（extract=False）：import 链路上 GameParams 已由 CLI 备好
                 ext_items: list[tuple[str, dict]] = []
-                gp_file = self._find_gameparams_file(game_dir, wows_type)
+                gp_file = gp_locate(game_dir, wows_type)
                 if gp_file:
                     try:
                         ext_items = exterior_entities(gp_file)
@@ -975,10 +855,10 @@ class AssetsCacheService:
                 pass
 
             counts["models"] = len(models or ())
-            self._set_meta({
+            self.set_meta({
                 "synced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "built_models": str(counts["models"]),
-            })
+            }, commit=False)
             self._conn.commit()
             return counts
         except Exception:
@@ -1211,27 +1091,6 @@ class AssetsCacheService:
         except Exception:  # noqa: BLE001
             return ''
 
-    @staticmethod
-    def _find_gameparams_file(game_dir, wows_type: str = "") -> str:
-        """定位客户端 GameParams 文件（WG 优先 GameParams.data，其余优先 py3）。"""
-        if not game_dir:
-            return ""
-        data_dir = Path(game_dir) / "data"
-        low = (wows_type or "").lower()
-        names = (["GameParams.data", "GameParams_py3.data"]
-                 if ("wg" in low or "war" in low)
-                 else ["GameParams_py3.data", "GameParams_py2.data", "GameParams.data"])
-        for n in names:
-            f = data_dir / n
-            if f.is_file():
-                return str(f)
-        return ""
-
-    @staticmethod
-    def _material_family(shader_id: str) -> str:
-        """shader_id（0xHHHHLLLL）高 16 位 → 技术族（INDEXED/PBS/其他）。"""
-        from utils.asset_utils import material_family
-        return material_family(shader_id)
 
     @staticmethod
     def _norm_vfs_path(p: str) -> str:
@@ -1244,12 +1103,6 @@ class AssetsCacheService:
 
     # ── 工具 ────────────────────────────────────────────────
 
-    @staticmethod
-    def _model_of(geom_path: str) -> str:
-        """geometry 的 VFS 路径 → 模型目录名（= 父目录，如 BSD100_Waterloo_1956）。"""
-        if not geom_path:
-            return ""
-        return geom_path.replace("\\", "/").rsplit("/", 2)[-2]
 
     def _render_sets_lesta_one(self, data, off, db, self_id_idx, sdict,
                                add_row, models=None) -> None:
@@ -1268,7 +1121,7 @@ class AssetsCacheService:
         gp = self._path_of(h, db, self_id_idx)
         if not (gp and gp.endswith(".geometry")):
             return
-        model_id = self._model_of(gp)
+        model_id = model_id_of(gp)
         if models is not None and model_id not in models:
             return
         # 渲染集数组：+0x38 rel 为 **record-relative**（相对记录起始），
@@ -1334,7 +1187,7 @@ class AssetsCacheService:
                            db, self_id_idx)
         if not (gp and gp.endswith(".geometry")):
             return
-        model_id = self._model_of(gp)
+        model_id = model_id_of(gp)
         if models is not None and model_id not in models:
             return
         cnt = struct.unpack_from('<H', data, off + 0x3A)[0]
@@ -1407,7 +1260,7 @@ class AssetsCacheService:
         # 1) VisualPrototype nodes → HP_ 挂点 + 全部骨骼
         for _i, f in enumerate(vis_files, 1):
             _tick(_i, len(vis_files))
-            stem = self._stem_of_skeleton(f.path)
+            stem = model_id_of(f.path)
             if not stem:
                 continue
             try:
@@ -1445,7 +1298,7 @@ class AssetsCacheService:
         # 2) SkeletonExtender → MP_/SP_/EP_ 挂点（local 即船空间）
         for _i, f in enumerate(ext_files, 1):
             _tick(_i, len(ext_files))
-            stem = self._stem_of_skeleton(f.path)
+            stem = model_id_of(f.path)
             if not stem:
                 continue
             try:
@@ -1572,15 +1425,6 @@ class AssetsCacheService:
         _bump("ok")
         return names, mats
 
-    @staticmethod
-    def _stem_of_skeleton(path: str) -> str:
-        """骨架路径 → 舰体 model_folder（倒数第二段）。
-
-        例: /@content/gameplay/usa/ship/battleship/ASB107_North_Dakota_1953/
-            ASB107_North_Dakota_1953_Bow_ports.visual → ASB107_North_Dakota_1953
-        """
-        parts = [p for p in path.replace("/@", "/").split("/") if p]
-        return parts[-2] if len(parts) >= 2 else ""
 
     @staticmethod
     def _mat3_to_quat(rot) -> tuple:
@@ -1688,11 +1532,3 @@ class AssetsCacheService:
         from utils.asset_utils import build_strings_dict
         return build_strings_dict(db)
 
-    @staticmethod
-    def _to_render_row(mat: list) -> bytes | None:
-        """列主序 16 float → 行主序 4x4 的 64 字节（与 geometry_service._matrix_to_render 一致）。"""
-        from utils.asset_utils import mat_col_to_row_np
-        try:
-            return mat_col_to_row_np(mat).tobytes()
-        except Exception:  # noqa: BLE001
-            return None

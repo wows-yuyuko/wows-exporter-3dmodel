@@ -18,6 +18,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from utils.path_utils import list_builds
+
 #: 船体分段后缀：主文件（不带这些）才可能含装甲
 _SEG_SUFFIX = re.compile(r"_(Bow|MidFront|MidBack|Stern|Superstructure|Hull|Mid)$", re.I)
 
@@ -78,15 +80,6 @@ def snapshot_build(game: str | Path, build: str) -> dict[str, GeomFile]:
     finally:
         ex.close()
     return out
-
-
-def list_builds(game: str | Path, count: int = 2) -> list[str]:
-    """`bin/` 下按**数值**从新到旧的前 count 个版本目录名。"""
-    bin_root = Path(game) / "bin"
-    if not bin_root.is_dir():
-        return []
-    nums = [p.name for p in bin_root.iterdir() if p.is_dir() and p.name.isdigit()]
-    return sorted(nums, key=int, reverse=True)[:count]
 
 
 def ship_model_index(db_path: str | Path) -> tuple[dict[str, set[str]], dict[str, str]]:
@@ -263,9 +256,6 @@ def run(game: str | Path, server: str, old_build: str | None = None,
     by_folder, hull_folder = ship_model_index(db)
     annotate(changed, by_folder, hull_folder)
 
-    if fmt == "keys":
-        keys = affected_ships(changed)
-        return "\n".join(keys), len(keys)
     if fmt == "json":
         text = format_json(old_build, new_build, changed, added, removed)
         return text, len(affected_ships(changed))

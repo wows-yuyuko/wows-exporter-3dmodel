@@ -21,7 +21,7 @@ import zlib
 from app.signals import bus
 from app.application import app as app_ctx
 from utils.threading_utils import run_async
-from utils.path_utils import get_data_dir, get_split_dir
+from utils.path_utils import get_data_dir, get_split_dir, model_id_of
 from services.database_service import DatabaseManager, ShipRow, reset_db
 
 from services import GameParams as _GameParamsModule
@@ -57,12 +57,6 @@ def _entity_type(v) -> str:
     if isinstance(ti, dict):
         return str(ti.get('type') or '')
     return str(getattr(ti, 'type', '') or '')
-
-
-def _model_of(model_path: str) -> str:
-    """`.model` 的 VFS 路径 → 模型目录名（父目录）。"""
-    parts = [p for p in str(model_path or "").replace("\\", "/").split("/") if p]
-    return parts[-2] if len(parts) >= 2 else ""
 
 
 def _iter_mounts(entity: dict):
@@ -105,7 +99,7 @@ def _build_ship_rows(ships: dict[str, dict]) -> tuple[list[ShipRow], dict[str, l
         hull_model = ""
         pairs: list[tuple[str, str]] = []
         for role, path in _iter_mounts(v):
-            folder = _model_of(path)
+            folder = model_id_of(path)
             if not folder:
                 continue
             info = model_info.setdefault(folder, {"model_path": path, "kind": "mount"})

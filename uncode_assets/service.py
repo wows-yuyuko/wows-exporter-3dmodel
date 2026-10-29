@@ -427,3 +427,28 @@ class AssetsBinService:
         """释放引用（帮助 GC 回收大块内存）。"""
         self._db = None
         self._vfs = None
+
+
+FX_SUFFIX = ".fx"
+
+
+def resolve_fx_path(db, material_hash) -> str:
+    """material_hash（``"0x..."`` 或 int）→ fx 完整路径；无法解析返回空串。
+
+    Args:
+        db: assets.bin 解析出的 :class:`PrototypeDatabase`（可为 None）。
+        material_hash: 材质记录里的 selfId（十进制 int 或十六进制字符串）。
+    """
+    if db is None or material_hash in (None, "", 0, "0"):
+        return ""
+    try:
+        value = int(material_hash, 16) if isinstance(material_hash, str) else int(material_hash)
+    except (TypeError, ValueError):
+        return ""
+    if not value:
+        return ""
+    try:
+        path = db.resolve_self_path(value)
+    except Exception:  # noqa: BLE001
+        return ""
+    return path if (path or "").lower().endswith(FX_SUFFIX) else ""

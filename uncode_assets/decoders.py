@@ -328,7 +328,7 @@ def _decode_material_legacy(data: bytes, db: PrototypeDatabase) -> dict:
 
     return {
         "_type": "MaterialPrototype",
-        # 远古版本没有 shader_id；fx 由 +0x00 的 selfId 反查（mfm_fx.resolve_fx_path）
+        # 远古版本没有 shader_id；fx 由 +0x00 的 selfId 反查（service.resolve_fx_path）
         "fx": f"0x{fx_id:016X}",
         "collisionFlags": 0 if cflags_raw in (0, 0xFFFFFFFF) else cflags_raw & 0xFF,
         "sortOrder": 0 if sort_raw == 0xFFFFFFFF else sort_raw,
@@ -442,7 +442,7 @@ def decode_material(data: bytes, db: PrototypeDatabase) -> dict:
     return {
         "_type": "MaterialPrototype",
         # 官方 ModsSDK 明文格式（<mfm><fx>/<collisionFlags>/<property>）
-        # 二进制里没有 fx 字符串：fx 路径由 uncode_assets.mfm_fx 从 material_hash
+        # 二进制里没有 fx 字符串：fx 路径由 uncode_assets.service.resolve_fx_path 从 material_hash
         # （fx 资源 selfId）独立解析，本函数保持纯材质解码，不掺 fx 逻辑。
         "fx": f"0x{shader_id:08X}",
         # collisionFlags = WG +0x70（低 8 位有效）：碰撞面标记（写进碰撞三角 flags
