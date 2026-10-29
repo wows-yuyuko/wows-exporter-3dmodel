@@ -29,6 +29,7 @@ import json
 import sqlite3
 import struct
 import time
+from pathlib import Path
 
 from services.proto_render_sets import (
     name_of, path_of, render_sets_lesta_one, render_sets_wg,
