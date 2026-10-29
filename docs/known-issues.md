@@ -87,6 +87,7 @@
 | 删 `name_mappings` / 显示名（2026-10-28） | 产物不需要中文名；`_resolve_ship_name()` 与 `.po/.mo` 读取一起移除 |
 | 增量同步（2026-10-28） | 同 build 重复 `import` 从 ~4 min 降到 **18 s**；快照 sha1 没变就不重写（占整库 84% 的那部分） |
 | 二级索引 | 去掉 `idx_rs_geom` / `idx_bones_stem`（主键前缀已覆盖），只留 `idx_rs_model` |
+| 涂装三表恒为 0（2026-10-30） | `populate()` 里 `Path(game_dir)` 的 `Path` 在裁 import 时被误删 → `NameError` 被 `except` 吞掉，`camouflages` / `camouflage_color_schemes` / `camo_ship_groups` 两服一直空。修好后 Lesta 385 / 868 / 1,024、WG 505 / 1 / 1,076 |
 
 ### B. 待做：assets_data 按路径类型裁剪
 

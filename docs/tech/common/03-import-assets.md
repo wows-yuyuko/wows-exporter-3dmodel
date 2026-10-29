@@ -117,23 +117,27 @@ peculiarityModels / renderSetsStates / miscFilter / planesConfig / decalsEnabled
 类型表按 magic 识别，**不能按 blob index 套用另一服的表**
 （`uncode_assets/types.py` 顶部注释）。类型查询走 thread-local 的当前服务器上下文。
 
-## 5. 实测规模（2026-10-26）
+## 5. 实测规模（2026-10-30，全量 `--rebuild`）
 
 | 指标 | Lesta | WG |
 |---|---|---|
 | `assets_data*.db` | 554 MB | 623 MB |
-| `render_set` | 399,008 | 392,305 |
-| `material_full` | pbs 16,357 / indexed 192 / other 12,772 | pbs 19,708 / other 12,040 / indexed 0 |
+| `render_set` | 402,395 | 388,129 |
+| `skeleton_mounts` | 483,925 | 630,354 |
+| `skeleton_bones` | 812,395 | 876,588 |
+| `material_full` | 29,688 | 31,487 |
+| `mfm_textures` | 27,475 | 30,770 |
 | `exteriors` | 1,915 | 2,362 |
-| `camouflages` | 384 | 515 |
-| `shape_names` | 有（受 `bin_folder` 精确匹配影响） | 同上 |
+| `camouflages` | 385 | 505 |
+| `camo_ship_groups` | 1,024 | 1,076 |
 
-## 6. 已知不一致（导入后要复查）
+> 涂装三项（`camouflages` / `camouflage_color_schemes` / `camo_ship_groups`）
+> 在 2026-10-30 之前**恒为 0** —— `populate()` 里 `Path(game_dir)` 的 `Path`
+> 被误删（`from pathlib import Path` 缺失），异常被 `except` 吞掉。修好后两服
+> 分别入库 385 / 868 / 1,024 与 505 / 1 / 1,076 条。
 
-`assets_data*.db` 的 `meta.bin_folder` 必须与 `bin/` 实际目录一致。
-WG 当前库里是 **13488861**，而客户端 `bin/` 是 `13187581` / `13357625`：
-- `meta` 只用来展示，不影响导出；
-- 但 `shape_names` 按 `bin_folder` 精确过滤 → **查空**，LOD/crack 的名字兜底失效
-  （几何侧改用 `render_set` 自带 `shape`，所以导出的 LOD 选择仍然正确）。
+## 6. 已解决：库与客户端 build 不一致
 
-客户端更新后重跑一次 `import` 即可修好。
+旧版把 `bin_folder` 当主键维度，库里的 build 与客户端 `bin/` 对不上时
+`shape_names` 会查空。schema v19 起 build 只记在 `meta.build`，不再参与过滤，
+「库过期」只会让 `import` 走一次全量，不会查空。

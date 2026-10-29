@@ -199,6 +199,627 @@ class AssetsCacheService(SqliteStore):
     # ── 入库（「加载数据」时调用）────────────────────────────
 
 
+    @staticmethod
+    def _scan_prototype_files(svc) -> dict:
+        """一次遍历 VFS 全树，按 prototype 类型分桶（4 个阶段各取所需）。
+
+        45 万条记录只扫一遍：骨架（Korabli）、Visual / SkeletonExtender（WG）、
+        材质 .mfm。单次遍历约 10 s，分阶段各扫一遍会翻四倍。
+        """
+        buckets: dict[str, list] = {"skel": [], "vis": [], "ext": [], "mfm": []}
+        for f in svc.vfs.all_files():
+            try:
+                pt = f.prototype_type
+                if pt is None:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            name = pt.name
+            if name == "SkeletonPrototype":
+                buckets["skel"].append(f)
+            elif name == "MaterialPrototype" and f.path.endswith(".mfm"):
+                buckets["mfm"].append(f)
+            elif name == "VisualPrototype" and f.path.endswith(".visual"):
+                buckets["vis"].append(f)
+            elif name == "SkeletonExtenderPrototype" and f.path.endswith(".skel_ext"):
+                buckets["ext"].append(f)
+        return buckets
+
+    def _populate_skeletons(self, svc, db, sdict, self_id_idx,
+                            skel_files, vis_files, ext_files,
+                            models, full: bool, counts: dict, _p) -> None:
+        """骨架挂点 + 完整骨骼世界矩阵 → skeleton_mounts / skeleton_bones。
+
+        Korabli 走 SkeletonPrototype；WG 走 Visual nodes（HP_）+ SkeletonExtender（MP_/SP_/EP_）。
+        必须分批落库：Lesta 有近 4 万个骨架，攒齐再写要吃约 800 MB。
+        """
+        # 1) 骨架挂点 + 完整骨骼世界矩阵（bind pose 按 parent 累积）
+        #    Korabli：SkeletonPrototype；WG：Visual nodes（HP_）+ SkeletonExtender（MP_）
+        #
+        # ⚠️ 必须**分批落库**：Lesta 有 39793 个骨架 → 约 102 万骨骼行 + 66 万挂点行。
+        #    若先把它们全部攒在 Python 列表里、最后再一次性 executemany，光这些 13 元组
+        #    就要 ~800MB 常驻（叠在本服务自身 ~800MB 之上）→ 触发换页，整个阶段看起来
+        #    像卡死（用户实测：日志停在「解析舰体骨架挂点与骨骼」不再前进）。
+        #    每 SKEL_FLUSH 个骨架写一批并 clear()，峰值内存恒定在几十 MB。
+        #    事务仍然只有一个（末尾统一 commit）→ 中途被强杀时整体回滚，不会留半成品。
+        import numpy as np
+        skel_rows: list[tuple] = []
+        bone_rows: list[tuple] = []
+        skel_failed: list[str] = []
+        n_skel = len(skel_files)
+        tot_mounts = 0
+        tot_bones = 0
+        _t_skel = time.time()
+
+        def _flush_skel() -> None:
+            """把已累积的挂点/骨骼行写库并清空（内存有界）。"""
+            nonlocal tot_mounts, tot_bones
+            if skel_rows:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO skeleton_mounts "
+                    "(model_id, hp_name, "
+                    "pos_x, pos_y, pos_z, rot_qx, rot_qy, rot_qz, rot_qw, "
+                    "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    skel_rows)
+                tot_mounts += len(skel_rows)
+                skel_rows.clear()
+            if bone_rows:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO skeleton_bones "
+                    "(model_id, bone_name, "
+                    "pos_x, pos_y, pos_z, rot_qx, rot_qy, rot_qz, rot_qw, "
+                    "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    bone_rows)
+                tot_bones += len(bone_rows)
+                bone_rows.clear()
+
+        for _si, f in enumerate(skel_files, 1):
+            if _si % SKEL_FLUSH == 0:
+                _flush_skel()
+            if _si % SKEL_LOG == 0 and n_skel > SKEL_LOG:
+                _p(f"骨架解析 {_si}/{n_skel}"
+                   f"（骨骼 {tot_bones + len(bone_rows):,} / "
+                   f"挂点 {tot_mounts + len(skel_rows):,}，"
+                   f"已用 {time.time() - _t_skel:.0f}s）...")
+            stem = model_id_of(f.path)
+            if not stem:
+                continue
+            # 增量：只重建变更集里的模型，其余整个跳过（省掉解码 + 写库）
+            if not full and stem not in models:
+                continue
+            try:
+                sk = svc.decode_skeleton_path(f.path)
+            except Exception as exc:  # noqa: BLE001
+                skel_failed.append(f"{stem}({exc})")
+                continue
+            names = sk.get("name_ids") or []
+            mats = sk.get("matrices") or []
+            parents = sk.get("parent_ids") or []
+            n = len(names)
+            # 完整骨骼世界矩阵（与 geometry_service._skeleton_bone_world 一致）
+            if n and n == len(mats):
+                try:
+                    local = [np.array(mats[i], dtype=np.float32).reshape(4, 4).T
+                             for i in range(n)]
+                    w: list = [None] * n
+                    for i in range(n):
+                        p = parents[i] if i < len(parents) else 65535
+                        if p >= n or p == i or p == 65535:
+                            w[i] = local[i]
+                        else:
+                            w[i] = (w[p] if w[p] is not None
+                                    else np.eye(4, dtype=np.float32)) @ local[i]
+                    for i, nm in enumerate(names):
+                        if i < len(w) and w[i] is not None:
+                            # 统一用 _decompose_mat 分解（含反射 det=-1 处理：
+                            # 否则 Root_BlendBone 等 Z 镜像骨骼会被存成恒等 → 主炮/副炮方向翻转）
+                            pos, quat, scale = self._decompose_mat(w[i])
+                            bone_rows.append((
+                                stem, str(nm),
+                                float(pos[0]), float(pos[1]), float(pos[2]),
+                                quat[0], quat[1], quat[2], quat[3],
+                                scale[0], scale[1], scale[2]))
+                except Exception:  # noqa: BLE001
+                    pass
+            # HP_/MP_ 挂点（舰船骨架定位用；存解码后坐标/四元数/缩放）
+            # MP_ 为甲板设备挂点（缆桩/小艇/探照灯等 misc 模型），v5 起纳入；
+            # 其 parent 恒为 Scene Root，原始矩阵即船空间 bind pose
+            for i, n in enumerate(names):
+                if not (isinstance(n, str)
+                        and (n.startswith("HP_") or n.startswith("MP_"))):
+                    continue
+                if i >= len(mats) or not mats[i] or len(mats[i]) < 16:
+                    continue
+                m = np.array(mats[i], dtype=np.float32).reshape(4, 4).T
+                pos, quat, scale = self._decompose_mat(m)
+                skel_rows.append((stem, n,
+                                  pos[0], pos[1], pos[2],
+                                  quat[0], quat[1], quat[2], quat[3],
+                                  scale[0], scale[1], scale[2]))
+        # WG：Visual nodes（HP_ 挂点 + 骨骼）+ SkeletonExtender（MP_/SP_/EP_ 挂点）
+        if self._is_wg():
+            self._populate_wg_skeleton(
+                svc, db, sdict, self_id_idx,
+                vis_files, ext_files, skel_rows, bone_rows, skel_failed,
+                flush_cb=_flush_skel,
+                models=models, note_cb=_p,
+                log_cb=lambda i, n: _p(
+                    f"WG 骨架解析 {i}/{n}"
+                    f"（骨骼 {tot_bones + len(bone_rows):,} / "
+                    f"挂点 {tot_mounts + len(skel_rows):,}，"
+                    f"已用 {time.time() - _t_skel:.0f}s）..."))
+        _flush_skel()
+        if skel_failed:
+            sample = ", ".join(skel_failed[:5])
+            more = f" 等 {len(skel_failed)} 个" if len(skel_failed) > 5 else ""
+            _p(f"⚠️ {len(skel_failed)} 个骨架解码失败: {sample}{more}")
+        counts["skeleton"] = tot_mounts
+        counts["skeleton_bones"] = tot_bones
+        skel_rows.clear()
+        bone_rows.clear()
+
+    def _populate_render_sets(self, db, sdict, self_id_idx, models, full: bool,
+                              counts: dict, _p) -> None:
+        """VisualPrototype 渲染集 → render_set（+ shape 名称哈希表）。
+
+        40 万行级别，攒成列表要几百 MB，所以边解析边按 PK 汇总到字典
+        （同一 (geom_path, shape) 可能出现在多条记录里，必须全阶段并集），
+        解析完再一次分块写库。
+        """
+        _p("解析视觉渲染集（shape → 材质/mfm 引用）...")
+
+        # 2) 视觉渲染集（VisualPrototype 渲染集区 → shape/材质/mfm）
+        #    行数可达 40 万+，直接攒成列表要几百 MB → 改为**边解析边按 PK 汇总到字典**
+        #    （字典比原始行省内存：同 PK 折叠），解析全部完成后分块写库。
+        #    ★ 字典**不能中途清空**：同一 (geom_path, shape) 可能出现在多个记录里，
+        #      需要全阶段并集，才与旧的批量 _merge_render_set_rows 完全等价。
+        rs_merged: dict[tuple, list] = {}
+        tot_rs = 0
+        _t_rs = time.time()
+
+        def _add_rs(row: tuple) -> None:
+            """按 PK(geom_path, shape) 汇总节点调色板（流式，内存有界）。"""
+            self._merge_render_set_into(rs_merged, row)
+
+        def _write_rs() -> None:
+            """汇总字典 → 分块写库（解析结束后调**一次**，字典内容不变）。"""
+            nonlocal tot_rs
+            if not rs_merged:
+                return
+            buf: list[tuple] = []
+            for k, v in rs_merged.items():
+                buf.append((k[0], k[1], v[0], v[1], v[2], v[3], int(v[4]),
+                            json.dumps(v[5])))
+                if len(buf) >= RS_CHUNK:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO render_set "
+                        "(geom_path, shape, model_id, material, mfm, damage, "
+                        "skinned, nodes) VALUES (?,?,?,?,?,?,?,?)", buf)
+                    tot_rs += len(buf)
+                    buf.clear()
+            if buf:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO render_set "
+                    "(geom_path, shape, model_id, material, mfm, damage, "
+                    "skinned, nodes) VALUES (?,?,?,?,?,?,?,?)", buf)
+                tot_rs += len(buf)
+                buf.clear()
+
+        try:
+            from uncode_assets.parser import BLOB_HEADER_SIZE
+            from uncode_assets.types import type_from_magic
+            vis = next((b for b in db.databases if (lambda t: t and
+                       t.name == "VisualPrototype")(
+                type_from_magic(b.prototype_magic))), None)
+            if vis is not None:
+                data = vis.data
+                isize = vis.item_size
+                nrec = vis.record_count
+                wg = self._is_wg()
+                rs_failed: list[str] = []
+                for ri in range(nrec):
+                    if (ri + 1) % RS_LOG == 0 and nrec > RS_LOG:
+                        _p(f"渲染集解析 {ri + 1}/{nrec}"
+                           f"（已汇总 {len(rs_merged):,} 条，"
+                           f"已用 {time.time() - _t_rs:.0f}s）...")
+                    off = BLOB_HEADER_SIZE + ri * isize
+                    # ★ 逐条记录隔离异常：旧实现把整个循环包在同一个 try 里，
+                    #   任意一条坏记录都会让**全部**渲染集解析中断（入库 0 条）。
+                    try:
+                        if wg:
+                            # WG VisualPrototype 0x70 布局（wows-toolkit visual.rs）：
+                            # 渲染集 relptr 在 +0x60，记录头字段与 Korabli 完全不同，
+                            # 走专用 WG 解析（每记录一 geometry → 渲染集 0x28 步长）
+                            self._render_sets_wg(data, off, db, self_id_idx, sdict,
+                                                 _add_rs, models)
+                            continue
+                        if off + 0x40 > len(data):
+                            break
+                        self._render_sets_lesta_one(data, off, db, self_id_idx,
+                                                    sdict, _add_rs, models)
+                    except Exception as exc:  # noqa: BLE001
+                        # 只留前几条：整库为 0 时这就是唯一线索
+                        if len(rs_failed) < 5:
+                            rs_failed.append(repr(exc))
+                        continue
+                if rs_failed:
+                    _p(f"⚠️ {len(rs_failed)}+ 条渲染集记录解析失败: {rs_failed[0]}")
+        except Exception as exc:  # noqa: BLE001
+            _p(f"⚠️ 渲染集解析中断，已入库的仍保留: {exc}")
+        _write_rs()
+        counts["render_sets"] = tot_rs
+        _p(f"渲染集已入库: {tot_rs:,} 条")
+        tot_sn = 0
+        sn_rows: list[tuple] = []
+        for h, nm in sdict.items():
+            if nm.endswith(".vertices"):
+                sn_rows.append((h, nm))
+                if len(sn_rows) >= 50000:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO shape_names "
+                        "(hash, name) VALUES (?,?)", sn_rows)
+                    tot_sn += len(sn_rows)
+                    sn_rows.clear()
+        if sn_rows:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO shape_names (hash, name) "
+                "VALUES (?,?)", sn_rows)
+            tot_sn += len(sn_rows)
+            sn_rows.clear()
+        counts["shape_names"] = tot_sn
+
+    def _populate_materials(self, svc, db, sdict, self_id_idx, mfm_files,
+                            models, full: bool, counts: dict, _p) -> None:
+        """材质 .mfm → material_full + mfm_textures（全局表，每次全刷）。
+
+        一个 mfm 的贴图会被上百条船共用，无法归属到单个模型，所以增量同步
+        也整表重写（约 3 万行 / 20 MB）。
+        """
+        _p(f"解析材质（{len(mfm_files)} 个 mfm 文件）...")
+
+        # 3) 材质：mfm_textures（diffuseMap 原始路径）+ material_full（完整：
+        #    shader_id / 所有贴图原始路径 / INDEXED vec4 数组）。
+        #    只存路径与参数，贴图字节渲染时实时从客户端 pkg 解包。
+        from uncode_assets import binary as B
+        from uncode_assets.decoders import (
+            _read_typed_value,
+            material_array_lengths,
+            material_ool_end,
+        )
+        from uncode_assets.service import resolve_fx_path
+        mfm_rows: list[tuple] = []
+        mf_rows: list[tuple] = []
+        mfm_failed: list[str] = []
+        wg_mat = self._is_wg()
+        # 同样分批落库：material_full 每行带 INDEXED vec4 的 JSON（可达数 KB），
+        # 3 万条全攒在内存里同样是几百 MB
+        n_mfm = len(mfm_files)
+        tot_mfm = 0
+        tot_mf = 0
+        _t_mf = time.time()
+
+        def _flush_mf() -> None:
+            nonlocal tot_mfm, tot_mf
+            if mfm_rows:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO mfm_textures "
+                    "(mfm_path, texture_path) VALUES (?,?)",
+                    mfm_rows)
+                tot_mfm += len(mfm_rows)
+                mfm_rows.clear()
+            if mf_rows:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO material_full "
+                    "(mfm_path, shader_id, family, material_hash, "
+                    "fx_path, textures, indexed) VALUES (?,?,?,?,?,?,?)", mf_rows)
+                tot_mf += len(mf_rows)
+                mf_rows.clear()
+
+        for _mi, f in enumerate(mfm_files, 1):
+            if len(mf_rows) >= MF_FLUSH:
+                _flush_mf()
+            if _mi % MF_LOG == 0:
+                _flush_mf()
+                if n_mfm > MF_LOG:
+                    _p(f"材质解析 {_mi}/{n_mfm}"
+                       f"（完整材质 {tot_mf:,} 条 / 贴图映射 {tot_mfm:,} 条，"
+                       f"已用 {time.time() - _t_mf:.0f}s）...")
+            try:
+                data = svc.vfs.open_file_len(f.path, 0x78 if wg_mat else 0x90)
+            except Exception as exc:  # noqa: BLE001
+                mfm_failed.append(f"{f.path.rsplit('/', 1)[-1]}({exc})")
+                continue
+            if len(data) < (0x78 if wg_mat else 0x88):
+                continue
+            pc = B.read_u16(data, 0x00)
+            if not pc:
+                continue
+            if wg_mat:
+                # WG MaterialPrototype 0x78 布局（wows-toolkit material.rs）：
+                # +0x00 u16 property_count / +0x02 u16 flags /
+                # +0x04 u32 shader_id / +0x08 u64 reserved /
+                # +0x10 names_ptr / +0x18 type_idx_ptr /
+                # +0x20..+0x60 type_ptrs[9] / +0x68 material_hash
+                shader_id = B.read_u32(data, 0x04)
+                mat_hash = B.read_u64(data, 0x68)
+                names_ptr = B.read_u64(data, 0x10)
+                type_idx_ptr = B.read_u64(data, 0x18)
+                type_ptrs = {t: B.read_u64(data, 0x20 + t * 8) for t in range(9)}
+            else:
+                # Korabli 0x88 布局
+                shader_id = B.read_u32(data, 0x08)
+                mat_hash = B.read_u64(data, 0x78)
+                names_ptr = B.read_u64(data, 0x18)
+                type_idx_ptr = B.read_u64(data, 0x20)
+                type_ptrs = {t: B.read_u64(data, 0x30 + t * 8) for t in range(9)}
+            tptr4 = type_ptrs.get(4) or 0
+            vec4_ptr = type_ptrs.get(7) or 0
+            # ⚠️ 指针**先做合理性校验**再参与切片长度计算：个别材质记录的
+            #    OOL 指针是垃圾值（如 0x30000000E），旧实现直接拿去算 need →
+            #    随后的 parse_u32_array 抛 OutOfBounds，把整个 3D 缓存入库打断。
+            size = len(data)
+            _PTR_LIMIT = 64 * 1024 * 1024   # OOL 区上限（材质记录尾部远小于此）
+
+            def _plausible(p: int, n: int) -> bool:
+                return 0 < p <= _PTR_LIMIT and p + n <= _PTR_LIMIT
+
+            need = 0x90
+            for _ptr, _n in ((names_ptr, pc * 4), (type_idx_ptr, pc * 2),
+                             (tptr4, pc * 8), (vec4_ptr, 4096 * 16 + 64)):
+                if _plausible(_ptr, _n):
+                    need = max(need, _ptr + _n)
+            # 至少读到下一条记录的头（数组长度推断要用后继记录的 OOL 起点界定
+            # 「最后一组」的结束；见 uncode_assets.decoders.material_array_lengths）
+            need = max(need, (0x78 if wg_mat else 0x88) + 0x90)
+            if need + 8 > size:
+                try:
+                    data = svc.vfs.open_file_len(f.path, need + 8)
+                except Exception:  # noqa: BLE001
+                    continue
+                size = len(data)
+
+            def _ok_ptr(p: int, n: int) -> bool:
+                return 0 < p and p + n <= size
+
+            if not _ok_ptr(names_ptr, pc * 4) or not _ok_ptr(type_idx_ptr, pc * 2):
+                mfm_failed.append(f"{f.path.rsplit('/', 1)[-1]}(属性表指针异常)")
+                continue
+            names = B.parse_u32_array(data, names_ptr, pc)
+            type_idx = B.parse_u16_array(data, type_idx_ptr, pc)
+            if not _ok_ptr(tptr4, pc * 8):
+                tptr4 = 0
+            if not _ok_ptr(vec4_ptr, 16):
+                vec4_ptr = 0
+            textures: dict = {}
+            vec4s: list = []
+            diff_base = ""
+            # 每个属性的值数组元素数（最后一组按 OOL 边界界定，避免多读下一条
+            # 材质的 OOL 数据 → 出现 1e28 / 1e36 之类的假数值）
+            arr_lens = material_array_lengths(
+                data, pc, type_idx, type_ptrs,
+                material_ool_end(data, wg_mat), wg_mat)
+            for i in range(pc):
+                ti = type_idx[i] if i < len(type_idx) else 0
+                ptype = ti & 0xF
+                pidx = ti >> 4
+                raw_name = names[i] if i < len(names) else 0
+                # 数组名优先查 sdict（shape/贴图名缓存），缺失时回退 db.strings 完整表
+                # （⚠️ tileIdxMatIdArr/offsetScaleMatIdArr/artStrengthMatIdArr 等在 sdict 缺失，
+                #   必须用 db.strings 解析，否则 INDEXED 分块数组被漏提取）
+                nm = (sdict.get(raw_name & 0xFFFFFFFF)
+                      or db.strings.get_string_or_hex(raw_name)
+                      or "")
+                if ptype == 4:
+                    value = _read_typed_value(data, tptr4, 4, pidx)
+                    if isinstance(value, int) and value:
+                        vp = self._path_of(value, db, self_id_idx)
+                        if vp:
+                            if nm == "diffuseMap" and not diff_base:
+                                diff_base = vp
+                            textures[nm or f"tex_{i}"] = vp
+                elif ptype == 7 and nm:
+                    vec4s.append((i, raw_name, pidx))
+            if diff_base:
+                mfm_rows.append((self._norm_vfs_path(f.path), diff_base))
+            # INDEXED vec4 数组（长度按 material_array_lengths 推断）
+            indexed: dict = {}
+            if vec4s and vec4_ptr:
+                for j, (pi, nid, pidx) in enumerate(vec4s):
+                    nm = (sdict.get(nid & 0xFFFFFFFF)
+                          or db.strings.get_string_or_hex(nid)
+                          or f"vec4_{j}")
+                    length = arr_lens.get(pi, 1)
+                    off = vec4_ptr + pidx * 16
+                    vals = []
+                    for k in range(length):
+                        o = off + k * 16
+                        if o + 16 <= len(data):
+                            vals.append([round(float(x), 6) for x in B.parse_vec4(data, o)])
+                    if vals:
+                        indexed[nm] = vals
+            family = material_family(f"0x{shader_id:08X}")
+            # fx 路径：material_hash（fx 资源 selfId）→ assets.bin 路径树。
+            # 解析逻辑在 uncode_assets.service.resolve_fx_path（只依赖 PrototypeDatabase），
+            # 不依赖任何随源码打包的固定映射表。
+            fx_path = resolve_fx_path(db, f"0x{mat_hash:016X}")
+            mf_rows.append((self._norm_vfs_path(f.path), f"0x{shader_id:08X}", family,
+                            f"0x{mat_hash:016X}", fx_path,
+                            json.dumps(textures), json.dumps(indexed)))
+        if mfm_failed:
+            sample = ", ".join(mfm_failed[:5])
+            more = f" 等 {len(mfm_failed)} 个" if len(mfm_failed) > 5 else ""
+            _p(f"⚠️ {len(mfm_failed)} 个材质文件读取失败: {sample}{more}")
+        _flush_mf()
+        counts["mfm_textures"] = tot_mfm
+        counts["material_full"] = tot_mf
+
+    def _populate_exteriors(self, game_dir, bin_folder: str, wows_type: str,
+                            counts: dict, _p) -> None:
+        """外观（GameParams Exterior）与涂装（camouflages.xml）→ 全局表。
+
+        两张表被多船共用、无法归属到单个模型，所以**每次同步全刷**。
+        这里失败不致命（涂装只影响命名/配色），捕获后打日志继续。
+        """
+        _p("写入外观（Exterior）与涂装（camouflages.xml）数据...")
+        # 共享单个 GameExtractor（仅当需要从 pkg 读涂装时才建），惰性建一次复用。
+        shared_ext = None
+
+
+        def _ext_factory():
+            nonlocal shared_ext
+            if shared_ext is None and game_dir:
+                from data_extractor import GameExtractor
+                shared_ext = GameExtractor(str(game_dir), bin_folder=bin_folder)
+            return shared_ext
+        # 9) Exterior 实体（GameParams 直读）→ exteriors 表
+        try:
+            from core.gameparams import (EXTERIOR_DATA_KEYS, exterior_entities,
+                                         locate as gp_locate)
+            # 数据源只有 GameParams 一份（split 目录已不再产出）；
+            # 这里不解包（extract=False）：import 链路上 GameParams 已由 CLI 备好
+            ext_items: list[tuple[str, dict]] = []
+            gp_file = gp_locate(game_dir, wows_type)
+            if gp_file:
+                try:
+                    ext_items = exterior_entities(gp_file)
+                    _p(f"外观数据来源: GameParams（{len(ext_items)} 条）")
+                except Exception as exc:  # noqa: BLE001
+                    _p(f"GameParams 解析外观失败，外观表将为空: {exc}")
+            ext_rows: list[tuple] = []
+            # data_json 只存涂装相关字段，不存整份 Exterior（数千条会撑爆库）
+            ext_sql = ("INSERT OR REPLACE INTO exteriors "
+                       "(ext_index, name, camouflage, species, nation, "
+                       "cost_gold, can_buy, parts_json, custom_json, "
+                       "unpeculiar_camouflage, color_scheme_id, icon_path, data_json) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            tot_ext = 0
+            ext_total = len(ext_items)
+            # 外观条目极多，分批输出进度，避免长时间无任何日志（显得卡死）
+            ext_batch = max(1, ext_total // 20 or 1)
+            for _i, (ext_name, d) in enumerate(ext_items, 1):
+                if not isinstance(d, dict):
+                    continue
+                ti = d.get("typeinfo")
+                if not isinstance(ti, dict):
+                    ti = getattr(ti, "__dict__", {}) or {}
+                ext_index = d.get("index", ext_name)
+                # icon_path 列保留但不再生产（缩略图链路已移除）
+                icon_rel = ""
+                camo_mat = d.get("camouflage", "") or ""
+                ext_rows.append((
+                    ext_index,
+                    ext_name,
+                    camo_mat,
+                    ti.get("species", "") or "",
+                    ti.get("nation", "") or "",
+                    int(d.get("costGold", 0) or 0),
+                    int(bool(d.get("canBuy"))),
+                    json.dumps(d.get("parts", []), ensure_ascii=False),
+                    json.dumps(d.get("custom", {}), ensure_ascii=False),
+                    d.get("unpeculiarCamouflage", "") or "",
+                    int(d.get("unpeculiarCamouflageColorSchemeId", 0) or 0),
+                    icon_rel,
+                    json.dumps({k: d.get(k) for k in EXTERIOR_DATA_KEYS
+                                if d.get(k) is not None}, ensure_ascii=False),
+                ))
+                if len(ext_rows) >= EXT_FLUSH:
+                    self._conn.executemany(ext_sql, ext_rows)
+                    tot_ext += len(ext_rows)
+                    ext_rows.clear()
+                if ext_total > ext_batch and _i % ext_batch == 0:
+                    _p(f"外观数据入库进度 {_i}/{ext_total} ...")
+            if ext_rows:
+                self._conn.executemany(ext_sql, ext_rows)
+                tot_ext += len(ext_rows)
+                ext_rows.clear()
+            counts["exteriors"] = tot_ext
+            _p(f"外观数据已入库: {counts['exteriors']} 条")
+        except Exception as exc:  # noqa: BLE001
+            _p(f"⚠️ 外观数据入库失败: {exc}")
+
+        # 10) camouflages.xml（包根，含 shipgroups/colorschemes/camouflages 三段）
+        #     → camouflages + camouflage_color_schemes 表，供涂装切换器按索引查询。
+        try:
+            from services.camo_service import parse_camouflages
+            camo_xml: bytes | None = None
+            if game_dir:
+                rp = Path(game_dir) / "res_unpack" / "camouflages.xml"
+                if rp.exists():
+                    camo_xml = rp.read_bytes()
+            if camo_xml is None and game_dir:
+                ext = _ext_factory()
+                if ext is not None:
+                    try:
+                        hits = ext.list_files(["camouflages.xml"])
+                        if hits:
+                            e = hits[0]
+                            camo_xml = ext.pkg_reader.read_file(e.volume.filename, e.file_info)
+                    except Exception:  # noqa: BLE001
+                        pass
+            if camo_xml:
+                _p("解析 camouflages.xml（涂装/配色/船组）...")
+                parsed = parse_camouflages(camo_xml)
+                crows: list[tuple] = []
+                csrows: list[tuple] = []
+                for name, variants in (parsed.get("entries") or {}).items():
+                    if not variants:
+                        continue
+                    entry = variants[0]
+                    icon_rel = ""   # 缩略图链路已移除，列保留
+                    crows.append((
+                        name, entry.realm, int(entry.tiled),
+                        int(entry.use_color_scheme),
+                        ",".join(entry.color_schemes
+                                 or ([entry.color_scheme] if entry.color_scheme else [])),
+                        json.dumps(entry.textures, ensure_ascii=False),
+                        json.dumps(
+                            {k: {"scale": list(v.scale), "offset": list(v.offset)}
+                             for k, v in entry.uv_transforms.items()},
+                            ensure_ascii=False),
+                        json.dumps(entry.ship_groups, ensure_ascii=False),
+                        json.dumps(entry.target_ships, ensure_ascii=False),
+                        icon_rel,
+                    ))
+                for cname, cs in (parsed.get("color_schemes") or {}).items():
+                    cols = cs.colors or [[0.0] * 4 for _ in range(4)]
+                    csrows.append((cname,) + tuple(
+                        json.dumps(list(cols[i]), ensure_ascii=False) for i in range(4)))
+                if crows:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO camouflages "
+                        "(name, realm, tiled, use_color_scheme, "
+                        "color_scheme, textures_json, uv_json, "
+                        "ship_groups_json, target_ships_json, icon_path) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)", crows)
+                if csrows:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO camouflage_color_schemes "
+                        "(name, color0, color1, color2, color3) "
+                        "VALUES (?,?,?,?,?)", csrows)
+                # shipgroups.xml 全局船组映射
+                sgrows: list[tuple] = []
+                for gname, ships in (parsed.get("ship_groups") or {}).items():
+                    for s in ships:
+                        sgrows.append((gname, s))
+                if sgrows:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO camo_ship_groups "
+                        "(group_name, ship) VALUES (?,?)", sgrows)
+                counts["camouflages"] = len(crows)
+                counts["camouflage_color_schemes"] = len(csrows)
+                counts["camo_ship_groups"] = len(sgrows)
+                _p(f"涂装数据已入库: {counts['camouflages']} 条 / "
+                   f"配色 {counts['camouflage_color_schemes']} 条 / "
+                   f"船组 {counts['camo_ship_groups']} 条")
+        except Exception:  # noqa: BLE001
+            pass
+
+        if shared_ext is not None:
+            try:
+                shared_ext.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def populate(self, assets_path: str | None = None, bin_folder: str = "",
                  game_version: str = "", wows_type: str = "",
                  game_dir: str | Path | None = None,
@@ -241,8 +862,6 @@ class AssetsCacheService(SqliteStore):
                 except Exception:  # noqa: BLE001
                     pass
 
-        # 共享 pkg 提取器（Exterior/涂装图标；仅在需要时惰性创建），最后由 finally 统一关闭
-        _shared_ext = None
         full = models is None
 
         try:
@@ -277,30 +896,10 @@ class AssetsCacheService(SqliteStore):
 
             _p("清空目标模型（事务内，失败可回滚）并扫描 VFS 全树...")
 
-            # 收集骨架/视觉/扩展/材质文件（一次遍历全树）：
-            #   skel_files: Korabli SkeletonPrototype（HP_/MP_ 挂点 + 骨骼）
-            #   vis_files:  WG VisualPrototype .visual（基础骨架 nodes，含 HP_ 挂点）
-            #   ext_files:  WG SkeletonExtender .skel_ext（MP_/SP_/EP_ 挂点）
-            #   mfm_files:  MaterialPrototype .mfm（材质贴图）
-            skel_files: list = []
-            mfm_files: list = []
-            vis_files: list = []
-            ext_files: list = []
-            for f in svc.vfs.all_files():
-                try:
-                    pt = f.prototype_type
-                    if pt is None:
-                        continue
-                except Exception:  # noqa: BLE001
-                    continue
-                if pt.name == "SkeletonPrototype":
-                    skel_files.append(f)
-                elif pt.name == "MaterialPrototype" and f.path.endswith(".mfm"):
-                    mfm_files.append(f)
-                elif pt.name == "VisualPrototype" and f.path.endswith(".visual"):
-                    vis_files.append(f)
-                elif pt.name == "SkeletonExtenderPrototype" and f.path.endswith(".skel_ext"):
-                    ext_files.append(f)
+            # 一次遍历全树，按 prototype 类型分桶（4 个阶段各取所需）
+            files = self._scan_prototype_files(svc)
+            skel_files, vis_files = files["skel"], files["vis"]
+            ext_files, mfm_files = files["ext"], files["mfm"]
 
             if self._is_wg():
                 _p(f"解析舰体骨架挂点与骨骼（{len(skel_files)} 个骨架文件，"
@@ -310,561 +909,13 @@ class AssetsCacheService(SqliteStore):
             else:
                 _p(f"解析舰体骨架挂点与骨骼（{len(skel_files)} 个骨架文件）...")
 
-            # 1) 骨架挂点 + 完整骨骼世界矩阵（bind pose 按 parent 累积）
-            #    Korabli：SkeletonPrototype；WG：Visual nodes（HP_）+ SkeletonExtender（MP_）
-            #
-            # ⚠️ 必须**分批落库**：Lesta 有 39793 个骨架 → 约 102 万骨骼行 + 66 万挂点行。
-            #    若先把它们全部攒在 Python 列表里、最后再一次性 executemany，光这些 13 元组
-            #    就要 ~800MB 常驻（叠在本服务自身 ~800MB 之上）→ 触发换页，整个阶段看起来
-            #    像卡死（用户实测：日志停在「解析舰体骨架挂点与骨骼」不再前进）。
-            #    每 SKEL_FLUSH 个骨架写一批并 clear()，峰值内存恒定在几十 MB。
-            #    事务仍然只有一个（末尾统一 commit）→ 中途被强杀时整体回滚，不会留半成品。
-            import numpy as np
-            skel_rows: list[tuple] = []
-            bone_rows: list[tuple] = []
-            skel_failed: list[str] = []
-            n_skel = len(skel_files)
-            tot_mounts = 0
-            tot_bones = 0
-            _t_skel = time.time()
-
-            def _flush_skel() -> None:
-                """把已累积的挂点/骨骼行写库并清空（内存有界）。"""
-                nonlocal tot_mounts, tot_bones
-                if skel_rows:
-                    self._conn.executemany(
-                        "INSERT OR REPLACE INTO skeleton_mounts "
-                        "(model_id, hp_name, "
-                        "pos_x, pos_y, pos_z, rot_qx, rot_qy, rot_qz, rot_qw, "
-                        "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                        skel_rows)
-                    tot_mounts += len(skel_rows)
-                    skel_rows.clear()
-                if bone_rows:
-                    self._conn.executemany(
-                        "INSERT OR REPLACE INTO skeleton_bones "
-                        "(model_id, bone_name, "
-                        "pos_x, pos_y, pos_z, rot_qx, rot_qy, rot_qz, rot_qw, "
-                        "scale_x, scale_y, scale_z) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                        bone_rows)
-                    tot_bones += len(bone_rows)
-                    bone_rows.clear()
-
-            for _si, f in enumerate(skel_files, 1):
-                if _si % SKEL_FLUSH == 0:
-                    _flush_skel()
-                if _si % SKEL_LOG == 0 and n_skel > SKEL_LOG:
-                    _p(f"骨架解析 {_si}/{n_skel}"
-                       f"（骨骼 {tot_bones + len(bone_rows):,} / "
-                       f"挂点 {tot_mounts + len(skel_rows):,}，"
-                       f"已用 {time.time() - _t_skel:.0f}s）...")
-                stem = model_id_of(f.path)
-                if not stem:
-                    continue
-                # 增量：只重建变更集里的模型，其余整个跳过（省掉解码 + 写库）
-                if not full and stem not in models:
-                    continue
-                try:
-                    sk = svc.decode_skeleton_path(f.path)
-                except Exception as exc:  # noqa: BLE001
-                    skel_failed.append(f"{stem}({exc})")
-                    continue
-                names = sk.get("name_ids") or []
-                mats = sk.get("matrices") or []
-                parents = sk.get("parent_ids") or []
-                n = len(names)
-                # 完整骨骼世界矩阵（与 geometry_service._skeleton_bone_world 一致）
-                if n and n == len(mats):
-                    try:
-                        local = [np.array(mats[i], dtype=np.float32).reshape(4, 4).T
-                                 for i in range(n)]
-                        w: list = [None] * n
-                        for i in range(n):
-                            p = parents[i] if i < len(parents) else 65535
-                            if p >= n or p == i or p == 65535:
-                                w[i] = local[i]
-                            else:
-                                w[i] = (w[p] if w[p] is not None
-                                        else np.eye(4, dtype=np.float32)) @ local[i]
-                        for i, nm in enumerate(names):
-                            if i < len(w) and w[i] is not None:
-                                # 统一用 _decompose_mat 分解（含反射 det=-1 处理：
-                                # 否则 Root_BlendBone 等 Z 镜像骨骼会被存成恒等 → 主炮/副炮方向翻转）
-                                pos, quat, scale = self._decompose_mat(w[i])
-                                bone_rows.append((
-                                    stem, str(nm),
-                                    float(pos[0]), float(pos[1]), float(pos[2]),
-                                    quat[0], quat[1], quat[2], quat[3],
-                                    scale[0], scale[1], scale[2]))
-                    except Exception:  # noqa: BLE001
-                        pass
-                # HP_/MP_ 挂点（舰船骨架定位用；存解码后坐标/四元数/缩放）
-                # MP_ 为甲板设备挂点（缆桩/小艇/探照灯等 misc 模型），v5 起纳入；
-                # 其 parent 恒为 Scene Root，原始矩阵即船空间 bind pose
-                for i, n in enumerate(names):
-                    if not (isinstance(n, str)
-                            and (n.startswith("HP_") or n.startswith("MP_"))):
-                        continue
-                    if i >= len(mats) or not mats[i] or len(mats[i]) < 16:
-                        continue
-                    m = np.array(mats[i], dtype=np.float32).reshape(4, 4).T
-                    pos, quat, scale = self._decompose_mat(m)
-                    skel_rows.append((stem, n,
-                                      pos[0], pos[1], pos[2],
-                                      quat[0], quat[1], quat[2], quat[3],
-                                      scale[0], scale[1], scale[2]))
-            # WG：Visual nodes（HP_ 挂点 + 骨骼）+ SkeletonExtender（MP_/SP_/EP_ 挂点）
-            if self._is_wg():
-                self._populate_wg_skeleton(
-                    svc, db, sdict, self_id_idx,
-                    vis_files, ext_files, skel_rows, bone_rows, skel_failed,
-                    flush_cb=_flush_skel,
-                    models=models, note_cb=_p,
-                    log_cb=lambda i, n: _p(
-                        f"WG 骨架解析 {i}/{n}"
-                        f"（骨骼 {tot_bones + len(bone_rows):,} / "
-                        f"挂点 {tot_mounts + len(skel_rows):,}，"
-                        f"已用 {time.time() - _t_skel:.0f}s）..."))
-            _flush_skel()
-            if skel_failed:
-                sample = ", ".join(skel_failed[:5])
-                more = f" 等 {len(skel_failed)} 个" if len(skel_failed) > 5 else ""
-                _p(f"⚠️ {len(skel_failed)} 个骨架解码失败: {sample}{more}")
-            counts["skeleton"] = tot_mounts
-            counts["skeleton_bones"] = tot_bones
-            skel_rows.clear()
-            bone_rows.clear()
-
-            _p("解析视觉渲染集（shape → 材质/mfm 引用）...")
-
-            # 2) 视觉渲染集（VisualPrototype 渲染集区 → shape/材质/mfm）
-            #    行数可达 40 万+，直接攒成列表要几百 MB → 改为**边解析边按 PK 汇总到字典**
-            #    （字典比原始行省内存：同 PK 折叠），解析全部完成后分块写库。
-            #    ★ 字典**不能中途清空**：同一 (geom_path, shape) 可能出现在多个记录里，
-            #      需要全阶段并集，才与旧的批量 _merge_render_set_rows 完全等价。
-            rs_merged: dict[tuple, list] = {}
-            tot_rs = 0
-            _t_rs = time.time()
-
-            def _add_rs(row: tuple) -> None:
-                """按 PK(geom_path, shape) 汇总节点调色板（流式，内存有界）。"""
-                self._merge_render_set_into(rs_merged, row)
-
-            def _write_rs() -> None:
-                """汇总字典 → 分块写库（解析结束后调**一次**，字典内容不变）。"""
-                nonlocal tot_rs
-                if not rs_merged:
-                    return
-                buf: list[tuple] = []
-                for k, v in rs_merged.items():
-                    buf.append((k[0], k[1], v[0], v[1], v[2], v[3], int(v[4]),
-                                json.dumps(v[5])))
-                    if len(buf) >= RS_CHUNK:
-                        self._conn.executemany(
-                            "INSERT OR REPLACE INTO render_set "
-                            "(geom_path, shape, model_id, material, mfm, damage, "
-                            "skinned, nodes) VALUES (?,?,?,?,?,?,?,?)", buf)
-                        tot_rs += len(buf)
-                        buf.clear()
-                if buf:
-                    self._conn.executemany(
-                        "INSERT OR REPLACE INTO render_set "
-                        "(geom_path, shape, model_id, material, mfm, damage, "
-                        "skinned, nodes) VALUES (?,?,?,?,?,?,?,?)", buf)
-                    tot_rs += len(buf)
-                    buf.clear()
-
-            try:
-                from uncode_assets.parser import BLOB_HEADER_SIZE
-                from uncode_assets.types import type_from_magic
-                vis = next((b for b in db.databases if (lambda t: t and
-                           t.name == "VisualPrototype")(
-                    type_from_magic(b.prototype_magic))), None)
-                if vis is not None:
-                    data = vis.data
-                    isize = vis.item_size
-                    nrec = vis.record_count
-                    wg = self._is_wg()
-                    rs_failed: list[str] = []
-                    for ri in range(nrec):
-                        if (ri + 1) % RS_LOG == 0 and nrec > RS_LOG:
-                            _p(f"渲染集解析 {ri + 1}/{nrec}"
-                               f"（已汇总 {len(rs_merged):,} 条，"
-                               f"已用 {time.time() - _t_rs:.0f}s）...")
-                        off = BLOB_HEADER_SIZE + ri * isize
-                        # ★ 逐条记录隔离异常：旧实现把整个循环包在同一个 try 里，
-                        #   任意一条坏记录都会让**全部**渲染集解析中断（入库 0 条）。
-                        try:
-                            if wg:
-                                # WG VisualPrototype 0x70 布局（wows-toolkit visual.rs）：
-                                # 渲染集 relptr 在 +0x60，记录头字段与 Korabli 完全不同，
-                                # 走专用 WG 解析（每记录一 geometry → 渲染集 0x28 步长）
-                                self._render_sets_wg(data, off, db, self_id_idx, sdict,
-                                                     _add_rs, models)
-                                continue
-                            if off + 0x40 > len(data):
-                                break
-                            self._render_sets_lesta_one(data, off, db, self_id_idx,
-                                                        sdict, _add_rs, models)
-                        except Exception as exc:  # noqa: BLE001
-                            # 只留前几条：整库为 0 时这就是唯一线索
-                            if len(rs_failed) < 5:
-                                rs_failed.append(repr(exc))
-                            continue
-                    if rs_failed:
-                        _p(f"⚠️ {len(rs_failed)}+ 条渲染集记录解析失败: {rs_failed[0]}")
-            except Exception as exc:  # noqa: BLE001
-                _p(f"⚠️ 渲染集解析中断，已入库的仍保留: {exc}")
-            _write_rs()
-            counts["render_sets"] = tot_rs
-            _p(f"渲染集已入库: {tot_rs:,} 条")
-            tot_sn = 0
-            sn_rows: list[tuple] = []
-            for h, nm in sdict.items():
-                if nm.endswith(".vertices"):
-                    sn_rows.append((h, nm))
-                    if len(sn_rows) >= 50000:
-                        self._conn.executemany(
-                            "INSERT OR REPLACE INTO shape_names "
-                            "(hash, name) VALUES (?,?)", sn_rows)
-                        tot_sn += len(sn_rows)
-                        sn_rows.clear()
-            if sn_rows:
-                self._conn.executemany(
-                    "INSERT OR REPLACE INTO shape_names (hash, name) "
-                    "VALUES (?,?)", sn_rows)
-                tot_sn += len(sn_rows)
-                sn_rows.clear()
-            counts["shape_names"] = tot_sn
-
-            _p(f"解析材质（{len(mfm_files)} 个 mfm 文件）...")
-
-            # 3) 材质：mfm_textures（diffuseMap 原始路径）+ material_full（完整：
-            #    shader_id / 所有贴图原始路径 / INDEXED vec4 数组）。
-            #    只存路径与参数，贴图字节渲染时实时从客户端 pkg 解包。
-            from uncode_assets import binary as B
-            from uncode_assets.decoders import (
-                _read_typed_value,
-                material_array_lengths,
-                material_ool_end,
-            )
-            from uncode_assets.service import resolve_fx_path
-            mfm_rows: list[tuple] = []
-            mf_rows: list[tuple] = []
-            mfm_failed: list[str] = []
-            wg_mat = self._is_wg()
-            # 同样分批落库：material_full 每行带 INDEXED vec4 的 JSON（可达数 KB），
-            # 3 万条全攒在内存里同样是几百 MB
-            n_mfm = len(mfm_files)
-            tot_mfm = 0
-            tot_mf = 0
-            _t_mf = time.time()
-
-            def _flush_mf() -> None:
-                nonlocal tot_mfm, tot_mf
-                if mfm_rows:
-                    self._conn.executemany(
-                        "INSERT OR REPLACE INTO mfm_textures "
-                        "(mfm_path, texture_path) VALUES (?,?)",
-                        mfm_rows)
-                    tot_mfm += len(mfm_rows)
-                    mfm_rows.clear()
-                if mf_rows:
-                    self._conn.executemany(
-                        "INSERT OR REPLACE INTO material_full "
-                        "(mfm_path, shader_id, family, material_hash, "
-                        "fx_path, textures, indexed) VALUES (?,?,?,?,?,?,?)", mf_rows)
-                    tot_mf += len(mf_rows)
-                    mf_rows.clear()
-
-            for _mi, f in enumerate(mfm_files, 1):
-                if len(mf_rows) >= MF_FLUSH:
-                    _flush_mf()
-                if _mi % MF_LOG == 0:
-                    _flush_mf()
-                    if n_mfm > MF_LOG:
-                        _p(f"材质解析 {_mi}/{n_mfm}"
-                           f"（完整材质 {tot_mf:,} 条 / 贴图映射 {tot_mfm:,} 条，"
-                           f"已用 {time.time() - _t_mf:.0f}s）...")
-                try:
-                    data = svc.vfs.open_file_len(f.path, 0x78 if wg_mat else 0x90)
-                except Exception as exc:  # noqa: BLE001
-                    mfm_failed.append(f"{f.path.rsplit('/', 1)[-1]}({exc})")
-                    continue
-                if len(data) < (0x78 if wg_mat else 0x88):
-                    continue
-                pc = B.read_u16(data, 0x00)
-                if not pc:
-                    continue
-                if wg_mat:
-                    # WG MaterialPrototype 0x78 布局（wows-toolkit material.rs）：
-                    # +0x00 u16 property_count / +0x02 u16 flags /
-                    # +0x04 u32 shader_id / +0x08 u64 reserved /
-                    # +0x10 names_ptr / +0x18 type_idx_ptr /
-                    # +0x20..+0x60 type_ptrs[9] / +0x68 material_hash
-                    shader_id = B.read_u32(data, 0x04)
-                    mat_hash = B.read_u64(data, 0x68)
-                    names_ptr = B.read_u64(data, 0x10)
-                    type_idx_ptr = B.read_u64(data, 0x18)
-                    type_ptrs = {t: B.read_u64(data, 0x20 + t * 8) for t in range(9)}
-                else:
-                    # Korabli 0x88 布局
-                    shader_id = B.read_u32(data, 0x08)
-                    mat_hash = B.read_u64(data, 0x78)
-                    names_ptr = B.read_u64(data, 0x18)
-                    type_idx_ptr = B.read_u64(data, 0x20)
-                    type_ptrs = {t: B.read_u64(data, 0x30 + t * 8) for t in range(9)}
-                tptr4 = type_ptrs.get(4) or 0
-                vec4_ptr = type_ptrs.get(7) or 0
-                # ⚠️ 指针**先做合理性校验**再参与切片长度计算：个别材质记录的
-                #    OOL 指针是垃圾值（如 0x30000000E），旧实现直接拿去算 need →
-                #    随后的 parse_u32_array 抛 OutOfBounds，把整个 3D 缓存入库打断。
-                size = len(data)
-                _PTR_LIMIT = 64 * 1024 * 1024   # OOL 区上限（材质记录尾部远小于此）
-
-                def _plausible(p: int, n: int) -> bool:
-                    return 0 < p <= _PTR_LIMIT and p + n <= _PTR_LIMIT
-
-                need = 0x90
-                for _ptr, _n in ((names_ptr, pc * 4), (type_idx_ptr, pc * 2),
-                                 (tptr4, pc * 8), (vec4_ptr, 4096 * 16 + 64)):
-                    if _plausible(_ptr, _n):
-                        need = max(need, _ptr + _n)
-                # 至少读到下一条记录的头（数组长度推断要用后继记录的 OOL 起点界定
-                # 「最后一组」的结束；见 uncode_assets.decoders.material_array_lengths）
-                need = max(need, (0x78 if wg_mat else 0x88) + 0x90)
-                if need + 8 > size:
-                    try:
-                        data = svc.vfs.open_file_len(f.path, need + 8)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    size = len(data)
-
-                def _ok_ptr(p: int, n: int) -> bool:
-                    return 0 < p and p + n <= size
-
-                if not _ok_ptr(names_ptr, pc * 4) or not _ok_ptr(type_idx_ptr, pc * 2):
-                    mfm_failed.append(f"{f.path.rsplit('/', 1)[-1]}(属性表指针异常)")
-                    continue
-                names = B.parse_u32_array(data, names_ptr, pc)
-                type_idx = B.parse_u16_array(data, type_idx_ptr, pc)
-                if not _ok_ptr(tptr4, pc * 8):
-                    tptr4 = 0
-                if not _ok_ptr(vec4_ptr, 16):
-                    vec4_ptr = 0
-                textures: dict = {}
-                vec4s: list = []
-                diff_base = ""
-                # 每个属性的值数组元素数（最后一组按 OOL 边界界定，避免多读下一条
-                # 材质的 OOL 数据 → 出现 1e28 / 1e36 之类的假数值）
-                arr_lens = material_array_lengths(
-                    data, pc, type_idx, type_ptrs,
-                    material_ool_end(data, wg_mat), wg_mat)
-                for i in range(pc):
-                    ti = type_idx[i] if i < len(type_idx) else 0
-                    ptype = ti & 0xF
-                    pidx = ti >> 4
-                    raw_name = names[i] if i < len(names) else 0
-                    # 数组名优先查 sdict（shape/贴图名缓存），缺失时回退 db.strings 完整表
-                    # （⚠️ tileIdxMatIdArr/offsetScaleMatIdArr/artStrengthMatIdArr 等在 sdict 缺失，
-                    #   必须用 db.strings 解析，否则 INDEXED 分块数组被漏提取）
-                    nm = (sdict.get(raw_name & 0xFFFFFFFF)
-                          or db.strings.get_string_or_hex(raw_name)
-                          or "")
-                    if ptype == 4:
-                        value = _read_typed_value(data, tptr4, 4, pidx)
-                        if isinstance(value, int) and value:
-                            vp = self._path_of(value, db, self_id_idx)
-                            if vp:
-                                if nm == "diffuseMap" and not diff_base:
-                                    diff_base = vp
-                                textures[nm or f"tex_{i}"] = vp
-                    elif ptype == 7 and nm:
-                        vec4s.append((i, raw_name, pidx))
-                if diff_base:
-                    mfm_rows.append((self._norm_vfs_path(f.path), diff_base))
-                # INDEXED vec4 数组（长度按 material_array_lengths 推断）
-                indexed: dict = {}
-                if vec4s and vec4_ptr:
-                    for j, (pi, nid, pidx) in enumerate(vec4s):
-                        nm = (sdict.get(nid & 0xFFFFFFFF)
-                              or db.strings.get_string_or_hex(nid)
-                              or f"vec4_{j}")
-                        length = arr_lens.get(pi, 1)
-                        off = vec4_ptr + pidx * 16
-                        vals = []
-                        for k in range(length):
-                            o = off + k * 16
-                            if o + 16 <= len(data):
-                                vals.append([round(float(x), 6) for x in B.parse_vec4(data, o)])
-                        if vals:
-                            indexed[nm] = vals
-                family = material_family(f"0x{shader_id:08X}")
-                # fx 路径：material_hash（fx 资源 selfId）→ assets.bin 路径树。
-                # 解析逻辑在 uncode_assets.service.resolve_fx_path（只依赖 PrototypeDatabase），
-                # 不依赖任何随源码打包的固定映射表。
-                fx_path = resolve_fx_path(db, f"0x{mat_hash:016X}")
-                mf_rows.append((self._norm_vfs_path(f.path), f"0x{shader_id:08X}", family,
-                                f"0x{mat_hash:016X}", fx_path,
-                                json.dumps(textures), json.dumps(indexed)))
-            if mfm_failed:
-                sample = ", ".join(mfm_failed[:5])
-                more = f" 等 {len(mfm_failed)} 个" if len(mfm_failed) > 5 else ""
-                _p(f"⚠️ {len(mfm_failed)} 个材质文件读取失败: {sample}{more}")
-            _flush_mf()
-            counts["mfm_textures"] = tot_mfm
-            counts["material_full"] = tot_mf
-
-            _p("写入外观（Exterior）与涂装（camouflages.xml）数据...")
-            # 共享单个 GameExtractor（仅当需要从 pkg 读涂装时才建），惰性建一次复用。
-            def _ext_factory():
-                nonlocal _shared_ext
-                if _shared_ext is None and game_dir:
-                    from data_extractor import GameExtractor
-                    _shared_ext = GameExtractor(str(game_dir), bin_folder=bin_folder)
-                return _shared_ext
-            # 9) Exterior 实体（GameParams 直读）→ exteriors 表
-            try:
-                from core.gameparams import (EXTERIOR_DATA_KEYS, exterior_entities,
-                                             locate as gp_locate)
-                # 数据源只有 GameParams 一份（split 目录已不再产出）；
-                # 这里不解包（extract=False）：import 链路上 GameParams 已由 CLI 备好
-                ext_items: list[tuple[str, dict]] = []
-                gp_file = gp_locate(game_dir, wows_type)
-                if gp_file:
-                    try:
-                        ext_items = exterior_entities(gp_file)
-                        _p(f"外观数据来源: GameParams（{len(ext_items)} 条）")
-                    except Exception as exc:  # noqa: BLE001
-                        _p(f"GameParams 解析外观失败，外观表将为空: {exc}")
-                ext_rows: list[tuple] = []
-                # data_json 只存涂装相关字段，不存整份 Exterior（数千条会撑爆库）
-                ext_sql = ("INSERT OR REPLACE INTO exteriors "
-                           "(ext_index, name, camouflage, species, nation, "
-                           "cost_gold, can_buy, parts_json, custom_json, "
-                           "unpeculiar_camouflage, color_scheme_id, icon_path, data_json) "
-                           "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
-                tot_ext = 0
-                ext_total = len(ext_items)
-                # 外观条目极多，分批输出进度，避免长时间无任何日志（显得卡死）
-                ext_batch = max(1, ext_total // 20 or 1)
-                for _i, (ext_name, d) in enumerate(ext_items, 1):
-                    if not isinstance(d, dict):
-                        continue
-                    ti = d.get("typeinfo")
-                    if not isinstance(ti, dict):
-                        ti = getattr(ti, "__dict__", {}) or {}
-                    ext_index = d.get("index", ext_name)
-                    # icon_path 列保留但不再生产（缩略图链路已移除）
-                    icon_rel = ""
-                    camo_mat = d.get("camouflage", "") or ""
-                    ext_rows.append((
-                        ext_index,
-                        ext_name,
-                        camo_mat,
-                        ti.get("species", "") or "",
-                        ti.get("nation", "") or "",
-                        int(d.get("costGold", 0) or 0),
-                        int(bool(d.get("canBuy"))),
-                        json.dumps(d.get("parts", []), ensure_ascii=False),
-                        json.dumps(d.get("custom", {}), ensure_ascii=False),
-                        d.get("unpeculiarCamouflage", "") or "",
-                        int(d.get("unpeculiarCamouflageColorSchemeId", 0) or 0),
-                        icon_rel,
-                        json.dumps({k: d.get(k) for k in EXTERIOR_DATA_KEYS
-                                    if d.get(k) is not None}, ensure_ascii=False),
-                    ))
-                    if len(ext_rows) >= EXT_FLUSH:
-                        self._conn.executemany(ext_sql, ext_rows)
-                        tot_ext += len(ext_rows)
-                        ext_rows.clear()
-                    if ext_total > ext_batch and _i % ext_batch == 0:
-                        _p(f"外观数据入库进度 {_i}/{ext_total} ...")
-                if ext_rows:
-                    self._conn.executemany(ext_sql, ext_rows)
-                    tot_ext += len(ext_rows)
-                    ext_rows.clear()
-                counts["exteriors"] = tot_ext
-                _p(f"外观数据已入库: {counts['exteriors']} 条")
-            except Exception as exc:  # noqa: BLE001
-                _p(f"⚠️ 外观数据入库失败: {exc}")
-
-            # 10) camouflages.xml（包根，含 shipgroups/colorschemes/camouflages 三段）
-            #     → camouflages + camouflage_color_schemes 表，供涂装切换器按索引查询。
-            try:
-                from services.camo_service import parse_camouflages
-                camo_xml: bytes | None = None
-                if game_dir:
-                    rp = Path(game_dir) / "res_unpack" / "camouflages.xml"
-                    if rp.exists():
-                        camo_xml = rp.read_bytes()
-                if camo_xml is None and game_dir:
-                    ext = _ext_factory()
-                    if ext is not None:
-                        try:
-                            hits = ext.list_files(["camouflages.xml"])
-                            if hits:
-                                e = hits[0]
-                                camo_xml = ext.pkg_reader.read_file(e.volume.filename, e.file_info)
-                        except Exception:  # noqa: BLE001
-                            pass
-                if camo_xml:
-                    _p("解析 camouflages.xml（涂装/配色/船组）...")
-                    parsed = parse_camouflages(camo_xml)
-                    crows: list[tuple] = []
-                    csrows: list[tuple] = []
-                    for name, variants in (parsed.get("entries") or {}).items():
-                        if not variants:
-                            continue
-                        entry = variants[0]
-                        icon_rel = ""   # 缩略图链路已移除，列保留
-                        crows.append((
-                            name, entry.realm, int(entry.tiled),
-                            int(entry.use_color_scheme),
-                            ",".join(entry.color_schemes
-                                     or ([entry.color_scheme] if entry.color_scheme else [])),
-                            json.dumps(entry.textures, ensure_ascii=False),
-                            json.dumps(
-                                {k: {"scale": list(v.scale), "offset": list(v.offset)}
-                                 for k, v in entry.uv_transforms.items()},
-                                ensure_ascii=False),
-                            json.dumps(entry.ship_groups, ensure_ascii=False),
-                            json.dumps(entry.target_ships, ensure_ascii=False),
-                            icon_rel,
-                        ))
-                    for cname, cs in (parsed.get("color_schemes") or {}).items():
-                        cols = cs.colors or [[0.0] * 4 for _ in range(4)]
-                        csrows.append((cname,) + tuple(
-                            json.dumps(list(cols[i]), ensure_ascii=False) for i in range(4)))
-                    if crows:
-                        self._conn.executemany(
-                            "INSERT OR REPLACE INTO camouflages "
-                            "(name, realm, tiled, use_color_scheme, "
-                            "color_scheme, textures_json, uv_json, "
-                            "ship_groups_json, target_ships_json, icon_path) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?)", crows)
-                    if csrows:
-                        self._conn.executemany(
-                            "INSERT OR REPLACE INTO camouflage_color_schemes "
-                            "(name, color0, color1, color2, color3) "
-                            "VALUES (?,?,?,?,?)", csrows)
-                    # shipgroups.xml 全局船组映射
-                    sgrows: list[tuple] = []
-                    for gname, ships in (parsed.get("ship_groups") or {}).items():
-                        for s in ships:
-                            sgrows.append((gname, s))
-                    if sgrows:
-                        self._conn.executemany(
-                            "INSERT OR REPLACE INTO camo_ship_groups "
-                            "(group_name, ship) VALUES (?,?)", sgrows)
-                    counts["camouflages"] = len(crows)
-                    counts["camouflage_color_schemes"] = len(csrows)
-                    counts["camo_ship_groups"] = len(sgrows)
-                    _p(f"涂装数据已入库: {counts['camouflages']} 条 / "
-                       f"配色 {counts['camouflage_color_schemes']} 条 / "
-                       f"船组 {counts['camo_ship_groups']} 条")
-            except Exception:  # noqa: BLE001
-                pass
+            self._populate_skeletons(svc, db, sdict, self_id_idx,
+                                     skel_files, vis_files, ext_files,
+                                     models, full, counts, _p)
+            self._populate_render_sets(db, sdict, self_id_idx, models, full, counts, _p)
+            self._populate_materials(svc, db, sdict, self_id_idx, mfm_files,
+                                     models, full, counts, _p)
+            self._populate_exteriors(game_dir, bin_folder, wows_type, counts, _p)
 
             counts["models"] = len(models or ())
             self.set_meta({
@@ -883,12 +934,6 @@ class AssetsCacheService(SqliteStore):
             raise
         finally:
             svc.close()
-            # 关闭共享 pkg 提取器（释放 IDX/文件树内存）
-            if _shared_ext is not None:
-                try:
-                    _shared_ext.close()
-                except Exception:  # noqa: BLE001
-                    pass
 
     # ── 查询（3D 查看器用）─────────────────────────────────
 
