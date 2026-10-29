@@ -68,8 +68,11 @@ MergedGeometryPrototype
 ## 4. 组装：HullMesh / MountMesh
 
 > 数据结构在 `models/ship_mesh.py`（纯 dataclass + numpy），装配函数在
-> `services/mesh_assembly.py`（不碰文件/数据库）。`GeometryService` 里保留了同名
-> `staticmethod` 别名，所以本文按 `_merge_hull()` 这种写法称呼仍然成立。
+> `services/mesh_assembly.py`（不碰文件/数据库）。后者的函数不带下划线前缀
+> （`merge_hull()` / `split_primitives_by_material()` / `apply_skinning()`），
+> `GeometryService` 里只留了 `_split_primitives_by_material` 一个转发方法
+> —— 其余调用都已在模块内部直连，所以本文的 `_xxx()` 指的是「装配那一步」，
+> 不是某个仍然存在的实例方法。
 
 ### 船体分段
 
@@ -106,7 +109,8 @@ primitives → _split_primitives_by_material()
    皮肤可用 `nodesConfig` 覆盖 `model / miscFilter / customMiscs`。
 
 **蒙皮烘焙**：带 `iiiww` 的顶点在加载阶段就按 bind pose 混合到最终位置
-（`_apply_skinning`），`skinned_applied=True`。因此：
+（`mesh_assembly.apply_skinning`，需要 `bones_of` 与当前舰船骨架 stem），
+`skinned_applied=True`。因此：
 
 - 挂载矩阵**不能再乘** `rb`（否则双重镜像 → 朝向翻转，PASB111 的 AGS542 实证）；
 - 导出的 `JOINTS_0/WEIGHTS_0` 仍保留原始索引/权重，供 Blender 做顶点组。
