@@ -1225,6 +1225,210 @@ class _GlbBuilder:
 # 导出入口
 # ────────────────────────────────────────────────────────────────────────────
 
+def _build_material(builder: "_GlbBuilder", src, name: str, component: str,
+                    options: "GlbRenderOptions", report: "ExportReport",
+                    fallback_tex) -> tuple[int, dict]:
+    """为一个 mesh 造材质：贴图通道 + INDEXED 数组 + extras，返回 (材质索引, extras)。
+
+    贴图一律按内容 sha1 去重后外置（`builder.add_texture_from_dds`）；
+    INDEXED 族的 6 组 float 数组单独落 `.bin`，路径写进 extras 供网页端还原。
+    返回的 extras 同时给 mesh 用（`component` 由调用方再补一次）。
+    """
+    tex = getattr(src, "texture_dds", None) or fallback_tex
+    tex_idx = None
+    if options.embed_textures and tex:
+        if _is_dds_array(tex):
+            pass  # INDEXED atlas arrays are exported via wows_indexed_textures
+        else:
+            tex_idx = builder.add_texture_from_dds(tex, name)
+            if tex_idx is None:
+                report.skipped_textures += 1
+    # ── 其他 PBR 通道：只认 .mfm 声明的贴图键（material_textures）──
+    mtexs = getattr(src, "material_textures", None) or {}
+    if os.environ.get("WOWS_DEBUG_MATERIALS") and getattr(src, "tech_family", "pbs") == "indexed":
+        print("[DEBUG-IDX]", getattr(src, "material", ""), {
+            k: (type(v).__name__, (len(v) if hasattr(v, "__len__") else ""),
+                (str(v)[:80]))
+            for k, v in mtexs.items()
+        })
+
+    def _pick(*keys):
+        for k in keys:
+            v = mtexs.get(k)
+            if v and len(v) > 1 and v[1]:
+                return v
+        return None
+
+    normal_idx = mr_idx = ao_idx = None
+    ip = getattr(src, "indexed_params", None) or {}
+    bake_meta = None
+    if (options.bake_indexed and options.embed_textures
+            and getattr(src, "tech_family", "pbs") == "indexed" and ip):
+        bake_meta = _bake_indexed_material(builder, src, mtexs, ip, options, report)
+        if bake_meta is not None:
+            tex_idx = bake_meta["albedo"]
+            normal_idx = bake_meta["normal"]
+            mr_idx = bake_meta["mr"]
+    # INDEXED 族的 normalMap 是 alpha 法线叠加层（见 renderer/scene.py），
+    # 贴图集也要逐材质分块才能取到正确结果 → 仅标准 PBS 材质接 PBR 通道。
+    if (bake_meta is None and options.embed_textures
+            and getattr(src, "tech_family", "pbs") != "indexed"):
+        for kind, keys, slot in (
+            (_TEX_NORMAL, ("normalMap", "g_normalMap"), "normal"),
+            (_TEX_MR, ("metallicGlossMap", "g_mgMap"), "mr"),
+            (_TEX_COLOR, ("ambientOcclusionMap",), "ao"),
+        ):
+            picked = _pick(*keys)
+            if not picked or _is_dds_array(picked[1]):
+                continue
+            slot_idx = builder.add_texture_from_dds(picked[1], f"{name}_{slot}", kind)
+            if slot_idx is None:
+                report.skipped_textures += 1
+                continue
+            if slot == "normal":
+                normal_idx = slot_idx
+            elif slot == "mr":
+                mr_idx = slot_idx
+            else:
+                ao_idx = slot_idx
+    emissive_idx = None
+    if (bake_meta is None and options.emissive and options.embed_textures
+            and getattr(src, "tech_family", "pbs") != "indexed"):
+        mg_pick = _pick("metallicGlossMap", "g_mgMap")
+        if mg_pick and tex and not _is_dds_array(mg_pick[1]):
+            try:
+                emissive_idx = _emissive_texture(
+                    builder, tex, mg_pick[1], getattr(src, "emissive_power", None),
+                    name, max_size=options.texture_max_size)
+            except Exception as exc:  # noqa: BLE001
+                report.warnings.append(f"自发光贴图生成失败（{name}）：{exc}")
+    layer_tex = {}
+    if bake_meta is None and options.embed_textures:
+        for slot, keys in (
+            ("composite", ("compositeMap", "composite", "g_compositeMap")),
+            ("artMap", ("artMap", "g_artMap")),
+            ("materialIdMap", ("materialIdMap",)),
+        ):
+            picked = _pick(*keys)
+            if not picked or _is_dds_array(picked[1]):
+                continue
+            slot_idx = builder.add_texture_from_dds(picked[1], f"{name}_{slot}", _TEX_COLOR)
+            if slot_idx is not None:
+                layer_tex[slot] = slot_idx
+    indexed_tex = {}
+    if (bake_meta is None and options.embed_textures
+            and getattr(src, "tech_family", "pbs") == "indexed"):
+        for slot, keys, kind in (
+            ("albedoArray", ("albedoArray", "g_albedoMap"), _TEX_COLOR),
+            ("normalArray", ("normalArray", "g_normalMap"), _TEX_NORMAL),
+            ("mgArray", ("MGArray", "g_mgMap"), _TEX_MR),
+        ):
+            picked = _pick(*keys)
+            if not picked:
+                continue
+            meta = builder.add_texture_array_from_dds(picked[1], f"{name}_{slot}")
+            if meta:
+                indexed_tex[slot] = meta
+    indexed_meta = {}
+    if bake_meta is None and options.embed_textures and ip:
+        arrays = ip.get("arrays") or {}
+        for aname, arr in arrays.items():
+            try:
+                import hashlib
+                from pathlib import Path
+                a = np.ascontiguousarray(arr)
+                data = a.tobytes()
+                digest = hashlib.sha1(data).hexdigest()
+                out_dir = Path(builder.textures_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                rel = "indexed_" + digest + ".bin"
+                bin_path = out_dir / rel
+                if not bin_path.exists():
+                    bin_path.write_bytes(data)
+                indexed_meta.setdefault("arrays", {})[aname] = {
+                    "bin": builder.texture_uri_prefix + "/" + rel,
+                    "dtype": str(a.dtype), "shape": list(a.shape),
+                }
+            except Exception:
+                pass
+        for k, v in ip.items():
+            if k == "arrays":
+                continue
+            if isinstance(v, (int, float, str, bool, list, tuple)):
+                indexed_meta[k] = v
+    alpha_mode = _OPAQUE if getattr(src, "opaque", True) else _BLEND
+    extras = {"component": component,
+              "texture_path": getattr(src, "texture_path", ""),
+              "wows_textures": {k: (v[0] if isinstance(v, (tuple, list)) else "")
+                                for k, v in mtexs.items()},
+              "wows_layer_textures": layer_tex,
+              "wows_indexed": indexed_meta,
+              "wows_indexed_textures": indexed_tex}
+    if bake_meta is not None:
+        # 烘焙后材质就是普通 PBR：告诉 web manifest 别再按 arrays 走 INDEXED 路径
+        extras["wows_mode"] = "pbs"
+        extras["wows_baked"] = {"from": "indexed", "size": list(bake_meta["size"]),
+                                "notes": bake_meta["notes"]}
+    mat_idx = builder.add_material(
+        getattr(src, "material", None) or name,
+        base_color=(1.0, 1.0, 1.0, 1.0), texture_idx=tex_idx,
+        alpha_mode=alpha_mode,
+        double_sided=options.double_sided,
+        extras=extras,
+        normal_tex=normal_idx, mr_tex=mr_idx, occlusion_tex=ao_idx,
+        emissive_tex=emissive_idx)
+    return mat_idx, extras
+
+
+def _place_mesh(p, n, tan, bin_, matrix, parent_world, skinned):
+    """把网格顶点放到父节点局部坐标，返回 (p, n, tangent4, node_matrix, matrix)。
+
+    两条路径（glTF 的 skin 结果在**世界空间**，节点自身变换会被忽略）：
+
+    - 蒙皮网格：顶点保持世界坐标，`node_matrix = inv(父)` —— Blender 拿到的对象
+      变换是单位阵，不会把世界坐标再乘一次；
+    - 普通网格：顶点乘 `inv(父) @ matrix`，把挂点变换从顶点挪到父空物体上，
+      几何世界位置不变、层级有意义。
+
+    TANGENT 的 w 分量由 normal×tangent 与 binormal 的朝向得到（glTF 用它定手性）。
+    """
+    node_matrix = None
+    if parent_world is not None:
+        inv_w = np.linalg.inv(
+            np.asarray(parent_world, dtype=np.float64)).astype(np.float32)
+        if skinned:
+            # glTF 的 skin 结果在**世界空间**（节点自身变换被忽略）：顶点保持
+            # 世界坐标，骨骼也放世界；而蒙皮网格的节点矩阵取 inv(父) ——
+            # 这样 Blender 拿到的对象变换是单位阵，不会把世界坐标再乘一次。
+            node_matrix = inv_w
+        else:
+            # 普通网格：世界坐标 ← 父空物体变换 × 局部顶点，
+            # 把挂点矩阵从顶点挪到父节点上（几何世界位置不变）
+            matrix = inv_w if matrix is None \
+                else inv_w @ np.asarray(matrix, dtype=np.float32)
+    if matrix is not None:
+        p = _apply_matrix(p, matrix).astype(np.float32)
+        n = _apply_matrix3(n, matrix).astype(np.float32)
+        ln = np.linalg.norm(n, axis=1, keepdims=True)
+        ln[ln < 1e-8] = 1.0
+        n = (n / ln).astype(np.float32)
+        if tan is not None:
+            tan = _apply_matrix3(np.asarray(tan, dtype=np.float32), matrix)
+        if bin_ is not None:
+            bin_ = _apply_matrix3(np.asarray(bin_, dtype=np.float32), matrix)
+    # TANGENT = xyz + w（由 normal×tangent 与 binormal 的朝向得到）
+    tangent4 = None
+    if tan is not None:
+        t = np.asarray(tan, dtype=np.float32)
+        nv = np.asarray(n, dtype=np.float32)
+        b = (np.asarray(bin_, dtype=np.float32) if bin_ is not None
+             else np.cross(nv, t))
+        w = np.sign(np.sum(np.cross(nv, t) * b, axis=1))
+        w[w == 0] = 1.0
+        tangent4 = np.hstack([t, w[:, None]]).astype(np.float32)
+    return p, n, tangent4, node_matrix, matrix
+
+
 def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | None = None,
                       progress_cb=None, cancel_event=None) -> ExportReport:
     """导出渲染模型（舰体 + 挂载）为 GLB。
@@ -1393,183 +1597,10 @@ def export_render_glb(geometry, output_path: str, options: GlbRenderOptions | No
         # ── 蒙皮数据（xyznuviiiwwtb 的 iiiww）提前取出，决定顶点坐标空间 ──
         joints0, weights0, joints_mat, joint_names = builder.skin_data(src, bone_idx, bone_w)
         skinned = joints0 is not None and options.export_skins
-        node_matrix = None
-        if parent_world is not None:
-            inv_w = np.linalg.inv(
-                np.asarray(parent_world, dtype=np.float64)).astype(np.float32)
-            if skinned:
-                # glTF 的 skin 结果在**世界空间**（节点自身变换被忽略）：顶点保持
-                # 世界坐标，骨骼也放世界；而蒙皮网格的节点矩阵取 inv(父) ——
-                # 这样 Blender 拿到的对象变换是单位阵，不会把世界坐标再乘一次。
-                node_matrix = inv_w
-            else:
-                # 普通网格：世界坐标 ← 父空物体变换 × 局部顶点，
-                # 把挂点矩阵从顶点挪到父节点上（几何世界位置不变）
-                matrix = inv_w if matrix is None \
-                    else inv_w @ np.asarray(matrix, dtype=np.float32)
-        if matrix is not None:
-            p = _apply_matrix(p, matrix).astype(np.float32)
-            n = _apply_matrix3(n, matrix).astype(np.float32)
-            ln = np.linalg.norm(n, axis=1, keepdims=True)
-            ln[ln < 1e-8] = 1.0
-            n = (n / ln).astype(np.float32)
-            if tan is not None:
-                tan = _apply_matrix3(np.asarray(tan, dtype=np.float32), matrix)
-            if bin_ is not None:
-                bin_ = _apply_matrix3(np.asarray(bin_, dtype=np.float32), matrix)
-        # TANGENT = xyz + w（由 normal×tangent 与 binormal 的朝向得到）
-        tangent4 = None
-        if tan is not None:
-            t = np.asarray(tan, dtype=np.float32)
-            nv = np.asarray(n, dtype=np.float32)
-            b = (np.asarray(bin_, dtype=np.float32) if bin_ is not None
-                 else np.cross(nv, t))
-            w = np.sign(np.sum(np.cross(nv, t) * b, axis=1))
-            w[w == 0] = 1.0
-            tangent4 = np.hstack([t, w[:, None]]).astype(np.float32)
-        tex = getattr(src, "texture_dds", None) or fallback_tex
-        tex_idx = None
-        if options.embed_textures and tex:
-            if _is_dds_array(tex):
-                pass  # INDEXED atlas arrays are exported via wows_indexed_textures
-            else:
-                tex_idx = builder.add_texture_from_dds(tex, name)
-                if tex_idx is None:
-                    report.skipped_textures += 1
-        # ── 其他 PBR 通道：只认 .mfm 声明的贴图键（material_textures）──
-        mtexs = getattr(src, "material_textures", None) or {}
-        if os.environ.get("WOWS_DEBUG_MATERIALS") and getattr(src, "tech_family", "pbs") == "indexed":
-            print("[DEBUG-IDX]", getattr(src, "material", ""), {
-                k: (type(v).__name__, (len(v) if hasattr(v, "__len__") else ""),
-                    (str(v)[:80]))
-                for k, v in mtexs.items()
-            })
-
-        def _pick(*keys):
-            for k in keys:
-                v = mtexs.get(k)
-                if v and len(v) > 1 and v[1]:
-                    return v
-            return None
-
-        normal_idx = mr_idx = ao_idx = None
-        ip = getattr(src, "indexed_params", None) or {}
-        bake_meta = None
-        if (options.bake_indexed and options.embed_textures
-                and getattr(src, "tech_family", "pbs") == "indexed" and ip):
-            bake_meta = _bake_indexed_material(builder, src, mtexs, ip, options, report)
-            if bake_meta is not None:
-                tex_idx = bake_meta["albedo"]
-                normal_idx = bake_meta["normal"]
-                mr_idx = bake_meta["mr"]
-        # INDEXED 族的 normalMap 是 alpha 法线叠加层（见 renderer/scene.py），
-        # 贴图集也要逐材质分块才能取到正确结果 → 仅标准 PBS 材质接 PBR 通道。
-        if (bake_meta is None and options.embed_textures
-                and getattr(src, "tech_family", "pbs") != "indexed"):
-            for kind, keys, slot in (
-                (_TEX_NORMAL, ("normalMap", "g_normalMap"), "normal"),
-                (_TEX_MR, ("metallicGlossMap", "g_mgMap"), "mr"),
-                (_TEX_COLOR, ("ambientOcclusionMap",), "ao"),
-            ):
-                picked = _pick(*keys)
-                if not picked or _is_dds_array(picked[1]):
-                    continue
-                slot_idx = builder.add_texture_from_dds(picked[1], f"{name}_{slot}", kind)
-                if slot_idx is None:
-                    report.skipped_textures += 1
-                    continue
-                if slot == "normal":
-                    normal_idx = slot_idx
-                elif slot == "mr":
-                    mr_idx = slot_idx
-                else:
-                    ao_idx = slot_idx
-        emissive_idx = None
-        if (bake_meta is None and options.emissive and options.embed_textures
-                and getattr(src, "tech_family", "pbs") != "indexed"):
-            mg_pick = _pick("metallicGlossMap", "g_mgMap")
-            if mg_pick and tex and not _is_dds_array(mg_pick[1]):
-                try:
-                    emissive_idx = _emissive_texture(
-                        builder, tex, mg_pick[1], getattr(src, "emissive_power", None),
-                        name, max_size=options.texture_max_size)
-                except Exception as exc:  # noqa: BLE001
-                    report.warnings.append(f"自发光贴图生成失败（{name}）：{exc}")
-        layer_tex = {}
-        if bake_meta is None and options.embed_textures:
-            for slot, keys in (
-                ("composite", ("compositeMap", "composite", "g_compositeMap")),
-                ("artMap", ("artMap", "g_artMap")),
-                ("materialIdMap", ("materialIdMap",)),
-            ):
-                picked = _pick(*keys)
-                if not picked or _is_dds_array(picked[1]):
-                    continue
-                slot_idx = builder.add_texture_from_dds(picked[1], f"{name}_{slot}", _TEX_COLOR)
-                if slot_idx is not None:
-                    layer_tex[slot] = slot_idx
-        indexed_tex = {}
-        if (bake_meta is None and options.embed_textures
-                and getattr(src, "tech_family", "pbs") == "indexed"):
-            for slot, keys, kind in (
-                ("albedoArray", ("albedoArray", "g_albedoMap"), _TEX_COLOR),
-                ("normalArray", ("normalArray", "g_normalMap"), _TEX_NORMAL),
-                ("mgArray", ("MGArray", "g_mgMap"), _TEX_MR),
-            ):
-                picked = _pick(*keys)
-                if not picked:
-                    continue
-                meta = builder.add_texture_array_from_dds(picked[1], f"{name}_{slot}")
-                if meta:
-                    indexed_tex[slot] = meta
-        indexed_meta = {}
-        if bake_meta is None and options.embed_textures and ip:
-            arrays = ip.get("arrays") or {}
-            for aname, arr in arrays.items():
-                try:
-                    import hashlib
-                    from pathlib import Path
-                    a = np.ascontiguousarray(arr)
-                    data = a.tobytes()
-                    digest = hashlib.sha1(data).hexdigest()
-                    out_dir = Path(builder.textures_dir)
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    rel = "indexed_" + digest + ".bin"
-                    bin_path = out_dir / rel
-                    if not bin_path.exists():
-                        bin_path.write_bytes(data)
-                    indexed_meta.setdefault("arrays", {})[aname] = {
-                        "bin": builder.texture_uri_prefix + "/" + rel,
-                        "dtype": str(a.dtype), "shape": list(a.shape),
-                    }
-                except Exception:
-                    pass
-            for k, v in ip.items():
-                if k == "arrays":
-                    continue
-                if isinstance(v, (int, float, str, bool, list, tuple)):
-                    indexed_meta[k] = v
-        alpha_mode = _OPAQUE if getattr(src, "opaque", True) else _BLEND
-        extras = {"component": component,
-                  "texture_path": getattr(src, "texture_path", ""),
-                  "wows_textures": {k: (v[0] if isinstance(v, (tuple, list)) else "")
-                                    for k, v in mtexs.items()},
-                  "wows_layer_textures": layer_tex,
-                  "wows_indexed": indexed_meta,
-                  "wows_indexed_textures": indexed_tex}
-        if bake_meta is not None:
-            # 烘焙后材质就是普通 PBR：告诉 web manifest 别再按 arrays 走 INDEXED 路径
-            extras["wows_mode"] = "pbs"
-            extras["wows_baked"] = {"from": "indexed", "size": list(bake_meta["size"]),
-                                    "notes": bake_meta["notes"]}
-        mat_idx = builder.add_material(
-            getattr(src, "material", None) or name,
-            base_color=(1.0, 1.0, 1.0, 1.0), texture_idx=tex_idx,
-            alpha_mode=alpha_mode,
-            double_sided=options.double_sided,
-            extras=extras,
-            normal_tex=normal_idx, mr_tex=mr_idx, occlusion_tex=ao_idx,
-            emissive_tex=emissive_idx)
+        p, n, tangent4, node_matrix, matrix = _place_mesh(
+            p, n, tan, bin_, matrix, parent_world, skinned)
+        mat_idx, extras = _build_material(builder, src, name, component,
+                                          options, report, fallback_tex)
         # ── 顶点组 / 权重（iiiww 属性）──
         if p.size == 0 or p.size % 3:
             report.skipped_meshes += 1

@@ -13,425 +13,33 @@ geometry_service.py —— 舰船 3D 几何与装甲提取服务。
 
 from __future__ import annotations
 
-import re
-import struct
 import contextlib
 import threading
-from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 
 from app.application import app as app_ctx
 from app.signals import bus
-from models.geometry_parser import parse_geometry, ArmorModel, GeometryError
-from models.collision_materials import collision_material_name, thickness_to_color
+from models.geometry_parser import GeometryError, parse_geometry
+from models.ship_mesh import (  # noqa: F401  （ShipInfo 等仍从这里对外）
+    COMPONENT_DECK, COMPONENT_HULL,
+    ArmorMesh, CollisionModelData, MountMesh, ShipGeometry, ShipInfo,
+    _is_magenta_placeholder, is_known_component_key, iter_component_groups,
+    mp_base_id,
+)
+from services import mesh_filters
+from services.mesh_assembly import (
+    LOD_RES,
+    apply_declared_color, bake_rigid, build_armor_mesh, clone_prim,
+    dedupe_mount_instances, derived_mount_transform, folder_from_model_path,
+    instanced_bounds, match_thickness, material_layers, merge_hull,
+    misc_name_from_node, model_family_token, norm_shape_stem, palette_subgroups,
+    read_vfs, shape_lod, snapshot_without_mounts, vfs_entry,
+)
 from utils.asset_utils import murmur3_32, tech_family as fx_tech_family
 from utils.threading_utils import TaskCancelled
 
-from services import mesh_filters
 
-
-@dataclass
-class ShipInfo:
-    """发现到的舰船（用于舰船列表下拉框）。"""
-    game_key: str          # GameParams 键，如 "PFSB510_Bourgogne"
-    display_name: str      # 本地化名称，如 "勃艮第"
-    model_folder: str      # 几何文件夹名，如 "FSB025_Bourgogne_1945"
-    model_path: str        # 完整 model VFS 路径
-    nation: str = ""
-    ship_type: str = ""    # 舰种（shiptype），如 "Battleship"
-    tier: int = 0          # 等级 1..11
-    group: str = ""        # 船型分组 group_status_key（可研发/加值/特种）
-    has_geometry: bool = False
-
-
-#: 模型部件归属（component / 归属分类，用于挂载与装甲按归属筛选显示）
-COMPONENT_HULL = "船体"
-COMPONENT_MAIN = "主炮塔"
-COMPONENT_SECONDARY = "副炮塔"
-COMPONENT_TORPEDOES = "鱼雷发射管"
-COMPONENT_DEPTH_CHARGE = "深弹发射器"
-COMPONENT_AA = "防空"
-COMPONENT_DIRECTOR = "指挥仪"
-COMPONENT_FINDER = "测距仪"
-COMPONENT_RADAR = "雷达"
-COMPONENT_DECK = "甲板设备"
-COMPONENT_OTHER = "其他"
-
-#: 游戏内装甲查看器隐藏的「通用 Hull 材质」集合（wows-toolkit hidden 语义）：
-#: 原本借鉴 wows-toolkit 把 Hull 区通用材质（Trans/Deck/Belt 等）标记为隐藏，
-#: 但这些板有真实厚度数据，在我们的查看器中应默认显示。清空该集合即可。
-HIDDEN_GENERIC_MATERIALS: set[str] = set()
-
-
-def _is_magenta_placeholder(dds_bytes: bytes, sample: int = 256) -> bool:
-    """检测贴图是否为「洋红占位纹理」（缺失贴图常用纯色洋红，BC7 全 mode0）。
-
-    只抽前若干 BC7 块解码颜色端点求平均色；平均 RGB 偏洋红(R>180,G<110,B>90)
-    即视为占位。非 BC7 / 解析失败返回 False（不误判正常 camo）。
-    实例图集(CIA000_instances_atlas_art)实测全 mode0 纯洋红 (238,51,127)。
-    """
-    try:
-        from services.texture_io import parse_dds
-        dds = parse_dds(dds_bytes)
-        if dds.bc_kind != 8 or not dds.mips:
-            return False
-        mip0 = dds.mips[0]
-        w, h = dds.width, dds.height
-        nblocks = (w // 4) * (h // 4)
-        if nblocks == 0:
-            return False
-
-        def _unpack(b: bytes, off: int, n: int) -> int:
-            v = 0
-            for i in range(n):
-                bit = (off + i) // 8
-                biti = (off + i) % 8
-                if bit < len(b):
-                    v |= ((b[bit] >> biti) & 1) << i
-            return v
-
-        def _ep(b: bytes, offs) -> list:
-            """按 (off, bits) 解码 3 通道端点色，返回 0~255 值。"""
-            out = []
-            for off, bits in offs:
-                v = _unpack(b, off, bits)
-                out.append(v / ((1 << bits) - 1) * 255.0)
-            return out
-
-        total = [0.0, 0.0, 0.0]
-        cnt = 0
-        stride = max(1, nblocks // sample)
-        for bi in range(0, nblocks, stride):
-            if cnt >= sample:
-                break
-            blk = mip0[bi * 16: bi * 16 + 16]
-            if len(blk) < 16:
-                break
-            m = 0
-            for k in range(8):
-                if (blk[0] >> (7 - k)) & 1:
-                    m += 1
-                else:
-                    break
-            if m == 0:
-                p0 = _ep(blk, [(7, 4), (11, 4), (15, 4)])
-                p1 = _ep(blk, [(22, 4), (26, 4), (30, 4)])
-            elif m == 1:
-                p0 = _ep(blk, [(8, 6), (14, 6), (20, 6)])
-                p1 = _ep(blk, [(50, 6), (56, 6), (62, 6)])
-            elif m == 2:
-                p0 = _ep(blk, [(8, 5), (17, 5), (26, 5)])
-                p1 = _ep(blk, [(56, 5), (65, 5), (74, 5)])
-            elif m == 3:
-                p0 = _ep(blk, [(8, 7), (15, 7), (22, 7)])
-                p1 = _ep(blk, [(50, 7), (57, 7), (64, 7)])
-            elif m == 4:
-                p0 = _ep(blk, [(8, 5), (19, 5), (30, 5)])
-                p1 = _ep(blk, [(49, 5), (60, 5), (71, 5)])
-            elif m == 5:
-                p0 = _ep(blk, [(8, 7), (15, 7), (22, 7)])
-                p1 = _ep(blk, [(49, 7), (56, 7), (63, 7)])
-            elif m == 6:
-                p0 = _ep(blk, [(8, 7), (15, 7), (22, 7)])
-                p1 = _ep(blk, [(43, 7), (50, 7), (57, 7)])
-            elif m == 7:
-                p0 = _ep(blk, [(8, 5), (17, 5), (26, 5)])
-                p1 = _ep(blk, [(56, 5), (65, 5), (74, 5)])
-            else:
-                continue
-            total[0] += (p0[0] + p1[0]) * 0.5
-            total[1] += (p0[1] + p1[1]) * 0.5
-            total[2] += (p0[2] + p1[2]) * 0.5
-            cnt += 1
-        if cnt == 0:
-            return False
-        r, g, b = total[0] / cnt, total[1] / cnt, total[2] / cnt
-        return r > 180.0 and g < 110.0 and b > 90.0
-    except Exception:
-        return False
-
-#: GameParams 组件键 → 归属分类（按 base 组件名匹配任意前缀变体）
-#: 键格式 {PREFIX}_{BASE}，如 AB1_Artillery / B_AirDefense / A1_Torpedoes
-_COMPONENT_BY_BASE = {
-    "Artillery": COMPONENT_MAIN,            # 主炮塔（A1_/AB1_/B_/C_/X_... 前缀）
-    "ATBA": COMPONENT_SECONDARY,            # 副炮（A_/B_...）
-    "SecondaryArtillery": COMPONENT_MAIN,
-    "AirDefense": COMPONENT_AA,             # 防空（A_/B_...）
-    "AirSupport": COMPONENT_OTHER,
-    "Directors": COMPONENT_DIRECTOR,        # 指挥仪（A_/AB_...）
-    "Finders": COMPONENT_FINDER,            # 测距仪（A_/AB_...）
-    "Radars": COMPONENT_RADAR,              # 雷达（A_/AB_...）
-    "AirArmament": COMPONENT_OTHER,         # 弹射器（HP_JC_*）
-    "Torpedoes": COMPONENT_TORPEDOES,        # 鱼雷发射管（HP_*GT_*）
-    "DepthChargeGuns": COMPONENT_DEPTH_CHARGE,  # 深水炸弹炮塔（HP_*GB_*）
-}
-
-
-def _component_base(comp_key: str) -> str:
-    """组件键的 base 组件名：`AB1_Artillery` → `Artillery`。"""
-    if not comp_key:
-        return ""
-    return comp_key.split("_", 1)[1] if "_" in comp_key else comp_key
-
-
-def component_for_key(comp_key: str) -> str:
-    """GameParams 组件键 → 归属分类（未知键归"其他"）。
-
-    键格式 {PREFIX}_{BASE}，BASE 匹配任意前缀变体（A1_/AB_/B_/C_/X_...），
-    避免固定键列表遗漏合法变体（如 PGSB207 的 AB1_Artillery、AB_Directors、
-    B_AirDefense、A1_Torpedoes 等）。
-    """
-    return _COMPONENT_BY_BASE.get(_component_base(comp_key), COMPONENT_OTHER)
-
-
-def is_known_component_key(comp_key: str) -> bool:
-    """组件键是否已被识别（按 base 组件名匹配任意前缀变体）。"""
-    return _component_base(comp_key) in _COMPONENT_BY_BASE
-
-
-def iter_component_groups(data: dict):
-    """遍历快照中所有组件分组，产出 (component_key, category, group_dict)。
-
-    不依赖固定键列表：按 base 组件名匹配任意前缀变体，其余归「其他」。
-    或归「其他」。调用方据此加载挂载引用/装甲厚度，并可选告警未知组件。
-    """
-    for key, value in data.items():
-        if not isinstance(value, dict):
-            continue
-        yield key, component_for_key(key), value
-
-
-# ── MP 甲板设备节点 → misc 模型映射（纯命名约定，数据驱动校验 99.99% 命中）──
-# MP_{baseID}_{desc}_{instance}[_INDEX_N] → 去 MP_ 前缀 → 首个「字母+数字」token
-# 即 baseID；国家目录由 baseID 首字母决定；模型目录 = baseID（几何在
-# content/gameplay/{nation}/misc/{baseID}/{baseID}.geometry，与 HP 挂载同一
-# 目录索引/渲染集/贴图管线加载）。
-_MP_NATION_BY_LETTER = {
-    "A": "usa", "B": "uk", "C": "common", "F": "france", "G": "germany",
-    "H": "netherlands", "I": "italy", "J": "japan", "R": "russia",
-    "S": "spain", "U": "commonwealth", "V": "panamerica", "W": "europe",
-    "X": "events", "Z": "panasia",
-}
-_MP_BASE_RE = re.compile(r"^([A-Z][A-Z0-9]*?\d+)")
-
-
-def mp_base_id(mp_name: str) -> str:
-    """MP 节点名 → baseID（模型目录名）；无法解析返回空串。
-
-    例：MP_AM003_Fairlead_1 / MP_AM003_Fairlead_1_INDEX_2 → "AM003"
-    """
-    body = mp_name[3:] if mp_name.startswith("MP_") else mp_name
-    m = _MP_BASE_RE.match(body)
-    return m.group(1) if m else ""
-
-
-@dataclass
-class HullMesh:
-    """一个舰体部件网格（顶点/法线/UV/索引，已合并该部件全部 primitive）。
-
-    若按材质拆分（不同模型使用不同贴图），material/texture_dds 记录该分片的
-    材质与独立贴图；否则 material=None，使用舰体默认贴图。
-    """
-    name: str
-    positions: np.ndarray          # (N,3) f32
-    normals: np.ndarray            # (N,3) f32
-    indices: np.ndarray            # (M,) u32
-    vertex_count: int = 0
-    uvs: np.ndarray | None = None  # (N,2) f32（贴图用）
-    #: 第二套 UV（格式含 uv2 时）
-    uv2: np.ndarray | None = None
-    #: 切线/副切线（格式含 tb 时）
-    tangents: np.ndarray | None = None
-    binormals: np.ndarray | None = None
-    #: 单独 t 属性的原始 4 字节（语义未知，原样保留）
-    t4: np.ndarray | None = None
-    #: ``r`` 属性原始 4 字节（(N,4) uint8，不做语义解释）
-    extra: np.ndarray | None = None
-    material: str | None = None    # 材质名（如 TL2_SHIPMAT_PBS_DeckHouse）
-    texture_dds: bytes | None = None   # 该材质独立贴图（.mfm diffuseMap 或 INDEXED albedoArray）
-    texture_path: str = ""
-    #: 是否声明了颜色贴图（mfm 有 diffuseMap / indexed 有 albedoArray）。False=无色：
-    #: 按透明/不参与颜色计算处理（如仅 normalMap 的贴花层），避免误渲成白色/串错贴图。
-    has_color: bool = True
-    tech_family: str = "pbs"           # shader 技术族：pbs(0x0005)/indexed(0x0009)/other
-    material_textures: dict = field(default_factory=dict)  # {贴图键: (vfs_path, bytes)}
-    indexed_params: dict | None = None  # INDEXED 分块参数 {arrays, grid, offset}
-    #: emissive 自发光强度（mfm emissivePower 属性；None=默认 1.0）
-    emissive_power: float | None = None
-    opaque: bool = True                 # 半透明材质（玻璃等）用 alpha 混合
-    is_wire: bool = False               # wire 线框辅助网格：用 GL_LINES 渲染（非实体面）
-    #: crack/damage 损伤网格（查看器不显示，导出保留用）
-    is_crack: bool = False
-    #: bind pose 蒙皮已实际施加到顶点（Root_BlendBone 已烘焙进几何）；
-    #: 挂载矩阵不得再乘 rb，否则双重镜像 → 朝向翻转（PASB111 副炮 AGS542 实证）
-    skinned_applied: bool = False
-    #: 蒙皮权重（GLB 导出 glTF skin 用；非蒙皮网格为 None）
-    bone_indices: np.ndarray | None = None   # (N,4) uint8（调色板 slot × 3）
-    bone_weights: np.ndarray | None = None   # (N,4) float32
-    #: 蒙皮调色板骨骼名与 bind 世界矩阵（游戏空间），导出时转 glTF 空间
-    skin_bones: list = field(default_factory=list)
-    skin_bind: list = field(default_factory=list)
-    #: 构成该网格的形状名（*.vertices 去后缀，如 BIA454_Bollard_bigShape）与
-    #: 对应绑定的骨骼节点名（如 BIA454_Bollard_big_6）；调试模式 3 标签用。
-    shape_names: list = field(default_factory=list)
-    node_names: list = field(default_factory=list)
-    #: 逐节点实例矩阵（渲染空间 4x4 行主序）；非空时该网格是一份原始几何，
-    #: 渲染时按其每个矩阵各画一次（左右舷/多处实例，如切锯机 _0/_1）。
-    instance_matrices: list = field(default_factory=list)
-    #: 按 shape 切片的区间：[(shape_name, node_name, v_start, v_count, i_start,
-    #: i_count), ...]，与 `_merge_hull` 的合并顺序一致。GLB 导出据此把合并网格
-    #: 重新拆成 .visual 的每个 renderSet（一个 Shape 一个网格对象）。
-    shape_spans: list = field(default_factory=list)
-
-
-@dataclass
-class MountMesh:
-    """一个挂载实例（炮塔/副炮/防空/指挥仪等）。
-
-    - 几何为该部件模型目录（本地坐标），经 model_matrix 变换到舰船空间
-    - 每个部件使用自己的独立贴图（`{stem}_a.dd0` 等命名约定）
-    - component 为归属分类（主炮塔/副炮/防空/...），支持按归属筛选显示
-    """
-    name: str                      # HP_JGM_1
-    component: str                 # 归属分类
-    positions: np.ndarray          # (N,3) f32 本地坐标
-    normals: np.ndarray            # (N,3) f32
-    indices: np.ndarray            # (M,) u32
-    uvs: np.ndarray | None = None  # (N,2) f32
-    #: 第二套 UV / 切线 / 副切线 / 未知 t4 / r 属性（与 HullMesh 同义）
-    uv2: np.ndarray | None = None
-    tangents: np.ndarray | None = None
-    binormals: np.ndarray | None = None
-    t4: np.ndarray | None = None
-    extra: np.ndarray | None = None
-    model_matrix: np.ndarray | None = None  # (4,4) f32 行主序（渲染空间）
-    texture_dds: bytes | None = None
-    texture_path: str = ""
-    model_folder: str = ""         # 来源模型目录
-    vertex_count: int = 0
-    is_wire: bool = False          # wire 线框辅助网格：GL_LINES 渲染
-    #: 是否声明了颜色贴图（mfm 有 diffuseMap / indexed 有 albedoArray）。False=无色：
-    #: 按透明/不参与颜色计算处理（如仅 normalMap 的贴花层）。
-    has_color: bool = True
-    tech_family: str = "pbs"      # shader 技术族：pbs/indexed/other/grid
-    #: 材质贴图集 {贴图键: (vfs_path, bytes)}（INDEXED：albedoArray/materialIdMap/artMap）
-    material_textures: dict = field(default_factory=dict)
-    #: INDEXED 分块参数 {arrays, grid, offset}（炮塔等分块涂装）
-    indexed_params: dict | None = None
-    #: emissive 自发光强度（mfm emissivePower 属性；None=默认 1.0）
-    emissive_power: float | None = None
-    #: crack/damage 损伤网格（查看器不显示，导出保留用）
-    is_crack: bool = False
-    #: 蒙皮权重（GLB 导出 glTF skin 用；非蒙皮为 None）
-    bone_indices: np.ndarray | None = None
-    bone_weights: np.ndarray | None = None
-    skin_bones: list = field(default_factory=list)
-    skin_bind: list = field(default_factory=list)
-    #: 构成该网格的形状名与绑定的骨骼节点名（调试模式 3 标签用）。
-    shape_names: list = field(default_factory=list)
-    node_names: list = field(default_factory=list)
-    #: 逐节点实例矩阵（渲染空间 4x4 行主序）；非空时该网格是一份原始几何，
-    #: 渲染时按其每个矩阵各画一次（挂载模型内的多处实例）。
-    instance_matrices: list = field(default_factory=list)
-    #: 与 instance_matrices 对应的节点名（HP_/MP_ 挂点名）；GLB 导出用它命名
-    #: 每个实例的空物体，缺省时回退到网格名。
-    instance_labels: list = field(default_factory=list)
-    #: 按 shape 切片的区间（同 HullMesh.shape_spans）。
-    shape_spans: list = field(default_factory=list)
-
-    def bounds_in_world(self) -> tuple[np.ndarray, np.ndarray]:
-        """本地包围盒经 model_matrix 变换后的世界包围盒。"""
-        pts = np.empty((8, 3), dtype=np.float32)
-        if self.model_matrix is not None:
-            mn = self.positions.min(axis=0)
-            mx = self.positions.max(axis=0)
-            corners = np.array([
-                [mn[0], mn[1], mn[2]], [mx[0], mn[1], mn[2]],
-                [mn[0], mx[1], mn[2]], [mx[0], mx[1], mn[2]],
-                [mn[0], mn[1], mx[2]], [mx[0], mn[1], mx[2]],
-                [mn[0], mx[1], mx[2]], [mx[0], mx[1], mx[2]],
-            ], dtype=np.float32)
-            hom = np.hstack([corners, np.ones((8, 1), dtype=np.float32)])
-            w = hom @ self.model_matrix.T
-            return w[:, :3].min(axis=0), w[:, :3].max(axis=0)
-        return self.positions.min(axis=0), self.positions.max(axis=0)
-
-
-@dataclass
-class ArmorTriangleInfo:
-    material_id: int
-    material_name: str
-    layer_index: int
-    thickness_mm: float
-    color: tuple[float, float, float, float]
-    zone: str
-    #: 该材质所有非零层厚度（Dual 多层材质，升序；tooltip 展示堆叠）
-    layers: list[float] = field(default_factory=list)
-    #: 游戏内装甲查看器隐藏的板（Hull 区通用材质 Trans/Deck/Belt 等）
-    hidden: bool = False
-    #: 板块键 (zone, material_name, thickness_tenths)；高亮/显隐/描边判别
-    plate_key: tuple = ()
-
-
-@dataclass
-class ArmorMesh:
-    name: str
-    positions: np.ndarray          # (N,3) f32（N = 三角形数×3）
-    normals: np.ndarray            # (N,3) f32
-    colors: np.ndarray             # (N,4) f32（每个三角形三顶点同色）
-    indices: np.ndarray            # (M,) u32
-    triangles: list[ArmorTriangleInfo] = field(default_factory=list)
-    #: 归属分类（船体/主炮塔/副炮/防空/...），用于按归属筛选显示
-    component: str = COMPONENT_HULL
-    #: 舰船空间变换（挂载装甲需经挂点矩阵定位；舰体装甲为 None）
-    model_matrix: np.ndarray | None = None
-
-    def bounds_in_world(self) -> tuple[np.ndarray, np.ndarray]:
-        """装甲本地包围盒经 model_matrix 变换后的世界包围盒（舰体装甲恒等）。"""
-        pts = self.positions
-        if self.model_matrix is not None and pts.size:
-            corners = np.array([
-                [pts[:, 0].min(), pts[:, 1].min(), pts[:, 2].min()],
-                [pts[:, 0].max(), pts[:, 1].min(), pts[:, 2].min()],
-                [pts[:, 0].min(), pts[:, 1].max(), pts[:, 2].min()],
-                [pts[:, 0].max(), pts[:, 1].max(), pts[:, 2].min()],
-                [pts[:, 0].min(), pts[:, 1].min(), pts[:, 2].max()],
-                [pts[:, 0].max(), pts[:, 1].min(), pts[:, 2].max()],
-                [pts[:, 0].min(), pts[:, 1].max(), pts[:, 2].max()],
-                [pts[:, 0].max(), pts[:, 1].max(), pts[:, 2].max()],
-            ], dtype=np.float32)
-            hom = np.hstack([corners, np.ones((8, 1), dtype=np.float32)])
-            w = hom @ self.model_matrix.T
-            return w[:, :3].min(axis=0), w[:, :3].max(axis=0)
-        if pts.size:
-            return pts.min(axis=0), pts.max(axis=0)
-        return np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
-
-
-@dataclass
-class CollisionModelData:
-    name: str
-    size_in_bytes: int
-    data: bytes = b""
-
-
-@dataclass
-class ShipGeometry:
-    game_key: str
-    display_name: str
-    model_folder: str
-    hull_meshes: list[HullMesh] = field(default_factory=list)
-    mounts: list[MountMesh] = field(default_factory=list)
-    armor_meshes: list[ArmorMesh] = field(default_factory=list)
-    collision_models: list[CollisionModelData] = field(default_factory=list)
-    bounds_min: np.ndarray | None = None
-    bounds_max: np.ndarray | None = None
-    stats: dict = field(default_factory=dict)
-    #: 舰体漫反射贴图（.dds 原始字节）与 VFS 路径（可能为 None，未找到贴图）
-    texture_dds: bytes | None = None
-    texture_path: str = ""
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -443,6 +51,30 @@ class GeometryService:
 
     _instance: "GeometryService | None" = None
     _lock = threading.Lock()
+
+    # ── 纯装配函数（实现见 services/mesh_assembly.py）──────────────
+    # 留在类里当别名，是为了不改动 30+ 处 `self._x(...)` / `GeometryService._x(...)`
+    # 调用点；这些函数不碰 self，所以等价于模块级函数。
+    _folder_from_model_path = staticmethod(folder_from_model_path)
+    _vfs_entry = staticmethod(vfs_entry)
+    _model_family_token = staticmethod(model_family_token)
+    _shape_lod = staticmethod(shape_lod)
+    _bake_rigid = staticmethod(bake_rigid)
+    _derived_mount_transform = staticmethod(derived_mount_transform)
+    _material_layers = staticmethod(material_layers)
+    _read_vfs = staticmethod(read_vfs)
+    _match_thickness = staticmethod(match_thickness)
+    _norm_shape_stem = staticmethod(norm_shape_stem)
+    _instanced_bounds = staticmethod(instanced_bounds)
+    _palette_subgroups = staticmethod(palette_subgroups)
+    _snapshot_without_mounts = staticmethod(snapshot_without_mounts)
+    _misc_name_from_node = staticmethod(misc_name_from_node)
+    _apply_declared_color = staticmethod(apply_declared_color)
+    _clone_prim = staticmethod(clone_prim)
+    _dedupe_mount_instances = staticmethod(dedupe_mount_instances)
+    _build_armor_mesh = staticmethod(build_armor_mesh)
+    _merge_hull = staticmethod(merge_hull)
+    _LOD_RES = LOD_RES
 
     def __init__(self):
         self._extractor = None  # 懒创建
@@ -595,26 +227,6 @@ class GeometryService:
             self._keep_load_caches = prev
             if not prev:
                 self._clear_per_load_caches()
-
-    @staticmethod
-    def _snapshot_without_mounts(geom: ShipGeometry) -> ShipGeometry:
-        """船体/装甲就绪时的浅拷贝快照（列表/字典复制、元素共享）。
-
-        后台线程后续的挂载解析只改**原对象**，快照不会再变 ⇒ 调用方可安全使用。
-        """
-        import copy
-
-        snap = copy.copy(geom)
-        snap.hull_meshes = list(geom.hull_meshes)
-        snap.armor_meshes = list(geom.armor_meshes)
-        snap.mounts = []
-        snap.texture_dds = dict(geom.texture_dds)
-        snap.stats = dict(geom.stats)
-        warns = snap.stats.get("warnings")
-        if isinstance(warns, list):
-            snap.stats["warnings"] = list(warns)
-        return snap
-
 
     def _load_ship_impl(self, ship: ShipInfo, progress_cb=None,
                         cancel_event: threading.Event | None = None,
@@ -937,74 +549,6 @@ class GeometryService:
                     bmax = np.maximum(bmax, mx)
         return bmin, bmax
 
-    def _dedupe_mount_instances(self, geom: ShipGeometry) -> None:
-        """把 `geom.mounts` 中共享同一几何的 MountMesh 合并为**实例化**网格。
-
-        所有节点类型（HP 挂载 / MP 甲板设备 / 挂载模型骨架上的 MP 子设备）统一收敛：
-        同一模型目录被多个节点引用时，不再逐节点复制顶点，而是每个
-        (model_folder, 几何, component) 只保留一份网格，把各节点的渲染矩阵存入
-        instance_matrices。渲染时逐节点各画一次 → 大幅降低 GPU 内存。
-
-        依据：`_load_mount_model` 按 folder 缓存，同一模型的 `positions` 是同一个
-        ndarray 对象，故用 `id(positions)` 判同几何。
-        """
-        groups: dict = {}
-        order: list = []
-        for mm in geom.mounts:
-            key = (getattr(mm, 'model_folder', ''), id(mm.positions),
-                   getattr(mm, 'component', ''), getattr(mm, 'tech_family', 'pbs'))
-            if key not in groups:
-                groups[key] = [mm, [], []]
-                order.append(key)
-            g = groups[key]
-            labels = list(getattr(mm, 'instance_labels', None) or [])
-            if mm.instance_matrices:
-                g[1].extend(list(mm.instance_matrices))
-                for _k in range(len(mm.instance_matrices)):
-                    g[2].append(labels[_k] if _k < len(labels) else str(mm.name))
-            elif mm.model_matrix is not None:
-                g[1].append(np.ascontiguousarray(mm.model_matrix, dtype=np.float32))
-                g[2].append(labels[0] if labels else str(mm.name))
-            else:
-                g[1].append(np.eye(4, dtype=np.float32))
-                g[2].append(labels[0] if labels else str(mm.name))
-        new_mounts: list = []
-        for key in order:
-            rep, mats, labels = groups[key]
-            n = len(mats)
-            if n == 1:
-                # 单节点：无需实例化，保留原样（不额外复制）
-                if rep.instance_matrices and not rep.model_matrix:
-                    rep.instance_matrices = mats
-                rep.instance_labels = labels
-                new_mounts.append(rep)
-                continue
-            name = f"{getattr(rep, 'name', rep.model_folder)}+({n})"
-            inst = MountMesh(
-                name=name, component=rep.component,
-                positions=rep.positions, normals=rep.normals,
-                uvs=rep.uvs, indices=rep.indices,
-                uv2=rep.uv2, tangents=rep.tangents, binormals=rep.binormals,
-                t4=rep.t4,
-                extra=rep.extra,
-                model_matrix=None,
-                texture_dds=rep.texture_dds, texture_path=rep.texture_path,
-                model_folder=rep.model_folder, vertex_count=rep.vertex_count,
-                is_wire=rep.is_wire, is_crack=rep.is_crack,
-                tech_family=rep.tech_family,
-                material_textures=rep.material_textures or {},
-                indexed_params=rep.indexed_params,
-                has_color=rep.has_color,
-                bone_indices=rep.bone_indices, bone_weights=rep.bone_weights,
-                skin_bones=rep.skin_bones, skin_bind=rep.skin_bind,
-                shape_names=rep.shape_names, node_names=rep.node_names,
-                shape_spans=rep.shape_spans,
-                instance_matrices=mats,
-                instance_labels=labels,
-            )
-            new_mounts.append(inst)
-        geom.mounts = new_mounts
-
     def _load_mounts(self, geom: ShipGeometry, ship: ShipInfo, extractor,
                      armor_thickness: dict, progress_cb=None,
                      cancel_event: threading.Event | None = None,
@@ -1179,23 +723,6 @@ class GeometryService:
         geom.stats["deck_equipment"] = mp_placed
         geom.stats["sub_equipment"] = sub_placed
         geom.stats["unique_mount_models"] = len(model_cache)
-
-    @staticmethod
-    def _folder_from_model_path(model_path: str) -> str:
-        """`.model` 路径 → 模型目录名（末段）。"""
-        parts = [p for p in str(model_path).replace("\\", "/").split("/") if p]
-        return parts[-2] if len(parts) >= 2 else ""
-
-    @staticmethod
-    def _derived_mount_transform(hp: str, transforms: dict) -> np.ndarray | None:
-        """无独立骨架挂点的 HP（如 `HP_JGM_2_HP_JGA_1` 主炮塔上防空炮）
-        按最长前缀回退父挂点矩阵（`HP_JGM_2`）；找不到返回 None。"""
-        parts = hp.split("_")
-        for i in range(len(parts) - 1, 1, -1):
-            cand = "_".join(parts[:i])
-            if cand in transforms:
-                return transforms[cand]
-        return None
 
     def _skeleton_bone_world(self, folder: str, bone_name: str) -> np.ndarray | None:
         """读挂载模型骨架某 bone 的世界矩阵（bind pose，**只从 assets_data.db 读取**）。
@@ -1411,28 +938,6 @@ class GeometryService:
         if app_ctx.ctx.wows_type == "Wargaming":
             return self._misc_name_from_node(mp_name)
         return mp_base_id(mp_name)
-
-    @staticmethod
-    def _misc_name_from_node(node_name: str) -> str:
-        """MP_ 节点名 → misc 模型名（去 MP_ 前缀 + 尾部实例索引）。
-
-        对齐 wows-toolkit `misc_name_from_node`：去 MP_ 前缀，剥尾部
-        `.NNN`（带点三位数）或 `_INDEX_N`（传统索引）后缀。
-        例：MP_BM800_Ventilators_mushroom_INDEX_16 → BM800_Ventilators_mushroom
-        """
-        if not node_name.startswith("MP_"):
-            return node_name
-        rest = node_name[3:]
-        if "." in rest:
-            pos = rest.rfind(".")
-            tail = rest[pos + 1:]
-            if len(tail) == 3 and tail.isdigit():
-                return rest[:pos]
-        idx = rest.rfind("_INDEX_")
-        if idx >= 0:
-            return rest[:idx]
-        return rest
-
 
     def _place_skeleton_mps(self, geom, folder: str, skel_to_ship_game: np.ndarray,
                             model_cache: dict, extractor, armor_thickness: dict,
@@ -1742,25 +1247,6 @@ class GeometryService:
         self._mfm_diffuse_cache[stem] = result
         return result
 
-    @staticmethod
-    def _vfs_entry(extractor, path: str):
-        """O(1) 文件树查找（file_tree 是按路径索引的 dict，避免 list_files 全树扫描）。"""
-        try:
-            return extractor.file_tree.get(path)
-        except Exception:  # noqa: BLE001
-            return None
-
-    @staticmethod
-    def _read_vfs(extractor, path: str) -> bytes:
-        """按路径读取文件字节；不存在/失败返回 b""。"""
-        e = GeometryService._vfs_entry(extractor, path)
-        if e is None or e.is_directory or e.file_info is None:
-            return b""
-        try:
-            return extractor.pkg_reader.read_file(e.volume.filename, e.file_info)
-        except Exception:  # noqa: BLE001
-            return b""
-
     def _load_texture_tier(self, base: str, extractor) -> tuple[str, bytes]:
         """按 .dd0/.dd1/.dd2/.dds 分级读取贴图（.dd0 最高清），返回 (vfs_path, bytes)。
 
@@ -1824,16 +1310,6 @@ class GeometryService:
             pass
         return "", b""
 
-    @staticmethod
-    def _model_family_token(folder: str) -> str:
-        """提取型号 token（如 '5in54_Mark42'），用于同型号跨目录贴图共享匹配。
-
-        型号段形如 `数字+字母+数字+_名称`（跳过目录名开头的编号段如 AGS542_）。
-        """
-        import re
-        m = re.search(r"\d+[a-z]+\d+_\w+", folder)
-        return m.group(0) if m else ""
-
     def _find_hull_diffuse(self, ship: ShipInfo, extractor) -> tuple[str, bytes]:
         """舰体贴图：**只认 .mfm 声明**的 diffuseMap（Hull.mfm 权威，不再按文件名约定补全）。
 
@@ -1851,36 +1327,6 @@ class GeometryService:
 
     #: shape 名里的 LOD 标记。两种命名并存：
     #: `Bow_lod2Shape`（数字在前）与 `JM039_lodShape1`（数字在后）
-    _LOD_RES = (
-        re.compile(r'_lod(\d+)', re.IGNORECASE),
-        re.compile(r'_lodShape(\d+)', re.IGNORECASE),
-    )
-
-    @staticmethod
-    def _shape_lod(name: str) -> tuple[str, int]:
-        """shape 名 → (去掉 LOD 标记的基名, LOD 级别)。无标记视为 0。"""
-        s = name or ''
-        for rx in GeometryService._LOD_RES:
-            m = rx.search(s)
-            if m:
-                return s[:m.start()] + s[m.end():], int(m.group(1))
-        return s, 0
-
-    @staticmethod
-    def _palette_subgroups(prims) -> list[list]:
-        """按蒙皮调色板把 primitive 再分组（保序）。
-
-        一个网格只能带**一份** `skin_bones/skin_bind`，而同一材质下常混有调色板
-        不同的 shape（如 `TurretShape` 4 骨骼 + `insideShape` 1 骨骼、`Dasha` 的
-        手臂/腿各一套骨骼）。合并后顶点组索引会按错误的调色板翻译 → 权重落到
-        别的骨骼上。故合并前按调色板名序列拆开，保证每个网格的调色板一致。
-        """
-        out: dict = {}
-        for p in prims:
-            key = tuple(getattr(p, "skin_bones", None) or ())
-            out.setdefault(key, []).append(p)
-        return list(out.values())
-
     def _split_primitives_by_material(self, primitives, global_rs: dict,
                                       sdict: dict | None = None,
                                       geom_path: str | None = None,
@@ -2098,19 +1544,6 @@ class GeometryService:
                         _add_names(g, p, rs)
         return groups
 
-    @staticmethod
-    def _norm_shape_stem(name: str) -> str:
-        """归一化 shape 名（仅去 .vertices 后缀；**不再剥尾部重复字母**）。
-
-        ⚠️ 旧实现会把 TurretShapeff → TurretShape（剥 ff），导致 JGA180 的 TurretShape
-        网格在渲染集里模糊匹配到 JGA181 的 TurretShapeff 行，错用 JGA010 贴图。
-        实证 PT 26.9：TurretShapeff 是 JGA181.geometry 的真实网格名（mapping_id
-        0xb6f4c31d），TurretShape 是 JGA180 的真实网格名（0x03432c0c）——二者是
-        不同网格，必须严格区分，不得归并。模糊兜底保留（去后缀后同名才匹配），
-        仅处理真正的大小写/后缀笔误。
-        """
-        return name[:-len('.vertices')] if name.endswith('.vertices') else name
-
     def _strings_dict(self, db) -> dict:
         """字符串表 → {hash: name} Python dict（一次构建，O(1) 查询）。
 
@@ -2185,32 +1618,6 @@ class GeometryService:
             bus.log_message.emit(f"⚠️ 渲染集数据读取失败({model_folder}): {exc}，已回退默认贴图")
         self._visual_rs_cache[key] = idx
         return idx
-
-    def _apply_declared_color(self, hm, bundle: dict, extractor):
-        """按 .mfm **声明的贴图属性**设置 mesh 颜色贴图（只认声明，不按名补全）。
-
-        - indexed：用 albedoArray（分块图集）
-        - 标准：用 diffuseMap
-        - 都没声明：has_color=False、texture_dds=None（无色 → 按透明/不参与颜色计算处理）
-
-        bundle 为空（mfm 不在库/解析失败）同样按无色处理，绝不按文件名补全。
-        """
-        texs = (bundle or {}).get('textures') or {}
-        hm.tech_family = (bundle or {}).get('tech_family', 'pbs')
-        hm.material_textures = texs
-        hm.indexed_params = (bundle or {}).get('indexed_params')
-        if hm.tech_family == 'indexed' and 'albedoArray' in texs:
-            hm.texture_path, hm.texture_dds = texs['albedoArray']
-        elif 'diffuseMap' in texs:
-            hm.texture_path, hm.texture_dds = texs['diffuseMap']
-        # meshdecal 的 albedo（SHIP_MESHDECAL_ALBEDO_*）用 g_albedoMap：
-        # 仍是该材质的颜色贴图（alpha 遮罩），应参与渲染，不能当无色 overlay。
-        elif 'g_albedoMap' in texs:
-            hm.texture_path, hm.texture_dds = texs['g_albedoMap']
-        else:
-            # ★ 只认 mfm 声明：没声明颜色贴图就当不存在，不再按名/前缀猜 diffuse
-            hm.texture_path, hm.texture_dds = "", None
-        hm.has_color = bool(hm.texture_dds)
 
     def _resolve_material_texture(self, mfm_path: str, extractor) -> tuple[str, bytes]:
         """材质 .mfm 声明的 diffuseMap 贴图（只认 mfm 里声明的属性；未声明 → 不存在）。
@@ -2409,43 +1816,6 @@ class GeometryService:
         return True
 
 
-    def _bake_rigid(self, prim, m) -> None:
-        """把刚性父节点矩阵 m（4x4 行主序）烘焙进 primitive 的顶点（原地）。"""
-        R = m[:3, :3].astype(np.float64)
-        t = m[:3, 3].astype(np.float64)
-        prim.positions = ((prim.positions.astype(np.float64) @ R.T) + t).astype(np.float32)
-        new_nrm = prim.normals.astype(np.float64) @ R.T
-        ln = np.linalg.norm(new_nrm, axis=1, keepdims=True)
-        ln[ln == 0] = 1.0
-        prim.normals = (new_nrm / ln).astype(np.float32)
-
-    @staticmethod
-    def _clone_prim(p):
-        """复制一个 MeshPrimitive（顶点/法线/uv/索引各拷贝一份，供多节点分别烘焙）。"""
-        from models.geometry_parser import MeshPrimitive
-        return MeshPrimitive(
-            name=p.name,
-            positions=p.positions.copy(),
-            normals=p.normals.copy(),
-            uvs=None if p.uvs is None else p.uvs.copy(),
-            indices=None if p.indices is None else p.indices.copy(),
-            uv2=None if getattr(p, "uv2", None) is None else p.uv2.copy(),
-            tangents=(None if getattr(p, "tangents", None) is None
-                      else p.tangents.copy()),
-            binormals=(None if getattr(p, "binormals", None) is None
-                       else p.binormals.copy()),
-            t4=None if getattr(p, "t4", None) is None else p.t4.copy(),
-            extra=None if getattr(p, "extra", None) is None else p.extra.copy(),
-            mapping_id=p.mapping_id,
-            is_skinned=p.is_skinned,
-            bone_indices=None if p.bone_indices is None else p.bone_indices.copy(),
-            bone_weights=None if p.bone_weights is None else p.bone_weights.copy(),
-            skin_bones=list(p.skin_bones),
-            skin_bind=list(p.skin_bind),
-            shape_name=getattr(p, "shape_name", ""),
-            node_name=getattr(p, "node_name", ""),
-        )
-
     def _apply_rigid_multi(self, prim, rs: dict | None) -> list:
         """对**非蒙皮但刚性绑定**的子模型：按每个绑定节点烘焙一份顶点，返回列表。
 
@@ -2530,213 +1900,6 @@ class GeometryService:
             return game_mats[0], []
         inst = [(negz @ m @ negz).astype(np.float32) for m in game_mats]
         return None, inst
-
-    @staticmethod
-    def _instanced_bounds(positions, matrix) -> tuple[np.ndarray, np.ndarray]:
-        """局部顶点包围盒经实例矩阵变换后的世界包围盒（8 角点法）。"""
-        mn = positions.min(axis=0)
-        mx = positions.max(axis=0)
-        corners = np.array([
-            [mn[0], mn[1], mn[2]], [mn[0], mn[1], mx[2]],
-            [mn[0], mx[1], mn[2]], [mn[0], mx[1], mx[2]],
-            [mx[0], mn[1], mn[2]], [mx[0], mn[1], mx[2]],
-            [mx[0], mx[1], mn[2]], [mx[0], mx[1], mx[2]],
-        ], dtype=np.float32)
-        hom = np.hstack([corners, np.ones((8, 1), dtype=np.float32)])
-        w = (hom @ matrix.T)[:, :3]
-        return w.min(axis=0), w.max(axis=0)
-
-    @staticmethod
-    def _merge_hull(part_name: str, primitives, shape_names: list | None = None,
-                    node_names: list | None = None,
-                    instance_matrices: list | None = None) -> HullMesh:
-        """把同一部件的所有 primitive 合并成单个网格。
-
-        ⚠️ 调用方必须先用 `_palette_subgroups` 按蒙皮调色板分好组：本函数只保留
-        第一份非空调色板，混着不同调色板的顶点会被翻译成错误骨骼的权重。
-        """
-        v_total = sum(p.positions.shape[0] for p in primitives)
-        i_total = sum(0 if p.indices is None else p.indices.size for p in primitives)
-        has_uv = any(p.uvs is not None for p in primitives)
-        has_uv2 = any(getattr(p, "uv2", None) is not None for p in primitives)
-        has_tb = any(getattr(p, "tangents", None) is not None for p in primitives)
-        has_t4 = any(getattr(p, "t4", None) is not None for p in primitives)
-        has_extra = any(getattr(p, "extra", None) is not None for p in primitives)
-        has_bone = any(p.bone_indices is not None for p in primitives)
-
-        positions = np.empty((v_total, 3), dtype=np.float32)
-        normals = np.empty((v_total, 3), dtype=np.float32)
-        uvs = np.empty((v_total, 2), dtype=np.float32) if has_uv else None
-        uv2 = np.empty((v_total, 2), dtype=np.float32) if has_uv2 else None
-        tangents = np.empty((v_total, 3), dtype=np.float32) if has_tb else None
-        binormals = np.empty((v_total, 3), dtype=np.float32) if has_tb else None
-        t4 = np.empty((v_total, 4), dtype=np.uint8) if has_t4 else None
-        extra = np.empty((v_total, 4), dtype=np.uint8) if has_extra else None
-        indices = np.empty(i_total, dtype=np.uint32)
-        bone_indices = np.empty((v_total, 4), dtype=np.uint8) if has_bone else None
-        bone_weights = np.empty((v_total, 4), dtype=np.float32) if has_bone else None
-        skin_bones: list = []
-        skin_bind: list = []
-
-        def _copy_attr(dst, src_val, fill=0.0):
-            if dst is not None:
-                if src_val is not None:
-                    dst[voff:voff + n] = src_val
-                else:
-                    dst[voff:voff + n] = fill
-
-        voff = 0
-        ioff = 0
-        shape_spans: list = []
-        for p in primitives:
-            n = p.positions.shape[0]
-            i_start = ioff
-            i_count = 0 if p.indices is None else int(p.indices.size)
-            if n:
-                shape_spans.append((
-                    getattr(p, "shape_name", "") or "",
-                    getattr(p, "node_name", "") or "",
-                    voff, n, i_start, i_count))
-            positions[voff:voff + n] = p.positions
-            normals[voff:voff + n] = p.normals
-            _copy_attr(uvs, p.uvs)
-            _copy_attr(uv2, getattr(p, "uv2", None))
-            _copy_attr(tangents, getattr(p, "tangents", None))
-            _copy_attr(binormals, getattr(p, "binormals", None))
-            _copy_attr(t4, getattr(p, "t4", None), fill=0)
-            _copy_attr(extra, getattr(p, "extra", None), fill=0)
-            if bone_indices is not None:
-                if p.bone_indices is not None:
-                    bone_indices[voff:voff + n] = p.bone_indices
-                    bone_weights[voff:voff + n] = p.bone_weights
-                else:
-                    bone_indices[voff:voff + n] = 0
-                    bone_weights[voff:voff + n] = 0.0
-            if not skin_bones and p.skin_bones:
-                skin_bones = list(p.skin_bones)
-                skin_bind = list(p.skin_bind)
-            if p.indices is not None and p.indices.size:
-                indices[ioff:ioff + p.indices.size] = p.indices.astype(np.uint32) + voff
-                ioff += p.indices.size
-            voff += n
-
-        return HullMesh(
-            name=part_name,
-            positions=positions,
-            normals=normals,
-            uvs=uvs,
-            uv2=uv2,
-            tangents=tangents,
-            binormals=binormals,
-            t4=t4,
-            extra=extra,
-            indices=indices[:ioff] if ioff < i_total else indices,
-            vertex_count=voff,
-            bone_indices=bone_indices,
-            bone_weights=bone_weights,
-            skin_bones=skin_bones,
-            skin_bind=skin_bind,
-            shape_names=list(dict.fromkeys(shape_names or [])),
-            node_names=list(dict.fromkeys(node_names or [])),
-            instance_matrices=list(instance_matrices or []),
-            shape_spans=shape_spans,
-        )
-
-    @staticmethod
-    def _build_armor_mesh(am: ArmorModel, armor_thickness: dict,
-                          component: str = COMPONENT_HULL,
-                          model_matrix: np.ndarray | None = None) -> ArmorMesh | None:
-        """装甲模型 → 带厚度颜色/材质信息的 ArmorMesh（每三角形 3 顶点同色）。
-
-        component 标记该装甲的归属分类（船体/主炮塔/副炮/...）；挂载装甲
-        传入 model_matrix（挂点变换）用于定位到舰船空间。
-
-        ★ 厚度 ≤0（0mm）的三角形**直接剔除**（游戏内装甲查看器不显示无厚度
-        数据的碰撞面；保留会与有效装甲叠色干扰判读）。全部被剔除时返回 None。
-        """
-        tris = am.triangles
-        if not tris:
-            return None
-        infos: list[ArmorTriangleInfo] = []
-        layers_cache: dict[int, list[float]] = {}
-        keep: list[int] = []   # 保留的三角形下标（thickness > 0）
-
-        for t, tri in enumerate(tris):
-            mat_id = tri.material_id
-            layer = tri.layer_index
-            thickness = GeometryService._match_thickness(armor_thickness, mat_id, layer)
-            if thickness <= 0.0:
-                continue   # 0mm：无厚度数据，彻底驱逐
-            keep.append(t)
-            color = thickness_to_color(thickness)
-            mat_name = collision_material_name(mat_id)
-            from models.collision_materials import zone_from_material_name
-            zone = zone_from_material_name(mat_name)
-            layers = layers_cache.get(mat_id)
-            if layers is None:
-                layers = GeometryService._material_layers(armor_thickness, mat_id)
-                layers_cache[mat_id] = layers
-            hidden = zone == "Hull" and mat_name in HIDDEN_GENERIC_MATERIALS
-            infos.append(ArmorTriangleInfo(
-                material_id=mat_id,
-                material_name=mat_name,
-                layer_index=layer,
-                thickness_mm=thickness,
-                color=color,
-                zone=zone,
-                layers=layers,
-                hidden=hidden,
-                plate_key=(zone, mat_name, round(thickness * 10)),
-            ))
-
-        if not keep:
-            return None
-        n = len(keep)
-        positions = np.empty((n * 3, 3), dtype=np.float32)
-        normals = np.empty((n * 3, 3), dtype=np.float32)
-        colors = np.empty((n * 3, 4), dtype=np.float32)
-        indices = np.arange(n * 3, dtype=np.uint32)
-        for i, t in enumerate(keep):
-            tri = tris[t]
-            base = i * 3
-            positions[base:base + 3] = tri.vertices
-            normals[base:base + 3] = tri.normals
-            colors[base:base + 3] = infos[i].color
-
-        return ArmorMesh(
-            name=am.name,
-            positions=positions,
-            normals=normals,
-            colors=colors,
-            indices=indices,
-            triangles=infos,
-            component=component,
-            model_matrix=model_matrix,
-        )
-
-    @staticmethod
-    def _match_thickness(armor: dict, material_id: int, layer_index: int) -> float:
-        """按 (layer_index, material_id) 查厚度；未命中时取该材质任意非零层。"""
-        v = armor.get((layer_index, material_id))
-        if v is not None:
-            return float(v)
-        # 回退：该材质任一层（取最小非零，避免极端值）
-        best = 0.0
-        for (mi, mat), thk in armor.items():
-            if mat == material_id and thk and (best == 0.0 or thk < best):
-                best = thk
-        return float(best)
-
-    @staticmethod
-    def _material_layers(armor: dict, material_id: int) -> list[float]:
-        """该材质跨 model_index 的所有非零层厚度（升序）。
-
-        Dual 多层材质同一 material_id 可有多个 model_index 层；tooltip
-        需要展示全部堆叠厚度（wows-toolkit lookup_all_layers 语义）。
-        """
-        vals = sorted({float(thk) for (mi, mat), thk in armor.items()
-                       if mat == material_id and thk})
-        return vals
 
     # ── 装甲厚度字典 ────────────────────────────────────
 

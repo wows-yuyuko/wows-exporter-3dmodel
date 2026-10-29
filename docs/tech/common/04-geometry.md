@@ -67,6 +67,10 @@ MergedGeometryPrototype
 
 ## 4. 组装：HullMesh / MountMesh
 
+> 数据结构在 `models/ship_mesh.py`（纯 dataclass + numpy），装配函数在
+> `services/mesh_assembly.py`（不碰文件/数据库）。`GeometryService` 里保留了同名
+> `staticmethod` 别名，所以本文按 `_merge_hull()` 这种写法称呼仍然成立。
+
 ### 船体分段
 
 每个分段文件 → 若干 `HullMesh`：

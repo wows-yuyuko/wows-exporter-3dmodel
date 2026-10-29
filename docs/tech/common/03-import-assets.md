@@ -47,6 +47,11 @@
 
 ### `render_set`（核心，约 40 万行）
 
+> 记录解析代码在 `services/proto_render_sets.py`：`render_sets_lesta_one()` 与
+> `render_sets_wg()` 是两套**互不通用**的布局（0x40/0x50 vs 0x70/0x28），
+> `populate()` 只负责扫树、过滤模型、调 `add_row` 写库。
+
+
 | 列 | 含义 |
 |---|---|
 | `geom_path` + `shape` | 主键（`geom_path` 前缀索引足够快：带模型过滤的 IN 查询 4.65 ms） |
