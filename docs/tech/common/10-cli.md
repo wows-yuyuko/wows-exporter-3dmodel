@@ -1,57 +1,56 @@
 # 10 · CLI 参考（`python cli.py …`）
 
-> 代码：`cli.py`（单文件，argparse 六个子命令）
-> 本文按 **2026-10-27 的代码**校对；默认值、产物布局、行为都以代码为准。
+> 代码：`cli.py`（单文件）。**默认动作 = 增量同步数据库 + 导出选中的船**，
+> 只有 `import`（只同步）和 `diff`（只对比）是子命令。
+> 本文按 2026-10-28 的代码校对；默认值、产物布局、行为都以代码为准。
 
-## 1. 命令总览
-
-| 命令 | 用途 | 需要先 `import` 建库 | 典型耗时 |
-|---|---|---|---|
-| `list` | 列船（GameParams 直读） | ❌ | < 5 s |
-| `diff` | **版本对比**：找出两版之间 geometry 变动的船（只读 idx 的 crc32） | ❌（有库才能映射到船 key） | ~15 s（两版各扫一次 idx） |
-| `import` | 建库（GameParams + assets.bin → `data/*.db`） | — | 分钟级 |
-| `ship` | **单船导出**（主力） | ✅ | 35 s ~ 4 min |
-| `batch` | 批量导出（默认单进程 `batch-worker` 跑完整批） | ✅ | 按船数 |
-| `export-keys` | 只写船 key 列表 | ❌ | < 5 s |
-| `batch-worker` | 内部：`batch` 的子进程，一般不手跑 | ✅ | — |
-
-## 2. 通用约定
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--game DIR` | 必填 | 游戏安装根（下面要有 `bin/`、`data/`），如 `D:\Games\Korabli` |
-| `--server {lesta,wg}` | **必填** | Lesta = `Korabli`，wg = `World_of_Warships`。**没有默认值**，必须显式指定 |
-| `--gp FILE` | 空 | 显式指定 GameParams（默认 `<game>/data/GameParams*.data`） |
-
-- `bin_folder`（build 号）优先用 `import` 写进 `data/*.db` 的值；库里没有或该目录已不存在时，
-  取 `<game>/bin/` 下**数字最大**的目录（`8867689` vs `8870710` 按数值比，不按字符串）。
-  build 号**不写进 config.json**，客户端更新后无需改配置。
-- **一个 `--out` 只能放一个服务器 + 一个 build 的产物**：船 key 相同会互相覆盖
-  （Lesta 与 WG 都有 `PJSB018_Yamato_1944`）。导出时若发现已有 manifest 的 build 不同，
-  会打印 `[warn] … 将被覆盖`，请分根输出（`out/lesta`、`out/wg`）。
-
-## 3. `ship` —— 单船导出
+## 1. 一个入口
 
 ```text
-ship --game DIR --ship KEY --out DIR
-     --server {lesta,wg} [--gp FILE]
-     [--no-textures] [--zstd] [--armor] [--damage] [--decals]
-     [--lod N=2] [--merge-shapes | --split-shapes]
-     [--slim | --no-slim]
-     [--bake-indexed | --no-bake-indexed] [--bake-size PX=0]
-     [--emissive | --no-emissive] [--texture-size N=1024]
-     [--skins] [--permoflage] [--model-skins]
-     [--model-skin ID|auto|none] [--no-model-skin]
+python cli.py [--server {lesta,wg}] [--game DIR] [--gp FILE] [--out DIR]
+              [--ship SPEC]... [--jobs N] [--limit N] [--force] [--no-sync]
+              [--rebuild] [--bin BUILD] [--version TEXT]
+              [全部导出开关，见 §3]
 ```
 
-`--ship` 接受 GameParams key（`PJSB018_Yamato_1944`），也接受模型目录名
-（`JSB039_Yamato_1945`），取第一个匹配。
+不带子命令就是「同步 + 导出」。`--server` 必填（决定读哪一服、默认游戏路径取哪个）。
+
+| 命令 | 干什么 | 需要先建库 |
+|---|---|---|
+| `python cli.py --server lesta` | **同步 + 导出全部船** | 自动（首次建库、之后增量） |
+| `python cli.py --server lesta --ship 10` | 同步 + 只导 10 级 | 自动 |
+| `python cli.py import --server lesta` | 只建库 / 同步，不导出 | — |
+| `python cli.py diff --server lesta` | 只对比两个 build（只读 idx，不建库） | ❌ |
+
+`--game` 不给就取 `config.json` 里该服的路径（`game_path_lesta` / `game_path_wargaming`）；
+`--out` 默认 `out`。
+
+## 2. `--ship` 筛选（可重复，取并集）
+
+| 写法 | 例子 | 匹配 |
+|---|---|---|
+| 完整 key | `PJSB018_Yamato_1944` | `ship.key` 精确（大小写不敏感） |
+| idx | `PJSB018` | key 的第一段（`PJSB018_...`） |
+| 模型目录 | `JSB039_Yamato_1945` | `ship.model_folder` |
+| 等级 | `10` / `3,4,7` / `5-11` | `ship.tier` |
+| 子串（兜底） | `Yamato` | 精确都没命中时按 key 子串匹配 |
+
+```bash
+python cli.py --server lesta --ship 10              # 232 条
+python cli.py --server lesta --ship 3,4,7           # 189 条
+python cli.py --server lesta --ship 5-11            # 943 条
+python cli.py --server lesta --ship PJSB018 --ship PJSD889   # 2 条
+```
+
+一个精确写法都没命中的 spec 会打印 `[warn] --ship 'x' 没匹配到任何船`。
+
+## 3. 导出开关
 
 ### 3.1 输出与内容
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--out DIR` | 必填 | 输出根（布局见 §8） |
+| `--out DIR` | `out` | 输出根（布局见 §6） |
 | `--no-textures` | 关 | 不导贴图：GLB 里没有 image，也不写 `textures/` |
 | `--zstd` | 关 | 额外写 `.glb.zst`（zstd level 10，仅传输压缩） |
 | `--armor` | 关 | 额外导 `armor/<ship>/`（`.glb` + `.json` + `.bin`） |
@@ -103,22 +102,39 @@ ship --game DIR --ship KEY --out DIR
 
 指定具体 ID 时按 `ext_index` / `raw_name` / `display_name` 匹配，找不到会列出可选项后退出。
 
-## 4. `list` / `export-keys`
+## 4. `import` —— 建库 / 增量同步
 
 ```text
-list        --game DIR --server {lesta,wg} [--filter TEXT] [--gp FILE]
-export-keys --game DIR --out FILE --server {lesta,wg} [--filter TEXT] [--limit N] [--gp FILE]
+import --server {lesta,wg} [--game DIR] [--gp FILE] [--bin BUILD] [--version TEXT] [--rebuild]
 ```
 
-- `list` 输出四列（Tab 分隔）：`key  model_folder  T<tier>  nation`；
-- `--filter` 是**子串匹配**（大小写不敏感，同时匹配 key 与 model_folder）；空串 = 全部；
-- `export-keys` 只写 key，一行一个；`--limit` 截断（`batch --jobs ≥ 1` 靠它工作）。
+默认动作里**自动执行**这一步（`--no-sync` 可跳过）。流程：
 
-## 4.5 `diff` —— 版本对比（找变动的船）
+1. 设 `wows_type / game_path / bin_folder`；
+2. 把 GameParams 复制进 `<project>/data/`；
+3. `bin_folder` = `--bin`，否则 `<game>/bin/` 下**数字最大**的目录；
+4. 扫 idx 建模型清单（**5.5 s**，不解包几何）→ 与库里的 `model.sig` 比对；
+5. 只重写内容变了的行（快照 sha1 / 模型签名），其余仅刷 `last_checked`；
+6. 有模型变动才同步 3D 缓存（`assets_data.db`），否则直接跳过；
+7. 超时 **1800 s**；失败 `SystemExit(1)`。
+
+| 场景 | 耗时（Lesta 实测） |
+|---|---|
+| 首次 / `--rebuild` | 约 4 min（其中 92 s 是读 assets.bin） |
+| 同 build 无变更 | **15–18 s**（只扫 idx + 刷时间戳，不碰 assets.bin） |
+| 版本更新（几条船变了） | 18 s + 重建那几个模型的 3D 缓存 |
+
+`--rebuild` 忽略增量判据，强制全量重解析 3D 缓存 —— 解析逻辑改过
+（或怀疑缓存脏了）时用。它不会重建 `game_data.db` 的行，只重写内容变化的。
+
+客户端更新后必须重跑；不做增量校验的话 build 号与资产会对不上
+（旧版直接全清重建，现在是 upsert + 变更集）。
+
+## 5. `diff` —— 版本对比（诊断用）
 
 ```text
-diff --game DIR --server {lesta,wg} [--old BUILD] [--new BUILD]
-     [--format text|keys|json] [--out FILE]
+diff --server {lesta,wg} [--game DIR] [--old BUILD] [--new BUILD]
+     [--format text|json] [--out FILE]
 ```
 
 `--old` / `--new` 缺省时取 `<game>/bin/` 下**数值最大的两个**（新 = 最大）。
@@ -128,14 +144,15 @@ diff --game DIR --server {lesta,wg} [--old BUILD] [--new BUILD]
 
 | 层 | 做什么 | 成本 |
 |---|---|---|
-| 读两版 idx | 各 ~3.2 万个 `.geometry` 的 `(crc32, size)` | 两版合计 ~12 s |
+| 读两版 idx | 各 ~3 万个 `.geometry` 的 `(crc32, size)` | 两版合计 ~12 s |
 | 比对 | crc+size 一致 → 视为没变 | 毫秒级 |
-| 映射 | 目录名 → 船（`ship_models` + ship 快照的 `A_*.*.model`） | ~2 s |
+| 映射 | 目录名 → 船（`ship` + `ship_model`） | ~2 s |
 
-实测（WG `13187581 → 13357625`，共 2.4 万个改动点里只有 25 个文件变）：
+实测（WG `13187581 → 13357625`，3.2 万个同名 geometry 里只有 25 个文件变）：
 
 ```text
 对比 13187581 → 13357625
+  .geometry：旧 32050 / 新 32103，同名 63686
   变动 19 个模型目录（25 个文件）
 
 船体变动 7 条（其中 1 条动了主文件，可能含装甲）：
@@ -145,7 +162,6 @@ diff --game DIR --server {lesta,wg} [--old BUILD] [--new BUILD]
 
 挂载模型变动 12 个，波及 21 条船：
   JGM055_100mm65_Type98         PJSB508_Kii、PJSD210_Harugumo、…
-  JGT023_610mm4_Type_93R        PJSB539_Daisen、PJSC517_Maya、…
 ```
 
 字段含义：
@@ -153,67 +169,17 @@ diff --game DIR --server {lesta,wg} [--old BUILD] [--new BUILD]
 - **仅分段** = 只动了 `_Bow` / `_MidFront` 等，属于模型细节，装甲没变；
 - 挂载是**多船共享**的，改一个会影响一批船 —— 所以输出按「模型目录 → 引用它的船」列。
 
-`--format keys` 输出一行一个船 key，可直接给 `batch --keys-file`：
-
-```bash
-python cli.py diff --server wg --game D:\Games\World_of_Warships --format keys --out changed.txt
-python cli.py batch --server wg --game D:\Games\World_of_Warships --out out\wg --keys-file changed.txt
-```
+**它和默认流程的关系**：默认动作已经自动同步，所以 diff 不是必经步骤。
+它的价值是「不碰数据库就能先看影响面」—— 比如只想确认这次更新动了几条船。
 
 **局限（口径：宽松）**：
 - crc32 覆盖整个 `.geometry`（含顶点/索引）→ **只改模型细节也会判为变动**，宁可多导不漏导；
-- 只比 `.geometry`。**纯 GameParams 变动**（改装甲厚度、改挂载配置、改涂装归属）不会被发现；
-- 新增/删除的 geometry 会单独列出（新船通常伴随新增 geometry），但不自动转成船 key；
+- 只比 `.geometry`。**纯 GameParams 变动**（改装甲厚度、改挂载配置、改涂装归属）不会被发现
+  （但 `import` 的快照 sha1 能发现，见 §4）；
+- 新增/删除的 geometry 会单独列出，但不自动转成船 key；
 - 没有 `game_data*.db` 时退化为只报模型目录名，映射不到船。
 
-## 5. `import` —— 建库 / 增量同步
-
-```text
-import --game DIR --server {lesta,wg} [--gp FILE] [--bin BUILD] [--version TEXT] [--rebuild]
-```
-
-1. 设 `wows_type / game_path / bin_folder`；
-2. 把 GameParams 复制进 `<project>/data/`；
-3. `bin_folder` = `--bin`，否则 `<game>/bin/` 下**数字最大**的目录；
-4. 扫 idx 建模型清单（**5.5 s**，不解包几何）→ 与库里的 `model.sig` 比对；
-5. 只重写内容变了的行（快照 sha1 / 模型签名），其余仅刷 `last_checked`；
-6. 有模型变动才同步 3D 缓存（`assets_data.db`），否则直接跳过；
-7. 同步跑（后台线程 + `data_processed` 信号），超时 **1800 s**；
-8. 失败 `SystemExit(1)`；成功打印 `import result: {'ok': True}`。
-
-| 场景 | 耗时（Lesta 实测） |
-|---|---|
-| 首次 / `--rebuild` | 约 4 min（其中 92 s 是读 assets.bin） |
-| 同 build 无变更 | **18 s**（只扫 idx + 刷时间戳，不碰 assets.bin） |
-| 版本更新（几条船变了） | 18 s + 重建那几个模型的 3D 缓存 |
-
-`--rebuild` 忽略增量判据，强制全量重解析 3D 缓存 —— 解析逻辑改过
-（或怀疑缓存脏了）时用。它不会重建 `game_data.db` 的行，只重写内容变化的。
-
-客户端更新后必须重跑；不做增量校验的话 build 号与资产会对不上
-（旧版直接全清重建，现在是 upsert + 变更集）。
-
-## 6. `batch` —— 批量导出
-
-```text
-batch --game DIR --out DIR --server {lesta,wg} [--filter TEXT] [--keys-file FILE]
-      [--jobs N=1] [--limit N] [--force] [--gp FILE]
-      + ship 的全部开关
-```
-
-`--keys-file` 直接指定要导哪些船（一行一个 key，`#` 开头当注释），
-与 `--filter` 是**交集**；不在当前 GameParams 里的 key 会打印 `[warn]` 跳过。
-配 `diff --format keys` 就是「版本更新只导变动船」的闭环。
-
-### 6.1 `--jobs` 三档
-
-| 值 | 行为 |
-|---|---|
-| **1（默认）** | 单进程跑 `batch-worker`：GameParams / DB 只初始化一次，逐船调 `_export_ship()` |
-| `> 1` | `export-keys` 写 `.keys.txt` → 按 key **交错**切成 N 份 → N 个 `batch-worker` 并行 |
-| `0` | 旧行为：每艘船起一个 `ship` 子进程（进程隔离，但每条船都重新加载 GameParams/DB） |
-
-### 6.2 增量导出
+## 6. 增量导出与 `--jobs`
 
 输出根下维护 `.export_index.json`：
 
@@ -224,41 +190,30 @@ batch --game DIR --out DIR --server {lesta,wg} [--filter TEXT] [--keys-file FILE
 - 产物存在 **且** 签名一致 → `[skip]`（实测同参数复跑 3m14s → **2.3 s**）；
 - 任一开关或 build 变化 → 重导（换皮肤、换 LOD、关烘焙都会触发）；
 - `--force` 忽略签名全量重导；
-- `--limit N` 只导前 N 条（在 `export-keys` 阶段截断，两档 `--jobs` 都生效）。
+- `--limit N` 只导前 N 条（在选船之后截断）。
+
+### `--jobs`
+
+| 值 | 行为 |
+|---|---|
+| **1（默认）** | 进程内串行：GameParams / DB 只初始化一次，逐船调 `_export_ship()` |
+| `> 1` | 按 key **交错**切成 N 份 → N 个 `--worker` 子进程并行（内部开关，不出现在 `--help`） |
 
 **局限**：签名是**输入级**（build + 参数），不含产物内容哈希。同一 build 内资产被改动
 （换了 mod 包但版本号没变）不会自动重导。
 
-### 6.3 输出行
+### 输出行
 
 ```text
-[skip] 12 unchanged ships
-[worker done] 3
-[done] 3 exported to out/lesta
+[sync] build 8870710 ← GameParams_py3.data
+  📦 战舰 新增 0 / 变动 0 / 未变 1165 / 下架 0；模型 新增 0 / 变动 0 / 未变 21232 …
+[sync] done
+[plan] 1 / 1070 艘 → out
+[skip] 12 艘未变（签名命中），直接跳过
+[done] 1 / 1 exported to out
 ```
 
-`--jobs 0` 时逐船打印 `[ok]/[skip]/[fail]`。
-
-## 7. `batch-worker`（内部）
-
-```text
-batch-worker --game DIR --keys-file FILE --out DIR
-             --server {lesta,wg} [--no-textures] [--zstd] [--armor] [--damage] [--decals]
-             [--bake-indexed | --no-bake-indexed] [--bake-size PX]
-             [--slim | --no-slim] [--emissive | --no-emissive]
-             [--texture-size N] [--lod N]
-             [--skins] [--permoflage] [--model-skins]
-             [--model-skin ID|auto|none] [--no-model-skin]
-             [--merge-shapes] [--gp FILE]
-```
-
-只为 `batch --jobs ≥ 1` 服务；`--force` / `--limit` 由父进程处理，这里不接受。
-
-**历史坑**：这些参数曾只在父进程解析、子命令没定义，`batch --jobs 2` 会直接
-`unrecognized arguments` 退出。**以后加新开关必须两处都加**（`ship` 与 `batch-worker`，
-外加 `batch` 的透传），否则并行分支会静默丢参数。
-
-## 8. 产物布局
+## 7. 产物布局
 
 ```text
 <out>/
@@ -267,60 +222,68 @@ batch-worker --game DIR --keys-file FILE --out DIR
   armor/<ship>/<ship>.{glb,json,bin}  装甲（仅 --armor）
   skins/<ship>/*.json                 皮肤元数据（仅 --skins / --model-skins）
   textures/<sha1>.webp                贴图池（扁平、按内容哈希去重、跨船共享）
-  .export_index.json                  增量索引（仅 batch）
+  .export_index.json                  增量索引
 ```
 
 GLB 内的贴图 URI 是相对 GLB 的 `../../textures/…`；manifest 里的路径统一相对输出根。
 
-## 9. 退出码与排错
+## 8. 退出码与排错
 
 | 情况 | 表现 |
 |---|---|
 | 正常 | exit 0 |
-| `ship` 失败（船找不到、加载异常） | 抛异常 / `SystemExit(...)`，**非零** |
-| `import` 失败或超时 | `SystemExit(1)` |
-| `batch` 单船失败 | 只打印 `[fail] <key>: <末 300 字>`，**进程仍退 0** —— 要看日志或产物，不能只看退出码 |
+| 船找不到 / 加载异常 | `SystemExit(...)` 或单船 `[fail]`，见下 |
+| 同步失败或超时 | `SystemExit(1)` |
+| 单船失败 | 打印 `[fail] <key>: <异常>`，**进程仍退 0** —— 要看日志或产物，不能只看退出码 |
 
 常见问题：
 
-- `unrecognized arguments` → 用了子命令没定义的开关（尤其手跑 `batch-worker`）；
+- `--server 必填` → 没给 `--server`；`--game` 也没配进 `config.json`；
+- `没有匹配的船` → `--ship` 的 spec 一个都没命中（注意等级是 `10` 不是 `T10`）；
 - 页面 404 / 空白 → `--out` 根与页面 `root=` 参数不一致；改了布局或文件名要硬刷新；
-- 同名船被覆盖 → 两个服务器导进了同一个 `--out`；
+- 同名船被覆盖 → 两个服务器导进了同一个 `--out`（`PJSB018_Yamato_1944` 两边都有）；
 - 贴图缺失 → 用了 `--no-textures`，或换了 `--texture-size` 却沿用旧的 `textures/`。
 
-## 10. 已修正的历史问题（备查）
+## 9. 已修正的历史问题（备查）
 
 | 问题 | 现状 |
 |---|---|
 | `--split-shapes` 死参数（解析了但不用） | 已接线，且与 `--merge-shapes` 互斥 |
 | `--merge-shapes` 帮助写 "(default)"，与实现相反 | 帮助改为实际语义 |
-| `batch` 没有 `--split-shapes` | 已补齐（互斥组） |
-| `load_ship` docstring 写 `lod=-1` 默认 | 改为“默认 2”，并说明 `-1` = LOD0 |
-| `batch --jobs 2` 报 `unrecognized arguments` | 子命令补齐全部开关 |
-| `batch` 只按“文件存在”跳过 | 改为 build+参数的签名索引（§6.2） |
-| `batch --limit` 在 `--jobs ≥ 1` 下被忽略 | `export-keys` 支持 `--limit` 并透传 |
+| `load_ship` docstring 写 `lod=-1` 默认 | 改为"默认 2"，并说明 `-1` = LOD0 |
+| `--jobs 2` 报 `unrecognized arguments` | 子进程补齐全部开关（现共用 `_add_export_flags`） |
+| 只按"文件存在"跳过 | 改为 build+参数的签名索引（§6） |
+| `--limit` 在并行分支被忽略 | 选船后统一截断，两条分支都生效 |
+| 命令面 7 个子命令、6 个帮助空白 | 收敛为「默认动作 + `import`/`diff`」，全部带说明 |
 
-## 11. 典型命令
+## 10. 典型命令
 
 ```bash
-# 列船 / 建库（客户端更新后必须重跑 import）
-python cli.py list   --server lesta --game D:\Games\Korabli --filter Yamato
-python cli.py import --server lesta --game D:\Games\Korabli
+# 建库 / 更新（客户端更新后跑一次；日常不用单独调，默认动作会自动做）
+python cli.py import --server lesta
 
-# 单船：渲染 + 装甲 + zst
-python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out\lesta --armor --zstd
+# 全部导出（首次 ~4 min 同步 + 按船数导出）
+python cli.py --server lesta --out out/lesta
+
+# 只导 10 级
+python cli.py --server lesta --ship 10 --out out/lesta
+
+# 指定几条（idx + 完整 key 混用）
+python cli.py --server lesta --ship PJSB018 --ship PJSD889 --out out/lesta
+
+# 渲染 + 装甲 + zst
+python cli.py --server lesta --ship PJSB520_Raiju --out out/lesta --armor --zstd
 
 # 快速预览：低模 + 小贴图
-python cli.py ship --server lesta --game D:\Games\Korabli --ship PBSD511_Waterloo --out out\lesta \
-  --lod 2 --texture-size 512
+python cli.py --server lesta --ship PBSD511_Waterloo --out out/lesta --lod 2 --texture-size 512
 
 # 联动船本来的样子（默认 auto 已自动套模型皮肤）；要原版就关掉
-python cli.py ship --server wg --game D:\Games\World_of_Warships \
-  --ship PJSB700_ARP_Yamato --out out\wg
-python cli.py ship --server wg --game D:\Games\World_of_Warships \
-  --ship PJSB700_ARP_Yamato --out out\wg --no-model-skin
+python cli.py --server wg --ship PJSB700_ARP_Yamato --out out/wg
+python cli.py --server wg --ship PJSB700_ARP_Yamato --out out/wg --no-model-skin
 
-# 批量：先小规模验证，再全量；--jobs 4 并行
-python cli.py batch --server lesta --game D:\Games\Korabli --filter 10 --out out\lesta --armor --jobs 4 --limit 5
-python cli.py batch --server lesta --game D:\Games\Korabli --out out\lesta --force
+# 只想知道这次更新动了哪些船（不碰数据库）
+python cli.py diff --server wg
+
+# 多进程
+python cli.py --server lesta --ship 10 --jobs 4 --out out/lesta
 ```

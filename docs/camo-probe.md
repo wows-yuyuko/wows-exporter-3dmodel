@@ -103,10 +103,9 @@ sqlite3 data/assets_data.db \
 导皮肤（实测数量）：
 
 ```bash
-python cli.py ship --server lesta --game D:\Games\Korabli --ship PBSD511_Waterloo --out out --skins
+python cli.py --server lesta --ship PBSD511_Waterloo --out out --skins
 # → PCEM024 / PCEM028 / PCEM033（材质皮肤），0 套模型皮肤
 
-python cli.py ship --server wg --game D:\Games\World_of_Warships \
-  --ship PJSB700_ARP_Yamato --out out --skins --model-skins
+python cli.py --server wg --ship PJSB700_ARP_Yamato --out out --skins --model-skins
 # → [skins] 0 [] / [model-skins] 2 ['PJES340', 'PJES512']
 ```

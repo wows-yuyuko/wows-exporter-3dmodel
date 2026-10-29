@@ -1,19 +1,16 @@
 # 01 · 端到端管线与产物
 
-## 1. 六个命令对应的三条数据流
+## 1. 三个入口对应的三条数据流
 
 | 命令 | 读什么 | 写什么 | 是否用数据库 |
 |---|---|---|---|
-| `list` | `GameParams.data`（pickle） | stdout | ❌ |
-| `export-keys` | 同上 | 文本（每行一个 ship key） | ❌ |
-| `import` | GameParams + `content/assets.bin` | `data/game_data*.db`、`data/assets_data*.db` | 写 |
-| `ship` | `assets_data*.db` + 客户端 pkg | 输出目录（见 §3） | 读 |
-| `batch` | 同上 | 同上，逐船一个子进程 | 读 |
-| `batch-worker` | 同上（内部） | 同上 | 读 |
+| `cli.py --server X`（默认） | 先同步（GameParams + `content/assets.bin`），再读库 + 客户端 pkg | `data/*.db` + 输出目录（见 §3） | 写 + 读 |
+| `cli.py import` | GameParams + `content/assets.bin` | `data/game_data*.db`、`data/assets_data*.db` | 写 |
+| `cli.py diff` | 两版 `bin/<build>/idx/*.idx` | stdout | 只读（映射船用） |
 
-`batch` 自己**不做导出**：它按 `--jobs` 把船 key 切成 N 份，起 N 个
-`batch-worker` 子进程（`cli.py:cmd_batch()`）。所以 `batch` 与 `ship` 的行为差异
-只体现在"跳过已存在产物"与分片，导出逻辑完全共用 `_export_ship()`。
+默认动作 = `import`（增量）+ 导出。导出循环在进程内逐船调 `_export_ship()`；
+`--jobs > 1` 时按 key 交错切成 N 份，起 N 个 `--worker` 子进程（隐藏开关），
+导出逻辑完全共用。
 
 ## 2. 运行期依赖关系
 
@@ -38,7 +35,7 @@ cli.py
 
 `_bootstrap()` 里的 build 解析顺序（`cli.py:_bootstrap()`）：
 
-1. `core.build_info.imported_build(server)` 读 `game_data*.db` 的 `meta_import_state`；
+1. `services.database_service.imported_build(server)` 读 `game_data*.db` 的 `meta.build`；
 2. 该目录不存在时，退到 `bin/` 下**数字最大**的目录。
 
 > 第 2 步是坑：客户端更新后 `bin/` 会多出新目录，而库里的 build 是旧的
@@ -68,7 +65,7 @@ cli.py
 > 除 `textures/` 外每类产物都多一层船名目录；GLB 里的贴图 URI 因此是
 > `../../textures/…`，manifest 里的路径统一相对输出根。
 
-- 贴图文件名按内容哈希（`services/texture_export.write_webp`），同图不重复落盘；
+- 贴图文件名按内容哈希（`services/texture_io.write_webp`），同图不重复落盘；
 - `textures/` 是**共享目录**：多次导出到同一个 `<out>` 会累积历史贴图，
   改过 `--texture-size` 后旧图不会被自动删（体积会虚高，需手工清）。
 - `--no-textures` 时 `geometry/<ship>/` 只有 GLB，不写 `textures/`；GLB 里也不嵌图。

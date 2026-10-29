@@ -39,7 +39,7 @@ content/assets.bin ┴─ import ─→ assets_data*.db ┘                armor
                                                                  skins/<ship>/*.json
 ```
 
-- `list` / `export-keys` **不进数据库**，直接解析 GameParams；
+- `diff` **不进数据库**，直接解析 idx（`.geometry` 的 crc32）；
 - `ship` / `batch` **只读数据库**（`assets_data*.db`），运行期才从客户端 pkg 取
   `.geometry` 与贴图字节；
 - `import` 只在客户端更新后跑一次。

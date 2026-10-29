@@ -27,7 +27,7 @@ pickle.loads(gpd, encoding='latin1') # 3) pickle → GPData / dict
 
 `core/gameparams.py`（CLI 列船用）额外支持 WG 的 **deflate 变体**：
 `zlib.decompressobj(-15)` 解出后整体反转再 zlib。两条路径互不依赖：
-`list`/`export-keys`/`diff` 走 `core.gameparams`，`import` 走 `processor_service`。
+`diff` 走 `core.gameparams`，`import` 走 `processor_service`。
 
 ## 2. 只保留舰船
 

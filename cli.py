@@ -1,12 +1,19 @@
 """wows-exporter-3dmodel CLI.
 
-Subcommands:
-    list  --game DIR [--server lesta|wg] [--filter TEXT]
-    ship  --game DIR --ship KEY --out DIR [--server ...] [--no-textures]
+默认动作（不带子命令）= 增量同步数据库 + 导出选中的船：
+
+    python cli.py --server lesta                      # 同步 + 导出全部
+    python cli.py --server lesta --ship 10            # 只导 10 级
+    python cli.py --server lesta --ship 3,4,7 --ship PJSB018
+
+子命令只有两个（`--jobs>1` 的子进程入口是隐藏的 `--worker`，不在命令列表里）：
+    import  只建库 / 同步，不导出
+    diff    对比两个 build 的 geometry crc32（只读 idx，不用建库）
 """
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,58 +21,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from core.gameparams import ships as gp_ships  # noqa: E402
-
-
-def _auto_extract(game: Path, server: str) -> Path:
-    from data_extractor import GameExtractor
-    build = _latest_bin(game)
-    if not build:
-        raise SystemExit("no game build under %s/bin" % game)
-    ex = GameExtractor(str(game), bin_folder=build)
-    try:
-        entries = [e for e in ex.list_files(["content/GameParams*.data"]) if not e.is_directory]
-        if not entries:
-            raise SystemExit("GameParams not found in package")
-        target = game / "data"
-        target.mkdir(parents=True, exist_ok=True)
-        for e in entries:
-            name = e.path.rsplit("/", 1)[-1]
-            ex.extract_single(e.path, target / name)
-        print("[extract]", [e.path for e in entries])
-    finally:
-        ex.close()
-    return _gameparams_path(game, server)
+from core.gameparams import locate as gp_locate, ships as gp_ships  # noqa: E402
+from utils.path_utils import latest_build  # noqa: E402
 
 
 def _gameparams_path(game: Path, server: str, gp: str | None = None) -> Path:
-    if gp:
-        return Path(gp)
-    data = game / "data"
-    names = ["GameParams_py3.data", "GameParams_py2.data", "GameParams.data"] if server == "lesta" \
-        else ["GameParams.data", "GameParams_py3.data"]
-    for name in names:
-        if (data / name).is_file():
-            return data / name
-    return _auto_extract(game, server)
-
-
-def cmd_list(args):
-    for ship in gp_ships(str(_gameparams_path(Path(args.game), args.server, args.gp)), args.filter):
-        print("%s\t%s\tT%d\t%s" % (ship.key, ship.model_folder, ship.tier, ship.nation))
-
-
-def _latest_bin(game: Path) -> str:
-    """`<game>/bin` 下**数字最大**的目录名（客户端版本号）。
-
-    不能用字符串排序：`8867689` 与 `999999` 这类会按字典序排错，且旧版本里
-    可能存在非数字目录（如 `tmp`）。没有数字目录时返回空串。
-    """
-    bin_root = game / "bin"
-    if not bin_root.is_dir():
-        return ""
-    nums = [p.name for p in bin_root.iterdir() if p.is_dir() and p.name.isdigit()]
-    return max(nums, key=int) if nums else ""
+    """`--gp` 优先，否则按服找；都没有就从 pkg 解包（唯一会写游戏目录的地方）。"""
+    return Path(gp) if gp else Path(gp_locate(game, server, extract=True))
 
 
 def _bootstrap(game: Path, server: str):
@@ -76,10 +38,10 @@ def _bootstrap(game: Path, server: str):
     else:
         app.config.wows_type = "Wargaming"
         app.config.game_path_wargaming = str(game)
-    from core.build_info import imported_build
+    from services.database_service import imported_build
     build = imported_build(server)
     if not build or not (game / "bin" / build).is_dir():
-        build = _latest_bin(game)
+        build = latest_build(game)
     app.config.bin_folder = build
     return app
 
@@ -239,53 +201,159 @@ def _export_ship(ship, args, out: Path):
     return glb
 
 
-def cmd_ship(args):
-    _bootstrap(Path(args.game), args.server)
-    ship = next((s for s in gp_ships(str(_gameparams_path(Path(args.game), args.server, args.gp)), args.ship)
-                 if s.key == args.ship or s.model_folder == args.ship), None)
-    if ship is None:
-        raise SystemExit("ship not found: %s" % args.ship)
-    _export_ship(ship, args, Path(args.out))
-
-
 def cmd_diff(args):
     """对比两个 build 的 `.geometry` crc32，列出变动的船 / 挂载模型。
 
-    只读 idx 与 game_data*.db，不加载 assets.bin、不解包几何（秒级）。
+    只读 idx 与 game_data*.db，不加载 assets.bin、不解包几何（约 15 s）。
     """
     from services.version_diff import run
 
+    args.game = str(_resolve_game(args))
     text, n = run(args.game, args.server, args.old, args.new, args.format)
     if args.out:
         p = Path(args.out)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text + ("" if not text or text.endswith("\n") else "\n"), encoding="utf-8")
-        if args.format == "keys":
-            print("%d 条船 -> %s（可直接给 batch --keys-file）" % (n, p))
-        else:
-            print("写出 %s（受影响 %d 条船）" % (p, n))
+        print("写出 %s（受影响 %d 条船）" % (p, n))
     else:
         print(text)
 
 
-def cmd_batch(args):
-    ships = gp_ships(str(_gameparams_path(Path(args.game), args.server, args.gp)), args.filter)
-    # --keys-file：只导指定船（可直接用 `diff --format keys` 的输出）
-    if getattr(args, "keys_file", None):
-        raw = Path(args.keys_file).read_text(encoding="utf-8").splitlines()
-        wanted = {k.strip() for k in raw if k.strip() and not k.strip().startswith("#")}
-        ships = [s for s in ships if s.key in wanted]
-        missing = wanted - {s.key for s in ships}
-        print("[keys] %s：命中 %d 条" % (Path(args.keys_file).name, len(ships)))
-        if missing:
-            print("[warn] %d 条不在当前 GameParams 里（跳过）：%s"
-                  % (len(missing), ", ".join(sorted(missing)[:5])))
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    if args.limit:
-        ships = ships[:args.limit]
+def cmd_import(args):
+    """只建库 / 同步，不导出。"""
+    game = _resolve_game(args)
+    _bootstrap(game, args.server)
+    _sync_db(game, args)
 
-    extra = []
+
+# ── 默认动作：同步 + 导出 ──────────────────────────────────
+
+#: 等级表达式：10 / 3,4,7 / 5-11
+_TIER_SPEC = re.compile(r"^\d+(?:[-,]\d+)*$")
+
+
+def _parse_tiers(spec: str) -> set[int]:
+    out: set[int] = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+            lo, hi = int(a), int(b)
+            if lo > hi:
+                lo, hi = hi, lo
+            out.update(range(lo, hi + 1))
+        else:
+            out.add(int(token))
+    return out
+
+
+def _select_ships(ships: list, specs: list[str] | None) -> list:
+    """按 `--ship` 筛选。支持四种写法（可重复给，取并集）：
+
+    - 完整 key：``PJSB018_Yamato_1944``
+    - idx：``PJSB018``（key 的第一段）
+    - 模型目录：``JSB039_Yamato_1945``
+    - 等级：``10`` / ``3,4,7`` / ``5-11``
+
+    精确都没命中的 spec 再退化成子串匹配（兼容旧的 `--filter Yamato`）。
+    """
+    if not specs:
+        return list(ships)
+
+    tiers: set[int] = set()
+    names: set[str] = set()
+    for raw in specs:
+        s = str(raw).strip()
+        if not s:
+            continue
+        if _TIER_SPEC.match(s):
+            tiers |= _parse_tiers(s)
+        else:
+            names.add(s.lower())
+
+    picked: dict[str, object] = {}
+    for ship in ships:
+        key = (ship.key or "").lower()
+        idx = key.split("_", 1)[0]
+        folder = (ship.model_folder or "").lower()
+        if ship.tier in tiers or key in names or idx in names or folder in names:
+            picked[ship.key] = ship
+
+    exact: set[str] = set()
+    for ship in picked.values():
+        key = (ship.key or "").lower()
+        exact.update((key, key.split("_", 1)[0], (ship.model_folder or "").lower()))
+
+    for name in sorted(names - exact):
+        hits = [s for s in ships if name in (s.key or "").lower()]
+        if not hits:
+            print("[warn] --ship %r 没匹配到任何船" % name)
+        for ship in hits:
+            picked[ship.key] = ship
+    return [picked[k] for k in sorted(picked)]
+
+
+def _resolve_game(args) -> Path:
+    """`--game` 优先；没给就取 config.json 里 `--server` 对应的路径。"""
+    g = getattr(args, "game", None)
+    if g:
+        return Path(g)
+    from app.config import ConfigManager
+    cm = ConfigManager()
+    raw = (cm.game_path_lesta if args.server == "lesta" else cm.game_path_wargaming) or ""
+    if not raw or raw == "未设置":
+        raise SystemExit(
+            "没有 --game，config.json 里也没配 game_path_%s。\n"
+            "  要么加 --game <游戏根目录>，要么把路径写进项目 config.json。"
+            % ("lesta" if args.server == "lesta" else "wargaming"))
+    return Path(raw)
+
+
+def _require_server(args) -> None:
+    if not getattr(args, "server", None):
+        raise SystemExit("--server 必填：lesta 或 wg")
+
+
+def _sync_db(game: Path, args) -> None:
+    """建库 / 增量同步（`import` 与默认动作共用）。"""
+    import shutil
+    import threading
+
+    from utils.path_utils import get_data_dir
+
+    data_dir = get_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    gp_src = _gameparams_path(game, args.server, getattr(args, "gp", None))
+    shutil.copy2(gp_src, data_dir / gp_src.name)
+
+    from app.application import app
+    bin_folder = getattr(args, "bin", None) or latest_build(game)
+    app.config.bin_folder = bin_folder
+    app.config.game_version = getattr(args, "version", None) or bin_folder
+    print("[sync] build %s ← %s" % (bin_folder, gp_src.name))
+
+    from app.signals import bus
+    from services.processor_service import run_process
+
+    # bus 的进度消息默认没有消费者（GUI 才接），CLI 里直接打到 stdout
+    bus.log_message.connect(lambda msg: print("  " + str(msg), flush=True))
+
+    done = threading.Event()
+    result: dict = {}
+    bus.data_processed.connect(lambda ok: (result.setdefault("ok", ok), done.set()))
+    run_process(rebuild=bool(getattr(args, "rebuild", False)))
+    if not done.wait(timeout=1800):
+        raise SystemExit("同步超时（1800 s）")
+    if not result.get("ok"):
+        raise SystemExit(1)
+    print("[sync] done")
+
+
+def _export_flags(args) -> list[str]:
+    """args → 子进程用的导出开关（与 argparse 定义一一对应）。"""
+    extra: list[str] = []
     if args.no_textures:
         extra.append("--no-textures")
     if args.zstd:
@@ -316,18 +384,22 @@ def cmd_batch(args):
         extra.append("--permoflage")
     if getattr(args, "model_skins", False):
         extra.append("--model-skins")
-    _mskin = str(getattr(args, "model_skin", AUTO_MODEL_SKIN) or "")
-    if not _mskin:
+    mskin = str(getattr(args, "model_skin", AUTO_MODEL_SKIN) or "")
+    if not mskin:
         extra.append("--no-model-skin")
-    elif _mskin != AUTO_MODEL_SKIN:
-        extra += ["--model-skin", _mskin]
-    if args.gp:
+    elif mskin != AUTO_MODEL_SKIN:
+        extra += ["--model-skin", mskin]
+    if getattr(args, "gp", None):
         extra += ["--gp", str(args.gp)]
+    return extra
 
-    # 增量指纹：batch 以前只看 glb 是否存在，改参数后仍跳过（只能 --force 全量）。
-    # 现在按「build + 这组参数 + 船模型路径」算签名，签名变了就重导。
+
+def _export_ships(ships: list, args, out: Path) -> None:
+    """导出给定的一批船（进程内串行；--jobs>1 时切分给 --worker 子进程）。"""
+    from services.database_service import imported_build
     from services.export_index import ExportIndex, export_signature
-    from core.build_info import imported_build
+
+    extra = _export_flags(args)
     flags = {
         "no_textures": bool(args.no_textures), "zstd": bool(args.zstd),
         "armor": bool(args.armor), "damage": bool(getattr(args, "damage", False)),
@@ -344,122 +416,90 @@ def cmd_batch(args):
     build = imported_build(args.server) or ""
     index = ExportIndex(out)
 
-    def run_one(ship):
-        target = out / "geometry" / ship.key / (ship.key + ".glb")
-        # model 不进签名：同一 build 内模型不会变，而并行分支拿不到 ship 对象
-        sig = export_signature(args.server, build, ship.key, "",
-                               int(getattr(args, "lod", 2)),
-                               int(getattr(args, "texture_size", 1024)), flags)
-        if not args.force and target.is_file() and index.matches(ship.key, sig):
-            return ("skip", ship.key)
-        cmd = [sys.executable, str(Path(__file__).resolve()), "ship",
-               "--game", str(args.game), "--server", args.server,
-               "--ship", ship.key, "--out", str(out)] + extra
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            index.forget(ship.key)
-            return ("fail", ship.key + ": " + (proc.stderr or proc.stdout)[-300:])
-        index.record(ship.key, sig)
-        return ("ok", ship.key)
+    def sig_of(key: str) -> str:
+        # model 不进签名：同一 build 内模型不会变
+        return export_signature(args.server, build, key, "",
+                                int(getattr(args, "lod", 2)),
+                                int(getattr(args, "texture_size", 1024)), flags)
 
-    # 并行/串行都走 batch-worker：GameParams 与 DB 只初始化一次（以前每船一个
-    # `ship` 子进程，每条船都要重新加载 GameParams/数据库）。--jobs 0 保留旧行为。
-    if args.jobs and args.jobs >= 1:
-        import tempfile
-        keys_file = out / ".keys.txt"
-        if getattr(args, "keys_file", None):
-            # 已按 --keys-file 过滤过，别再让 export-keys 覆盖成全量
-            keys = [s.key for s in ships]
-        else:
-            subprocess.run([sys.executable, str(Path(__file__).resolve()), "export-keys",
-                            "--game", str(args.game), "--server", args.server,
-                            "--filter", args.filter, "--out", str(keys_file)]
-                           + (["--limit", str(args.limit)] if args.limit else [])
-                           + (["--gp", args.gp] if args.gp else []), check=True)
-            keys = keys_file.read_text(encoding="utf-8").splitlines()
-        # 并行分支同样吃增量指纹：先剔掉签名一致的，跑完再按产物登记
-        sig_by_key = {k: export_signature(args.server, build, k, "", int(getattr(args, "lod", 2)),
-                                          int(getattr(args, "texture_size", 1024)), flags)
-                      for k in keys}
-        if not args.force:
-            pending = [k for k in keys
-                       if not ((out / "geometry" / k / (k + ".glb")).is_file()
-                               and index.matches(k, sig_by_key[k]))]
-            skipped = len(keys) - len(pending)
-            if skipped:
-                print("[skip]", skipped, "unchanged ships")
-            keys = pending
-        chunks = [keys[i::args.jobs] for i in range(args.jobs)]
-        child_extra = [a for a in extra if a != "--armor"]
+    keys = [s.key for s in ships]
+    if not args.force:
+        pending = [k for k in keys
+                   if not ((out / "geometry" / k / (k + ".glb")).is_file()
+                           and index.matches(k, sig_of(k)))]
+        skipped = len(keys) - len(pending)
+        if skipped:
+            print("[skip] %d 艘未变（签名命中），直接跳过" % skipped)
+        keys = pending
+    if not keys:
+        print("[done] 0 艘需要导出（都已是最新）→", out)
+        return
+
+    if int(getattr(args, "jobs", 1) or 1) > 1:
+        jobs = int(args.jobs)
+        chunks = [keys[i::jobs] for i in range(jobs)]
         procs = []
+        chunk_files: list[Path] = []
         for i, chunk in enumerate(chunks):
             if not chunk:
                 continue
             cf = out / (".chunk%d.txt" % i)
             cf.write_text("\n".join(chunk), encoding="utf-8")
-            cmd = [sys.executable, str(Path(__file__).resolve()), "batch-worker",
+            chunk_files.append(cf)
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--worker",
                    "--game", str(args.game), "--server", args.server,
-                   "--keys-file", str(cf), "--out", str(out)] + child_extra
-            if args.armor:
-                cmd.append("--armor")
-            if args.gp:
-                cmd += ["--gp", args.gp]
+                   "--keys-file", str(cf), "--out", str(out)] + extra
             procs.append(subprocess.Popen(cmd))
-        for p in procs:
-            p.wait()
-        keys_file.unlink(missing_ok=True)
-        for i in range(len(chunks)):
-            (out / (".chunk%d.txt" % i)).unlink(missing_ok=True)
-        ok = sum(1 for k in keys if (out / "geometry" / k / (k + ".glb")).is_file())
+        for proc in procs:
+            proc.wait()
+        for cf in chunk_files:
+            cf.unlink(missing_ok=True)
+        ok = 0
         for k in keys:
             if (out / "geometry" / k / (k + ".glb")).is_file():
-                index.record(k, sig_by_key[k])
+                index.record(k, sig_of(k))
+                ok += 1
         print("[done]", ok, "exported to", out)
         return
 
-    results = [run_one(s) for s in ships]
-    for status, info in results:
-        print("[%s]" % status, info)
-    ok = sum(1 for s, _ in results if s == "ok")
-    print("[done]", ok, "exported to", out)
+    by_key = {s.key: s for s in ships}
+    ok = 0
+    for k in keys:
+        try:
+            _export_ship(by_key[k], args, out)
+            index.record(k, sig_of(k))
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            index.forget(k)
+            print("[fail]", k, exc)
+    print("[done]", ok, "/", len(keys), "exported to", out)
 
 
-def cmd_import(args):
-    app = _bootstrap(Path(args.game), args.server)
-    import shutil
-    from utils.path_utils import get_data_dir
-    data_dir = get_data_dir()
-    data_dir.mkdir(parents=True, exist_ok=True)
-    gp_src = _gameparams_path(Path(args.game), args.server, args.gp)
-    shutil.copy2(gp_src, data_dir / gp_src.name)
-    bin_folder = args.bin or _latest_bin(Path(args.game))
-    app.config.bin_folder = bin_folder
-    app.config.game_version = args.version or bin_folder
-    print("importing", gp_src.name, "bin", bin_folder)
+def cmd_run(args):
+    """默认动作：增量同步库（必要时建库）→ 导出选中的船（默认全部）。"""
+    _require_server(args)
+    game = _resolve_game(args)
+    args.game = str(game)
+    _bootstrap(game, args.server)
 
-    import threading
-    from app.signals import bus
-    from services.processor_service import run_process
-    done = threading.Event()
-    result = {}
-    bus.data_processed.connect(lambda ok: (result.setdefault("ok", ok), done.set()))
-    run_process(rebuild=bool(getattr(args, "rebuild", False)))
-    if not done.wait(timeout=1800):
-        raise SystemExit("import timed out")
-    print("import result:", result)
-    if not result.get("ok"):
-        raise SystemExit(1)
+    if not getattr(args, "no_sync", False):
+        _sync_db(game, args)
 
-
-def cmd_export_keys(args):
-    keys = [s.key for s in gp_ships(str(_gameparams_path(Path(args.game), args.server, args.gp)), args.filter)]
+    ships = gp_ships(str(_gameparams_path(game, args.server, args.gp)), "")
+    picked = _select_ships(ships, getattr(args, "ship", None))
+    if not picked:
+        raise SystemExit("没有匹配的船：%s" % ", ".join(args.ship or []))
     if getattr(args, "limit", 0):
-        keys = keys[:args.limit]
-    Path(args.out).write_text("\n".join(keys), encoding="utf-8")
-    print(len(keys), "keys ->", args.out)
+        picked = picked[:args.limit]
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    print("[plan] %d / %d 艘 → %s" % (len(picked), len(ships), out))
+    _export_ships(picked, args, out)
 
 
-def cmd_batch_worker(args):
+def cmd_worker(args):
+    """内部：`--jobs>1` 时父进程切分 key 后调用（`--worker`，不出现在命令列表）。"""
     keys = set(Path(args.keys_file).read_text(encoding="utf-8").splitlines())
     _bootstrap(Path(args.game), args.server)
     ships = [s for s in gp_ships(str(_gameparams_path(Path(args.game), args.server, args.gp)), "")
@@ -470,210 +510,103 @@ def cmd_batch_worker(args):
         try:
             _export_ship(ship, args, out)
             done += 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             print("[fail]", ship.key, exc)
     print("[worker done]", done)
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(prog="wows-export")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    p = sub.add_parser("list")
-    p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), required=True,
-                   help="which client the --game path points at (no default)")
-    p.add_argument("--filter", default="")
-    p.add_argument("--gp", default=None, help="explicit GameParams file")
-    p.set_defaults(func=cmd_list)
-
-    p = sub.add_parser("diff", help="对比两个 build 的 geometry crc32，列出变动的船")
-    p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), required=True,
-                   help="which client the --game path points at (no default)")
-    p.add_argument("--old", default=None, help="旧 build 目录名（默认 bin/ 下第二新的）")
-    p.add_argument("--new", default=None, help="新 build 目录名（默认 bin/ 下最新的）")
-    p.add_argument("--format", choices=("text", "keys", "json"), default="text",
-                   help="text=报告 / keys=一行一个船 key（喂 batch --keys-file）/ json")
-    p.add_argument("--out", default=None, help="写到文件（不给则打印到 stdout）")
-    p.set_defaults(func=cmd_diff)
-
-    p = sub.add_parser("ship")
-    p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), required=True,
-                   help="which client the --game path points at (no default)")
-    p.add_argument("--ship", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--no-textures", action="store_true")
-    p.add_argument("--zstd", action="store_true", help="also write .glb.zst")
-    p.add_argument("--armor", action="store_true", help="also export armor GLB")
+def _add_export_flags(p: argparse.ArgumentParser) -> None:
+    """导出开关（默认动作与隐藏的 --worker 共用，保证两边参数一一对应）。"""
+    p.add_argument("--no-textures", action="store_true", help="不写贴图（GLB 里也不嵌图）")
+    p.add_argument("--zstd", action="store_true", help="额外写 .glb.zst")
+    p.add_argument("--armor", action="store_true", help="额外导出装甲 GLB + JSON + bin")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--merge-shapes", action="store_true",
-                   help="merge each hull segment into one mesh (slower to load, can drop faces)")
+                   help="把舰体各分段合并成单网格（加载慢、可能丢面）")
     g.add_argument("--split-shapes", action="store_true",
-                   help="split hull by shape_spans (default; flag kept for explicitness)")
-    p.add_argument("--damage", action="store_true",
-                   help="include damage/crack geometry (default: excluded)")
-    p.add_argument("--decals", action="store_true",
-                   help="include SHIP_MESHDECAL flat decals (default: excluded)")
-    p.add_argument("--bake-indexed", dest="bake_indexed", action="store_true",
-                   default=True,
-                   help="bake INDEXED materials (materialIdMap + atlas arrays + artMap) "
-                        "into standard baseColor/normal/MR textures (default)")
+                   help="按 shape_spans 拆（默认行为，显式写出来只是为了清楚）")
+    p.add_argument("--damage", action="store_true", help="导出破损/断面几何（默认剔除）")
+    p.add_argument("--decals", action="store_true", help="导出 SHIP_MESHDECAL 平面贴花（默认剔除）")
+    p.add_argument("--bake-indexed", dest="bake_indexed", action="store_true", default=True,
+                   help="INDEXED 材质烘焙成标准 PBR（默认开）")
     p.add_argument("--no-bake-indexed", dest="bake_indexed", action="store_false",
-                   help="keep the raw INDEXED arrays instead of baking "
-                        "(needed for live camo switching; bigger, shader-only)")
+                   help="保留原始 INDEXED 数组（涂装实时切换需要，体积大）")
     p.add_argument("--bake-size", type=int, default=0, metavar="PX",
-                   help="max edge of baked textures (default: 0 = materialIdMap native size)")
+                   help="烘焙贴图最大边长（默认 0 = materialIdMap 原始尺寸）")
     p.add_argument("--slim", dest="slim", action="store_true", default=True,
-                   help="quantize vertex attributes (KHR_mesh_quantization) and drop "
-                        "unused _T4/TEXCOORD_1/TANGENT (default)")
+                   help="顶点量化 + 丢弃未用属性（默认）")
     p.add_argument("--no-slim", dest="slim", action="store_false",
-                   help="keep float32 attributes and every extra attribute (bigger files)")
+                   help="保留 float32 与全部属性（体积更大）")
     p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
-                   help="export emissive = baseColor x _mg.B (default off: B is a "
-                        "continuous channel on live assets, not a clean mask)")
-    p.add_argument("--no-emissive", dest="emissive", action="store_false",
-                   help="skip emissive (default)")
-    p.add_argument("--texture-size", type=int, default=1024,
-                   help="max texture dimension in pixels (default: 1024)")
-    p.add_argument("--lod", type=int, default=2,
-                   help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
-    p.add_argument("--skins", action="store_true", help="export mskin/skin material skins")
-    p.add_argument("--permoflage", action="store_true",
-                   help="also export permoflage (needs --skins)")
-    p.add_argument("--model-skins", action="store_true", help="export model-replacement skins")
+                   help="自发光 = baseColor × _mg.B（默认关：B 在实机是连续通道，不是干净掩码）")
+    p.add_argument("--no-emissive", dest="emissive", action="store_false", help="不导自发光（默认）")
+    p.add_argument("--texture-size", type=int, default=1024, help="贴图最大边长（默认 1024）")
+    p.add_argument("--lod", type=int, default=2, help="LOD 级别（-1=LOD0/auto，0-3；默认 2）")
+    p.add_argument("--skins", action="store_true", help="导出材质皮肤")
+    p.add_argument("--permoflage", action="store_true", help="连 permoflage 一起导（需 --skins）")
+    p.add_argument("--model-skins", action="store_true", help="导出换模型的皮肤")
     p.add_argument("--model-skin", default=AUTO_MODEL_SKIN, metavar="ID|auto|none",
-                   help="base appearance from a model skin (default: auto = use it only "
-                        "when the ship's first permoflage is a model skin, e.g. ARP "
-                        "Yamato / Kitakaze PR); output stays <ship>.glb")
+                   help="用某套模型皮肤当基准外观（默认 auto：首个 permoflage 是模型皮肤才用）")
     p.add_argument("--no-model-skin", dest="model_skin", action="store_const", const="",
-                   help="never apply a model skin (export the plain ship.model)")
-    p.add_argument("--gp", default=None, help="explicit GameParams file")
-    p.set_defaults(func=cmd_ship)
+                   help="绝不套模型皮肤（导原始 ship.model）")
 
-    p = sub.add_parser("import")
-    p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), required=True,
-                   help="which client the --game path points at (no default)")
-    p.add_argument("--gp", default=None)
+
+def _add_conn_flags(p: argparse.ArgumentParser) -> None:
+    """连接类参数（主命令与子命令共用；都给才不冲突）。"""
+    p.add_argument("--server", choices=("lesta", "wg"), help="哪一服（默认路径取 config.json）")
+    p.add_argument("--game", default=None, help="游戏根目录（默认取 config.json 里对应服路径）")
+    p.add_argument("--gp", default=None, help="显式指定 GameParams 文件")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="wows-export",
+        description="WoWS 模型导出。不带子命令 = 增量同步数据库 + 导出选中的船（默认全部）。",
+        epilog="例：python cli.py --server lesta --ship 10 --ship PJSB018 --out out")
+    _add_conn_flags(ap)
+    ap.add_argument("--out", default="out", help="输出目录（默认 out）")
+    ap.add_argument("--ship", action="append", metavar="SPEC",
+                    help="筛选船，可重复：完整 key / idx（PJSB018）/ 模型目录 / "
+                         "等级（10、3,4,7、5-11）；不给 = 全部")
+    ap.add_argument("--jobs", type=int, default=1, help="并行进程数（默认 1 = 进程内串行）")
+    ap.add_argument("--limit", type=int, default=0, help="只导前 N 条（调试用）")
+    ap.add_argument("--force", action="store_true", help="忽略增量签名，强制重导")
+    ap.add_argument("--no-sync", dest="no_sync", action="store_true",
+                    help="跳过建库/同步（默认每次都做增量同步）")
+    ap.add_argument("--rebuild", action="store_true", help="强制全量重建 3D 缓存")
+    ap.add_argument("--bin", default=None, help="指定 build 目录（默认 bin/ 下数字最大的）")
+    ap.add_argument("--version", default=None, help="写进 meta 的 game_version（默认同 build）")
+    # 内部：--jobs>1 的子进程入口（不出现在 --help）
+    ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--keys-file", default=None, help=argparse.SUPPRESS)
+    _add_export_flags(ap)
+
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("import", help="只建库 / 同步，不导出")
+    _add_conn_flags(p)
     p.add_argument("--bin", default=None)
     p.add_argument("--version", default=None)
     p.add_argument("--rebuild", action="store_true",
                    help="重建 3D 缓存（assets_data.db）：忽略增量判据，全量重解析")
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("batch")
-    p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), required=True,
-                   help="which client the --game path points at (no default)")
-    p.add_argument("--filter", default="")
-    p.add_argument("--keys-file", default=None,
-                   help="只导这些船（一行一个 key，可直接用 "
-                        "`diff --format keys --out FILE` 的输出）")
-    p.add_argument("--out", required=True)
-    p.add_argument("--no-textures", action="store_true")
-    p.add_argument("--zstd", action="store_true")
-    p.add_argument("--armor", action="store_true")
-    p.add_argument("--skins", action="store_true")
-    p.add_argument("--permoflage", action="store_true",
-                   help="also export permoflage (needs --skins)")
-    p.add_argument("--model-skins", action="store_true")
-    p.add_argument("--model-skin", default=AUTO_MODEL_SKIN, metavar="ID|auto|none")
-    p.add_argument("--no-model-skin", dest="model_skin", action="store_const", const="")
-    gb = p.add_mutually_exclusive_group()
-    gb.add_argument("--merge-shapes", action="store_true")
-    gb.add_argument("--split-shapes", action="store_true",
-                    help="split hull by shape_spans (default; flag kept for explicitness)")
-    p.add_argument("--damage", action="store_true",
-                   help="include damage/crack geometry (default: excluded)")
-    p.add_argument("--decals", action="store_true",
-                   help="include SHIP_MESHDECAL flat decals (default: excluded)")
-    p.add_argument("--bake-indexed", dest="bake_indexed", action="store_true",
-                   default=True,
-                   help="bake INDEXED materials (materialIdMap + atlas arrays + artMap) "
-                        "into standard baseColor/normal/MR textures (default)")
-    p.add_argument("--no-bake-indexed", dest="bake_indexed", action="store_false",
-                   help="keep the raw INDEXED arrays instead of baking "
-                        "(needed for live camo switching; bigger, shader-only)")
-    p.add_argument("--bake-size", type=int, default=0, metavar="PX",
-                   help="max edge of baked textures (default: 0 = materialIdMap native size)")
-    p.add_argument("--slim", dest="slim", action="store_true", default=True,
-                   help="quantize vertex attributes (KHR_mesh_quantization) and drop "
-                        "unused _T4/TEXCOORD_1/TANGENT (default)")
-    p.add_argument("--no-slim", dest="slim", action="store_false",
-                   help="keep float32 attributes and every extra attribute (bigger files)")
-    p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
-                   help="export emissive = baseColor x _mg.B (default off: B is a "
-                        "continuous channel on live assets, not a clean mask)")
-    p.add_argument("--no-emissive", dest="emissive", action="store_false",
-                   help="skip emissive (default)")
-    p.add_argument("--texture-size", type=int, default=1024,
-                   help="max texture dimension in pixels (default: 1024)")
-    p.add_argument("--lod", type=int, default=2,
-                   help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--limit", type=int, default=0)
-    p.add_argument("--jobs", type=int, default=1)
-    p.add_argument("--gp", default=None, help="explicit GameParams file")
-    p.set_defaults(func=cmd_batch)
-
-    p = sub.add_parser("export-keys")
-    p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), required=True,
-                   help="which client the --game path points at (no default)")
-    p.add_argument("--filter", default="")
-    p.add_argument("--out", required=True)
-    p.add_argument("--limit", type=int, default=0)
-    p.add_argument("--gp", default=None)
-    p.set_defaults(func=cmd_export_keys)
-
-    p = sub.add_parser("batch-worker")
-    p.add_argument("--game", required=True)
-    p.add_argument("--server", choices=("lesta", "wg"), required=True,
-                   help="which client the --game path points at (no default)")
-    p.add_argument("--keys-file", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--no-textures", action="store_true")
-    p.add_argument("--zstd", action="store_true")
-    p.add_argument("--armor", action="store_true")
-    p.add_argument("--damage", action="store_true",
-                   help="include damage/crack geometry (default: excluded)")
-    p.add_argument("--decals", action="store_true",
-                   help="include SHIP_MESHDECAL flat decals (default: excluded)")
-    p.add_argument("--bake-indexed", dest="bake_indexed", action="store_true",
-                   default=True,
-                   help="bake INDEXED materials (materialIdMap + atlas arrays + artMap) "
-                        "into standard baseColor/normal/MR textures (default)")
-    p.add_argument("--no-bake-indexed", dest="bake_indexed", action="store_false",
-                   help="keep the raw INDEXED arrays instead of baking "
-                        "(needed for live camo switching; bigger, shader-only)")
-    p.add_argument("--bake-size", type=int, default=0, metavar="PX",
-                   help="max edge of baked textures (default: 0 = materialIdMap native size)")
-    p.add_argument("--slim", dest="slim", action="store_true", default=True,
-                   help="quantize vertex attributes (KHR_mesh_quantization) and drop "
-                        "unused _T4/TEXCOORD_1/TANGENT (default)")
-    p.add_argument("--no-slim", dest="slim", action="store_false",
-                   help="keep float32 attributes and every extra attribute (bigger files)")
-    p.add_argument("--emissive", dest="emissive", action="store_true", default=False,
-                   help="export emissive = baseColor x _mg.B (default off: B is a "
-                        "continuous channel on live assets, not a clean mask)")
-    p.add_argument("--no-emissive", dest="emissive", action="store_false",
-                   help="skip emissive (default)")
-    p.add_argument("--texture-size", type=int, default=1024,
-                   help="max texture dimension in pixels (default: 1024)")
-    p.add_argument("--lod", type=int, default=2,
-                   help="LOD level to export (-1=LOD0/auto, 0-3; default: 2)")
-    p.add_argument("--skins", action="store_true")
-    p.add_argument("--permoflage", action="store_true")
-    p.add_argument("--model-skins", action="store_true")
-    p.add_argument("--model-skin", default=AUTO_MODEL_SKIN, metavar="ID|auto|none")
-    p.add_argument("--no-model-skin", dest="model_skin", action="store_const", const="")
-    p.add_argument("--merge-shapes", action="store_true")
-    p.add_argument("--gp", default=None)
-    p.set_defaults(func=cmd_batch_worker)
+    p = sub.add_parser("diff", help="对比两个 build 的 geometry crc32（只读 idx，不用建库）")
+    _add_conn_flags(p)
+    p.add_argument("--old", default=None, help="旧 build 目录名（默认 bin/ 下第二新的）")
+    p.add_argument("--new", default=None, help="新 build 目录名（默认 bin/ 下最新的）")
+    p.add_argument("--format", choices=("text", "json"), default="text",
+                   help="text=报告 / json=结构化")
+    p.add_argument("--out", default=None, help="写到文件（不给则打印到 stdout）")
+    p.set_defaults(func=cmd_diff)
 
     args = ap.parse_args(argv)
+    if args.worker:
+        if not args.keys_file:
+            raise SystemExit("--worker 需要 --keys-file")
+        return cmd_worker(args)
+    if args.cmd is None:
+        return cmd_run(args)
     return args.func(args)
 
 

@@ -31,7 +31,7 @@
 | `<game>/data/GameParams*.data` | 取 `ShipInfo` 与 `permoflages`（决定 `--model-skin auto` 套不套皮肤）；**不存在时从 pkg 解包并写回该目录** |
 | `<game>/bin/<build>/**.pkg` | `.geometry`、`.mfm`、贴图（按 `.dd0 → .dd1 → .dd2 → .dds` 分层取） |
 
-`list` / `export-keys` 只读 GameParams，不进数据库。`data/split/` 不再产出也不会被读。
+`diff` 只读 idx，不进数据库。`data/split/` 不再产出也不会被读。
 
 ## 建库 / 更新
 
@@ -44,53 +44,53 @@
 判据是舰船快照的 sha1 与 `.geometry` 的 crc32 签名，后者在 `bin/<build>/idx` 里现成可读。
 解析逻辑改过、或怀疑缓存脏了，用 `import ... --rebuild` 强制全量重解析 3D 缓存。
 
-客户端更新后的推荐流程（只导变动的船）：
+客户端更新后不用手动建库 —— 直接跑导出，它会自己判断（首次建库，之后增量同步）：
 
-    python cli.py diff --server wg --game D:\Games\World_of_Warships --format keys --out changed.txt
-    python cli.py import --server wg --game D:\Games\World_of_Warships
-    python cli.py batch --server wg --game D:\Games\World_of_Warships --out out --keys-file changed.txt
+    python cli.py --server lesta
 
 `config.json` 只存两个游戏路径；build 号（`bin/` 下的版本目录）不落盘，每次自动取
-**数字最大**的那个目录，所以客户端更新后不需要改配置。`--server` 必须显式给，没有默认值。
-独立的 `python -m data_extractor.cli` 也读同一份配置：命令里不写游戏目录就用这里的
-`game_path_lesta` / `game_path_wargaming`（`--server` 选槽位），两处都没配会提示怎么填。
+**数字最大**的那个目录，所以客户端更新后不需要改配置。`--server` 必须显式给，没有默认值；
+`--game` 不给就用配置里对应服的路径。独立的 `python -m data_extractor.cli` 也读同一份配置。
 
 ## 使用
 
-    # 列船
-    python cli.py list --server lesta --game D:\Games\Korabli --filter Yamato
+    # 全部导出（首次会先建库，约 4 min；之后同 build 重跑同步只要 ~15 s）
+    python cli.py --server lesta --out out/lesta
 
-    # 版本更新后：先找变动过的船，再只导这些（不加载 assets.bin、不建库）
-    python cli.py diff  --server wg --game D:\Games\World_of_Warships --format keys --out changed.txt
-    python cli.py batch --server wg --game D:\Games\World_of_Warships --out out\wg --keys-file changed.txt
+    # 只导某个等级：10 / 3,4,7 / 5-11
+    python cli.py --server lesta --ship 10 --out out/lesta
 
-    # 单船：渲染 + 装甲 + zst
-    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --armor --zstd
+    # 指定几条（完整 key、idx、模型目录都能混用，可重复给）
+    python cli.py --server lesta --ship PJSB018 --ship PJSD889 --out out/lesta
+
+    # 渲染 + 装甲 + zst
+    python cli.py --server lesta --ship PJSB520_Raiju --out out/lesta --armor --zstd
 
     # 材质皮肤（默认只导 mskin / skin；加 --permoflage 连同永久涂装）
-    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --skins --permoflage
+    python cli.py --server lesta --ship PJSB520_Raiju --out out/lesta --skins --permoflage
 
-    # 批量（分片并行）
-    python cli.py batch --server lesta --game D:\Games\Korabli --filter 10 --jobs 2 --out out --armor --zstd --skins
+    # 多进程
+    python cli.py --server lesta --ship 10 --jobs 4 --out out/lesta
 
     # 需要沉没状态的断面几何时加 --damage（默认剔除）
-    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --damage
+    python cli.py --server lesta --ship PJSB520_Raiju --out out/lesta --damage
 
     # 贴图分辨率 / LOD 可调（默认 1024 像素 / LOD2；--lod -1 回到 LOD0 高模）
-    python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB520_Raiju --out out --texture-size 2048 --lod -1
+    python cli.py --server lesta --ship PJSB520_Raiju --out out/lesta --texture-size 2048 --lod -1
 
     # Lesta INDEXED 材质（视觉 2.0）默认烘成 baseColor/normal/MR，标准查看器直接可看；
     # 需要实时换涂装（原始图集 + 6 数组）时加 --no-bake-indexed
-    python cli.py ship --server lesta --game D:\Games\Korabli --ship PBSD511_Waterloo --out out --no-bake-indexed
+    python cli.py --server lesta --ship PBSD511_Waterloo --out out/lesta --no-bake-indexed
 
     # 联动/PR 船（ARP 大和、星之北风）的本来样子在模型皮肤里 —— 默认 auto 已自动套上；
     # 想强制原版模型、或指定某一套皮肤：
-    python cli.py ship --server wg --game D:\Games\World_of_Warships \
-      --ship PJSB700_ARP_Yamato --out out\wg                        # auto → PJES340（ARP 外观）
-    python cli.py ship --server wg --game D:\Games\World_of_Warships \
-      --ship PJSB700_ARP_Yamato --out out\wg --no-model-skin        # 原版大和
-    python cli.py ship --server wg --game D:\Games\World_of_Warships \
-      --ship PJSB700_ARP_Yamato --out out\wg --model-skin PJES512   # 指定另一套
+    python cli.py --server wg --ship PJSB700_ARP_Yamato --out out/wg
+    python cli.py --server wg --ship PJSB700_ARP_Yamato --out out/wg --no-model-skin
+    python cli.py --server wg --ship PJSB700_ARP_Yamato --out out/wg --model-skin PJES512
+
+    # 只同步库、不导出；只想知道两版之间动了哪些船（后者不碰数据库）
+    python cli.py import --server lesta
+    python cli.py diff   --server wg
 
 产物（除 `textures/` 外都按船名分一层目录）：
 

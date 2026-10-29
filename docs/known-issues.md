@@ -55,13 +55,13 @@
 还需把 geom/tex 指纹写进 manifest 再比对（未做）。
 
 > 注意与「数据库增量」的区别：这里的签名含 `build`，所以客户端一更新，整批签名失效 →
-> `batch` 会重导全量。要只导变动的船，用 `diff --format keys` 出清单再
-> `batch --keys-file`（见 [tech/common/10](tech/common/10-cli.md)）。
+> 导出会重跑全量（未变的船仍是本地读盘 + 写盘，不是「跳过」）。数据库那一层才是真增量：
+> 只有快照/几何变了的行会被重写（见 [tech/common/02](tech/common/02-import-game-data.md)）。
 
 ## P1：batch 性能 ✅ 已实现（2026-10-27）
 
-- ~~每艘船都是独立 Python 进程~~ → `--jobs 1`（默认）改走 `batch-worker`，
-  一个进程跑完整批，GameParams / DB 只初始化一次；`--jobs 0` 保留旧的每船子进程；
+- ~~每艘船都是独立 Python 进程~~ → `--jobs 1`（默认）在进程内串行，
+  GameParams / DB 只初始化一次；`--jobs > 1` 才切分给 `--worker` 子进程；
 - 每次加载仍会重开 VFS 索引（按船必需），但不再重复 bootstrap。
 
 ## P1：数据库结构与体积
@@ -210,20 +210,17 @@ http://127.0.0.1:8767/threejs-example.html?ship=PJSB018_Yamato_1944&root=sample/
 Waterloo：
 
 ```bash
-python cli.py ship --server lesta --game D:\Games\Korabli --ship PBSD511_Waterloo \
-  --out out/lesta --armor
+python cli.py --server lesta --ship PBSD511_Waterloo --out out/lesta --armor
 ```
 
 WG 大和：
 
 ```bash
-python cli.py ship --server wg --game D:\Games\World_of_Warships \
-  --ship PJSB018_Yamato_1944 --out out/wg --armor
+python cli.py --server wg --ship PJSB018_Yamato_1944 --out out/wg --armor
 ```
 
 Lesta 大和：
 
 ```bash
-python cli.py ship --server lesta --game D:\Games\Korabli --ship PJSB018_Yamato_1944 \
-  --out out/lesta --armor
+python cli.py --server lesta --ship PJSB018_Yamato_1944 --out out/lesta --armor
 ```

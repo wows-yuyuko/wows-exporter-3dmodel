@@ -442,7 +442,7 @@ load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是�
    | 同参数再跑 | `[skip]` **2.3 s** |
    | 加 `--no-textures` | 重导（签名变） |
    | 改回原参数 | 重导（签名又变回另一组） |
-2. **不再每船重启进程**：`--jobs` 默认 1 现在也走 `batch-worker`（一个进程跑完整批，
+2. **不再每船重启进程**：`--jobs` 默认 1 现在在进程内串行（一个进程跑完整批，
    GameParams / 数据库只初始化一次）；`--jobs 0` 保留旧的「每船一个 `ship` 子进程」。
    并行分支同样吃增量指纹（先剔掉 unchanged，跑完按产物登记）。
 
@@ -567,15 +567,16 @@ load 7.2 s、GLB 导出 12–15 s、manifest 2.6–4.7 s，其中 GLB 那段是�
 ### 已完成：`diff` 版本对比（2026-10-28）
 
 主场景「版本更新只导变动的船」原先**没有工具支撑**（`batch` 的签名含 build，
-版本一变全批失效），只能手工 `--filter` 猜。现在补上：
+版本一变全批失效），只能手工按名字猜。现在补上 `diff`（2026-10-28 起筛选并入 `--ship`）：
 
 - `cli.py diff`：读两版 `bin/<build>/idx/*.idx`，按 `.geometry` 的 `crc32` 比对，
   **不加载 assets.bin、不解包几何**；映射到船 key（`ship_models` + 快照的
   `A_*.*.model`）后输出报告 / keys / json。
-- `cli.py batch --keys-file`：直接吃 `diff --format keys` 的输出。
+- ~~`cli.py batch --keys-file`~~：2026-10-28 命令面收敛后由 `--ship` 取代（支持 key / idx / 等级）。
 - 实测 WG `13187581 → 13357625`：两版共 6.4 万个同名 geometry，**99.9% 的 crc32 不变**，
   只有 25 个文件变 → 7 条船的船体（其中仅 1 条动了主文件）+ 12 个共享挂载（波及 21 条船）；
-  整条命令 **14.6 s**。闭环验证：`diff --format keys` → `batch --keys-file` 导出成功。
+  整条命令 **14.6 s**。（`--format keys` 与 `batch --keys-file` 已在 2026-10-28 命令面
+  收敛时移除，改由 `--ship` 直接按 key / idx / 等级筛选。）
 
 口径「宽松」（与用户确认）：crc32 含顶点/索引，**只改模型细节也算变动**，
 宁可多导不漏导。局限见 `10-cli.md` §4.5（纯 GameParams 变动不在此判据内）。
@@ -633,7 +634,7 @@ P0、P1 与 P2-1/3/4/5/6/7 已全部结清（逐项状态见各节标题）。�
 | # | 项 | 现状 |
 |---|---|---|
 | E1 | ~~WG 库 build 过期~~ | ✅ 2026-10-28 重跑 `import` 修好：`meta.build = 13357625`，与客户端一致 |
-| E2 | `wg_compat` 4 处 `TODO(手动)` | WG 的类型映射 / 弹夹炮识别目前复制 Lesta 版，未按 WG 实测校准 |
+| E2 | `wg_compat.WG_TYPE_CATEGORY_MAP` 仍为 `None` | WG 的 type→类别映射未按实测校准（当前 WG 导入正常，说明命名与 Lesta 一致）。其余三处占位（类别列表 / 标签 / 归一化）已于 2026-10-29 删除 —— 无调用方 |
 
 ### F. 死代码 ✅ 已清理（2026-10-28）
 
@@ -668,6 +669,31 @@ P0、P1 与 P2-1/3/4/5/6/7 已全部结清（逐项状态见各节标题）。�
 | `service.wows_type_auto` / `auto_rule` / `auto_rule_reason` / `find_files` / `decode_mfm_by_self_id` / `decode_material_by_path`、`space.parse_geometry_header` / `parse_space_bin`、`types.default_item_sizes`、`vfs.pkg_has` / `logical_path` | 子模块公开接口，本仓库无调用方 |
 | **整模块删除**：`uncode_assets/{mfm_text, model_text, skel_ext_text, model_wg_text, visual_text, visual_wg_text}.py` | 「Prototype → 明文」实验性反导出，6 个模块共 688 行，全仓无引用 |
 | 级联孤儿：`config._path_valid`、`geometry_service._rgba_to_dds_bgra` / `_get_assets_service` / `_load_texture_tier_live` | 因上游删除而失去调用者 |
+
+### 第三轮：结构复盘（2026-10-29）
+
+删（−1,600 行量级）：
+
+| 内容 | 说明 |
+|---|---|
+| `name_mapping.py`（models，935 行）、`log_writer.py`（utils，168）、`po_utils.py`（utils，49）、`space.py`（uncode_assets，282）、`pictures_data.py`（resources，4） | 全仓 0 引用；分别是静态中文对照表、GUI 日志文件、.po 工具、港口/地图浏览、Qt 内嵌图 |
+| `styles/main.qss`、`ui/main_window.ui`（resources 下） | Qt GUI 残留，CLI 版用不到 |
+| `database_service` 的 `skipped_ships` / `db_size_mb` / `count_ships` / `load_ships`；`geometry_service.list_ships`（+`_ships` / `_ships_error`） | 3D 查看器的下拉框与库体积日志都没了；选船早改走 GameParams |
+| `assets_cache` 的 `_to_render_row` / `_murmur3_32` / `_material_family`；`geometry_service._matrix_to_render` / `_murmur3_32` / `_material_family` | 纯转发封装 / 已无人调用 |
+| `wg_compat` 的 6 个占位函数与 2 个常量 | 指向早已不存在的 analysis_service / ui/detail_panel |
+
+合（少 6 个文件、约 −150 行样板）：
+
+| 现状 | 合并到 |
+|---|---|
+| 「bin 下数字最大」三份（`cli._latest_bin` / `version_diff.list_builds` / `path_utils.find_latest_bin_folder`） | `utils.path_utils.list_builds` / `latest_build` |
+| 「模型目录名」三份（`assets_cache._model_of` / `_stem_of_skeleton` / `processor._model_of`） | `utils.path_utils.model_id_of` |
+| GameParams 定位两份（`cli._gameparams_path` / `assets_cache._find_gameparams_file`） | `gameparams.locate`（core；`extract=True` 才解包写回） |
+| 两个库的 SQLite 样板（`_db_name` / `_schema_subdir` / `_conn` / `initialize` / `get_current_version` / `_record_version` / `_drop_all_tables` / `get_meta` / `set_meta`） | 新文件 `sqlite_store.py`（services） |
+| `fx_mapping.py`（services，37） | `asset_utils.tech_family`（utils） |
+| `mfm_fx.py`（uncode_assets，36） | `service.resolve_fx_path`（uncode_assets） |
+| `dds_reader.py`（models，201）+ `texture_export.py`（services，43） | 新文件 `texture_io.py`（services） |
+| `build_info.py`（core，22） | `database_service.imported_build`（services） |
 
 > 删完后 `uncode_assets` 只剩实际用到的：`parser` / `decoders` / `types` / `vfs` /
 > `service` / `binary` / `space` / `fx` / `atlas_contour`（后者仅经 `decoders` 调 `decode_contours`）。
