@@ -41,6 +41,10 @@ from utils.asset_utils import murmur3_32, tech_family as fx_tech_family
 from utils.threading_utils import TaskCancelled
 
 
+#: 几何（左手系）→ 渲染（右手系）的 Z 共轭，等价于顶点几何 Z 取反。
+_NEGZ = np.diag([1.0, 1.0, -1.0, 1.0])
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # 服务入口
 # ────────────────────────────────────────────────────────────────────────────
@@ -253,73 +257,11 @@ class GeometryService:
 
         # 皮肤变体（origin="model"）：把船体 model 目录替换成皮肤变体目录
         #   优先 hullConfig 的 model；其次 peculiarityModels 的船体替换；最后原 model_folder
-        use_mf = ship.model_folder
-        skin_nodes: dict = {}
-        if skin:
-            if not model_replace:
-                model_replace = skin.get("peculiarity_models") or None
-            for hv in (skin.get("hull_config") or {}).values():
-                hv_model = hv.get("model") if isinstance(hv, dict) else (hv if isinstance(hv, str) else "")
-                if hv_model:
-                    use_mf_override = hv_model.rsplit("/", 2)[-2] if "/" in hv_model else ""
-                    if use_mf_override:
-                        use_mf = use_mf_override
-                    break
-            for nodes in (skin.get("nodes_config") or {}).values():
-                if isinstance(nodes, dict):
-                    for hp, nv in nodes.items():
-                        if isinstance(nv, dict):
-                            skin_nodes[hp] = nv
-        if use_mf == ship.model_folder and model_replace:
-            for _k, _v in model_replace.items():
-                _d = _k.rsplit("/", 2)[-2] if "/" in _k else ""
-                if _d and _d == ship.model_folder:
-                    use_mf = _v.rsplit("/", 2)[-2] if "/" in _v else use_mf
-                    break
+        use_mf, skin_nodes, model_replace = self._resolve_hull_folder(
+            ship, skin, model_replace)
 
-        # 舰体分段：模型目录内全部 .geometry（已处于舰船坐标系）
-        entries = self._geometry_folder_index(extractor).get(use_mf) or []
-        if not entries:
-            # 回退：按 model_folder 全树匹配任意路径下的 geometry
-            pattern = f"content/**/{use_mf}/{use_mf}*.geometry"
-            try:
-                entries = [
-                    e for e in extractor.list_files([pattern])
-                    if not e.is_directory
-                ]
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"列出几何文件失败: {exc}") from exc
-
-        if not entries:
-            raise RuntimeError(f"未找到 {use_mf} 的 .geometry 文件")
-
-        # 去重（相同路径+大小只加载一次）
-        seen = set()
-        uniq = []
-        for e in sorted(entries, key=lambda x: x.path):
-            key = (e.path, e.file_info.size)
-            if key not in seen:
-                seen.add(key)
-                uniq.append(e)
-
-        # 跳过「不带分段后缀」的主文件（如 JSB039_Yamato_1945.geometry）：
-        # 多为 base/聚合文件，含烟囱等多余模型；真正高模在 *_Bow/_MidBack/... 分段。
-        # 但**主文件可能含船体装甲**（CM_PA_*.armor，如 Yamato 12487 tris）→ 单独保留。
-        main_entries = []
-        seg_uniq = []
-        for e in uniq:
-            stem = e.path.rsplit('/', 1)[-1][:-len('.geometry')]
-            if stem == use_mf:
-                main_entries.append(e)
-                continue
-            seg_uniq.append(e)
-        if seg_uniq:
-            uniq = seg_uniq
-        elif uniq:
-            # 只有主文件（无分段模型）：明确报错提示，而非静默用主文件回退
-            raise RuntimeError(
-                f"未找到 {use_mf} 的分段模型文件"
-                f"（仅存在主文件 {use_mf}.geometry）")
+        # 舰体分段（已处于舰船坐标系）；主文件单独留下，只取其中的船体装甲
+        uniq, main_entries = self._list_hull_parts(extractor, use_mf)
 
         # 该船全部渲染集索引（含整合模型：高模 shape 渲染集可能在别的分段记录）
         ship_rs = self._ship_render_sets(use_mf)
@@ -333,11 +275,138 @@ class GeometryService:
         # 蒙皮 bind pose 骨架 stem（舰船模型目录；_apply_skinning 用它查骨骼矩阵）
         self._current_skinning_stem = use_mf
 
+        bmin, bmax = self._load_hull_segments(
+            geom, uniq, ship_rs, extractor, armor_thickness,
+            progress_cb=progress_cb, cancel_event=cancel_event, lod=lod)
+        if np.isfinite(bmin).all():
+            geom.bounds_min = bmin
+            geom.bounds_max = bmax
+
+        # 提取船体漫反射贴图（尽力而为：单贴图应用到全部舰体分段）
+        self._raise_if_cancelled(cancel_event)
+        try:
+            tex_path, tex_bytes = self._find_hull_diffuse(ship, extractor)
+            if tex_bytes:
+                geom.texture_dds = tex_bytes
+                geom.texture_path = tex_path
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ── 主文件装甲（几何已跳过渲染，但船体装甲 CM_PA_*.armor 在此） ──
+        bmin, bmax = self._load_main_armor(
+            geom, main_entries, extractor, armor_thickness, bmin, bmax,
+            cancel_event=cancel_event)
+
+        # ── 分阶段交付：船体 + 装甲已就绪，挂载还没开始 ──
+        # 大船（中途岛那类）挂载阶段还要十几秒；先把「船体/装甲」交给调用方提前显示。
+        if partial_cb is not None:
+            try:
+                partial_cb(self._snapshot_without_mounts(geom))
+            except Exception:  # noqa: BLE001 - 提前交付失败不影响完整加载
+                pass
+
+        # ── 挂载模型（骨架定位 + 每个部件独立贴图） ──
+        self._raise_if_cancelled(cancel_event)
+        self._load_mounts(geom, ship, extractor, armor_thickness, progress_cb,
+                          cancel_event=cancel_event, model_replace=model_replace,
+                          skin_nodes=skin_nodes, lod=lod)
+
+        if progress_cb:
+            progress_cb(100, "加载完成")
+        return geom
+
+    # ── 加载阶段（_load_ship_impl 的下沉实现）─────────────
+
+    def _resolve_hull_folder(self, ship: ShipInfo, skin: dict | None,
+                             model_replace: dict | None):
+        """决定船体几何目录与皮肤节点覆盖。
+
+        优先级：hullConfig 的 model > peculiarityModels 的船体替换 > 原 model_folder。
+        返回 (model_folder, skin_nodes, model_replace)——model_replace 可能被 skin 补全。
+        """
+        use_mf = ship.model_folder
+        skin_nodes: dict = {}
+        if skin:
+            if not model_replace:
+                model_replace = skin.get("peculiarity_models") or None
+            for hv in (skin.get("hull_config") or {}).values():
+                hv_model = (hv.get("model") if isinstance(hv, dict)
+                            else (hv if isinstance(hv, str) else ""))
+                if hv_model:
+                    override = hv_model.rsplit("/", 2)[-2] if "/" in hv_model else ""
+                    if override:
+                        use_mf = override
+                    break
+            for nodes in (skin.get("nodes_config") or {}).values():
+                if isinstance(nodes, dict):
+                    for hp, nv in nodes.items():
+                        if isinstance(nv, dict):
+                            skin_nodes[hp] = nv
+        if use_mf == ship.model_folder and model_replace:
+            for k, v in model_replace.items():
+                d = k.rsplit("/", 2)[-2] if "/" in k else ""
+                if d and d == ship.model_folder:
+                    use_mf = v.rsplit("/", 2)[-2] if "/" in v else use_mf
+                    break
+        return use_mf, skin_nodes, model_replace
+
+    def _list_hull_parts(self, extractor, model_folder: str):
+        """列出舰体几何分段，返回 (分段列表, 主文件列表)。
+
+        主文件（如 `JSB039_Yamato_1945.geometry`）不含高模，但可能带船体装甲
+        `CM_PA_*.armor`，所以不参与渲染合并、单独返回给调用方取装甲。
+        只有主文件、没有分段模型时直接报错，不静默回退。
+        """
+        entries = self._geometry_folder_index(extractor).get(model_folder) or []
+        if not entries:
+            # 回退：按 model_folder 全树匹配任意路径下的 geometry
+            pattern = f"content/**/{model_folder}/{model_folder}*.geometry"
+            try:
+                entries = [e for e in extractor.list_files([pattern]) if not e.is_directory]
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"列出几何文件失败: {exc}") from exc
+
+        if not entries:
+            raise RuntimeError(f"未找到 {model_folder} 的 .geometry 文件")
+
+        # 去重（相同路径+大小只加载一次）
+        seen = set()
+        uniq = []
+        for e in sorted(entries, key=lambda x: x.path):
+            key = (e.path, e.file_info.size)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(e)
+
+        main_entries = []
+        seg_uniq = []
+        for e in uniq:
+            stem = e.path.rsplit('/', 1)[-1][:-len('.geometry')]
+            if stem == model_folder:
+                main_entries.append(e)
+                continue
+            seg_uniq.append(e)
+        if seg_uniq:
+            return seg_uniq, main_entries
+        if uniq:
+            raise RuntimeError(
+                f"未找到 {model_folder} 的分段模型文件"
+                f"（仅存在主文件 {model_folder}.geometry）")
+        return uniq, main_entries
+
+    def _load_hull_segments(self, geom: ShipGeometry, parts: list, ship_rs: dict,
+                            extractor, armor_thickness: dict, progress_cb=None,
+                            cancel_event: threading.Event | None = None,
+                            lod: int = 2):
+        """解析舰体全部分段：合并 hull 网格 + 船体装甲 + 碰撞模型。
+
+        返回 (bmin, bmax)，由调用方决定是否写入 geom。
+        """
         bmin = np.full(3, np.inf, dtype=np.float32)
         bmax = np.full(3, -np.inf, dtype=np.float32)
-        total_parts = len(uniq)
+        total_parts = len(parts)
 
-        for idx, e in enumerate(uniq):
+        for idx, e in enumerate(parts):
             self._raise_if_cancelled(cancel_event)
             if progress_cb:
                 progress_cb(5 + 80 * idx / total_parts, f"解析 {e.path.rsplit('/', 1)[-1]}")
@@ -438,29 +507,19 @@ class GeometryService:
             for cm in parsed.collision_models:
                 geom.collision_models.append(CollisionModelData(cm.name, cm.size_in_bytes, cm.data))
 
-            geom.stats[f"parts"] = len(uniq)
+            geom.stats[f"parts"] = len(parts)
             geom.stats[f"prim_{idx}"] = {
                 "file": part_name,
                 "vertices": sum(p.positions.shape[0] for p in parsed.primitives),
                 "triangles": sum(0 if p.indices is None else p.indices.size // 3 for p in parsed.primitives),
                 "armor_tris": sum(len(a.triangles) for a in parsed.armor_models),
             }
+        return bmin, bmax
 
-        if np.isfinite(bmin).all():
-            geom.bounds_min = bmin
-            geom.bounds_max = bmax
-
-        # 提取船体漫反射贴图（尽力而为：单贴图应用到全部舰体分段）
-        self._raise_if_cancelled(cancel_event)
-        try:
-            tex_path, tex_bytes = self._find_hull_diffuse(ship, extractor)
-            if tex_bytes:
-                geom.texture_dds = tex_bytes
-                geom.texture_path = tex_path
-        except Exception:  # noqa: BLE001
-            pass
-
-        # ── 主文件装甲（几何已跳过渲染，但船体装甲 CM_PA_*.armor 在此） ──
+    def _load_main_armor(self, geom: ShipGeometry, main_entries: list, extractor,
+                         armor_thickness: dict, bmin: np.ndarray, bmax: np.ndarray,
+                         cancel_event: threading.Event | None = None):
+        """只从主文件里取船体装甲（渲染几何已跳过，见 _list_hull_parts）。"""
         for e in main_entries:
             try:
                 data = extractor.pkg_reader.read_file(e.volume.filename, e.file_info)
@@ -483,24 +542,7 @@ class GeometryService:
                         pmax = mesh.positions.max(axis=0)
                         bmin = np.minimum(bmin, pmin)
                         bmax = np.maximum(bmax, pmax)
-
-        # ── 分阶段交付：船体 + 装甲已就绪，挂载还没开始 ──
-        # 大船（中途岛那类）挂载阶段还要十几秒；先把「船体/装甲」交给调用方提前显示。
-        if partial_cb is not None:
-            try:
-                partial_cb(self._snapshot_without_mounts(geom))
-            except Exception:  # noqa: BLE001 - 提前交付失败不影响完整加载
-                pass
-
-        # ── 挂载模型（骨架定位 + 每个部件独立贴图） ──
-        self._raise_if_cancelled(cancel_event)
-        self._load_mounts(geom, ship, extractor, armor_thickness, progress_cb,
-                          cancel_event=cancel_event, model_replace=model_replace,
-                          skin_nodes=skin_nodes, lod=lod)
-
-        if progress_cb:
-            progress_cb(100, "加载完成")
-        return geom
+        return bmin, bmax
 
     # ── 挂载模型 ────────────────────────────────────────
 
@@ -577,10 +619,82 @@ class GeometryService:
             bmax = np.full(3, -np.inf, dtype=np.float32)
 
         model_cache: dict = {}   # model_folder -> 加载结果 or None
+
+        hp_groups, placed, sub_placed, bmin, bmax = self._place_hp_mounts(
+            geom, refs, transforms, extractor, armor_thickness, model_cache,
+            bmin, bmax, progress_cb=progress_cb, cancel_event=cancel_event,
+            model_replace=model_replace, lod=lod)
+        # ★ 一次性实例化 HP 挂载（同模型多节点 → 一份几何 + 各节点矩阵）
+        for (folder, comp), items in hp_groups.items():
+            src = model_cache.get(folder)
+            if src is None:
+                continue
+            bmin, bmax = self._emit_instanced_mount(geom, src, folder, comp,
+                                                    items, bmin, bmax)
+
+        mp_groups, mp_placed, sub_deck, bmin, bmax = self._place_deck_mounts(
+            geom, transforms, extractor, armor_thickness, model_cache, len(refs),
+            bmin, bmax, progress_cb=progress_cb, cancel_event=cancel_event, lod=lod)
+        sub_placed += sub_deck
+        # ★ 一次性实例化 MP 甲板设备（同模型多节点 → 一份几何 + 各节点矩阵）
+        for folder, items in mp_groups.items():
+            src = model_cache.get(folder)
+            if src is None:
+                continue
+            bmin, bmax = self._emit_instanced_mount(geom, src, folder, COMPONENT_DECK,
+                                                    items, bmin, bmax)
+
+        # ★ 统一收敛：把所有节点类型（含挂载模型骨架上的 MP 子设备）中共享同一
+        #   几何的 MountMesh 合并为实例化网格（一份几何 + 各节点矩阵），省 GPU 内存。
+        self._dedupe_mount_instances(geom)
+
+        if np.isfinite(bmin).all():
+            geom.bounds_min = bmin
+            geom.bounds_max = bmax
+        geom.stats["mounts"] = placed
+        geom.stats["deck_equipment"] = mp_placed
+        geom.stats["sub_equipment"] = sub_placed
+        geom.stats["unique_mount_models"] = len(model_cache)
+
+    def _mount_matrices(self, m_raw: np.ndarray, rb: np.ndarray):
+        """挂点矩阵拆成两份：渲染用（含 Root_BlendBone）+ 装甲用（原始挂点）。
+
+        ★ 装甲几何在制作时已与挂点对齐（wows-toolkit ship.rs：armor 用原始
+        hp_transform，不做 Root_BlendBone 旋转修正）；若套用渲染矩阵会多转一次
+        rb → 主炮塔装甲方向反转。
+        """
+        mtx = np.ascontiguousarray(_NEGZ @ (m_raw @ rb) @ _NEGZ, dtype=np.float32)
+        armor_mtx = np.ascontiguousarray(_NEGZ @ m_raw @ _NEGZ, dtype=np.float32)
+        return mtx, armor_mtx
+
+    def _append_mount_armor(self, geom: ShipGeometry, src: dict, armor_mtx: np.ndarray,
+                            comp: str, bmin: np.ndarray, bmax: np.ndarray):
+        """挂载模型自带的装甲：本地坐标 + 原始挂点矩阵定位 + 归属分类。"""
+        for am in src["armor_meshes"]:
+            mesh = ArmorMesh(
+                name=am.name, positions=am.positions, normals=am.normals,
+                colors=am.colors, indices=am.indices, triangles=am.triangles,
+                component=comp, model_matrix=armor_mtx,
+            )
+            geom.armor_meshes.append(mesh)
+            if mesh.positions.size:
+                mn, mx = mesh.bounds_in_world()
+                bmin = np.minimum(bmin, mn)
+                bmax = np.maximum(bmax, mx)
+        return bmin, bmax
+
+    def _place_hp_mounts(self, geom: ShipGeometry, refs: list, transforms: dict,
+                         extractor, armor_thickness: dict, model_cache: dict,
+                         bmin: np.ndarray, bmax: np.ndarray, progress_cb=None,
+                         cancel_event: threading.Event | None = None,
+                         model_replace: dict | None = None, lod: int = -1):
+        """按 GameParams 的 HP_* 挂点放置挂载模型（只累积分组，不立刻建网格）。
+
+        返回 (hp_groups, placed, sub_placed, bmin, bmax)；网格由调用方统一实例化。
+        """
         hp_groups: dict = {}     # (folder, comp) -> [(label, mtx, armor_mtx), ...]
         placed = 0
         sub_placed = 0   # 挂载模型骨架上的 MP 子设备（炮塔测距仪/炮上防空炮等）
-        _negz = np.diag([1.0, 1.0, -1.0, 1.0])   # 几何(左手系)→渲染(右手系) 共轭
         n_refs = len(refs)
         for idx, (hp, comp, model_path, misc_filter, custom_battle) in enumerate(refs):
             self._raise_if_cancelled(cancel_event)
@@ -602,14 +716,9 @@ class GeometryService:
                 m_raw = self._derived_mount_transform(hp, transforms)
             if m_raw is None:
                 continue
-            # 基于原始骨骼组匹配：几何空间 = HP 挂点 × 模型 Root_BlendBone(静息朝向)，
-            # 再 negz 共轭转渲染空间（等价于顶点几何 Z 取反）
+            # 基于原始骨骼组匹配：几何空间 = HP 挂点 × 模型 Root_BlendBone(静息朝向)
             rb = self._mount_root_blend(folder)
-            mtx = np.ascontiguousarray(_negz @ (m_raw @ rb) @ _negz, dtype=np.float32)
-            # ★ 装甲几何在制作时已与挂点对齐（wows-toolkit ship.rs：armor 用
-            # 原始 hp_transform，不做 Root_BlendBone 旋转修正）；若套用 mtx 会
-            # 多转一次 rb → 主炮塔装甲方向反转。装甲单独用原始挂点矩阵。
-            armor_mtx = np.ascontiguousarray(_negz @ m_raw @ _negz, dtype=np.float32)
+            mtx, armor_mtx = self._mount_matrices(m_raw, rb)
             if folder not in model_cache:
                 model_cache[folder] = self._load_mount_model(
                     folder, extractor, armor_thickness, comp, cancel_event=cancel_event,
@@ -622,18 +731,7 @@ class GeometryService:
             #   循环后按 (folder, comp) 一次性实例化（一份几何 + 各节点矩阵）。
             hp_groups.setdefault((folder, comp), []).append((hp, mtx, armor_mtx))
 
-            # 该模型的装甲（本地坐标 + 原始挂点矩阵定位 + 归属分类）
-            for am in src["armor_meshes"]:
-                mesh = ArmorMesh(
-                    name=am.name, positions=am.positions, normals=am.normals,
-                    colors=am.colors, indices=am.indices, triangles=am.triangles,
-                    component=comp, model_matrix=armor_mtx,
-                )
-                geom.armor_meshes.append(mesh)
-                if mesh.positions.size:
-                    mn, mx = mesh.bounds_in_world()
-                    bmin = np.minimum(bmin, mn)
-                    bmax = np.maximum(bmax, mx)
+            bmin, bmax = self._append_mount_armor(geom, src, armor_mtx, comp, bmin, bmax)
             placed += 1
 
             # 该挂载模型骨架上的 MP 子设备（炮塔测距仪/炮管防空炮/弹药箱等，
@@ -641,28 +739,28 @@ class GeometryService:
             # miscFilter 白名单：**恒生效**（空列表 = 空白名单 = 不显示任何
             # MP 子设备），对齐游戏 MiscsController；customMiscs.battle 预设
             # 按 miscName 兜底显示。同一模型在不同炮位显示不同挂件（PGSB106）。
-            mp_allow = frozenset(misc_filter)
-            battle_customs = frozenset(custom_battle)
             sub_n, bmin, bmax = self._place_skeleton_mps(
                 geom, folder, m_raw, model_cache, extractor, armor_thickness,
                 comp, bmin, bmax, 0, frozenset(), cancel_event=cancel_event,
-                mp_allow=mp_allow, battle_customs=battle_customs)
+                mp_allow=frozenset(misc_filter), battle_customs=frozenset(custom_battle))
             sub_placed += sub_n
+        return hp_groups, placed, sub_placed, bmin, bmax
 
-        # ★ 一次性实例化 HP 挂载（同模型多节点 → 一份几何 + 各节点矩阵）
-        for (folder, comp), items in hp_groups.items():
-            src = model_cache.get(folder)
-            if src is None:
-                continue
-            bmin, bmax = self._emit_instanced_mount(geom, src, folder, comp,
-                                                    items, bmin, bmax)
+    def _place_deck_mounts(self, geom: ShipGeometry, transforms: dict, extractor,
+                           armor_thickness: dict, model_cache: dict, n_refs: int,
+                           bmin: np.ndarray, bmax: np.ndarray, progress_cb=None,
+                           cancel_event: threading.Event | None = None,
+                           lod: int = -1):
+        """MP_ 甲板设备（缆桩/小艇/探照灯/救生筏等 misc 模型）定位。
 
-        # ── MP 甲板设备挂载（缆桩/小艇/探照灯/救生筏等 misc 模型）──
-        # MP 节点不在 GameParams，由 populate 纳入 skeleton_mounts（v5）；
-        # 模型目录由命名约定推导：MP_{baseID}_... → misc/{baseID}/{baseID}.geometry
-        mp_placed = 0
-        mp_items = [(n, m) for n, m in transforms.items() if n.startswith("MP_")]
+        MP 节点不在 GameParams，由 populate 纳入 skeleton_mounts；
+        模型目录由命名约定推导：MP_{baseID}_... → misc/{baseID}/{baseID}.geometry。
+        返回 (mp_groups, mp_placed, sub_placed, bmin, bmax)。
+        """
         mp_groups: dict = {}   # folder -> [(label, mtx, armor_mtx), ...]
+        mp_placed = 0
+        sub_placed = 0
+        mp_items = [(n, m) for n, m in transforms.items() if n.startswith("MP_")]
         n_mp = len(mp_items)
         for idx, (mp_name, m_raw) in enumerate(mp_items):
             self._raise_if_cancelled(cancel_event)
@@ -673,9 +771,7 @@ class GeometryService:
             if not folder:
                 continue
             rb = self._mount_root_blend(folder)
-            mtx = np.ascontiguousarray(_negz @ (m_raw @ rb) @ _negz, dtype=np.float32)
-            # 装甲用原始挂点矩阵（同 HP 挂载：不做 Root_BlendBone 修正）
-            armor_mtx = np.ascontiguousarray(_negz @ m_raw @ _negz, dtype=np.float32)
+            mtx, armor_mtx = self._mount_matrices(m_raw, rb)
             if folder not in model_cache:
                 model_cache[folder] = self._load_mount_model(
                     folder, extractor, armor_thickness, COMPONENT_DECK,
@@ -685,43 +781,15 @@ class GeometryService:
                 continue
             # ★ 不逐节点复制几何：累积到分组，循环后一次性实例化
             mp_groups.setdefault(folder, []).append((mp_name, mtx, armor_mtx))
-            for am in src["armor_meshes"]:
-                mesh = ArmorMesh(
-                    name=am.name, positions=am.positions, normals=am.normals,
-                    colors=am.colors, indices=am.indices, triangles=am.triangles,
-                    component=COMPONENT_DECK, model_matrix=armor_mtx,
-                )
-                geom.armor_meshes.append(mesh)
-                if mesh.positions.size:
-                    mn, mx = mesh.bounds_in_world()
-                    bmin = np.minimum(bmin, mn)
-                    bmax = np.maximum(bmax, mx)
+            bmin, bmax = self._append_mount_armor(
+                geom, src, armor_mtx, COMPONENT_DECK, bmin, bmax)
             mp_placed += 1
             # 甲板设备模型自身骨架上的 MP 子设备（递归，防环）
             sub_n, bmin, bmax = self._place_skeleton_mps(
                 geom, folder, m_raw, model_cache, extractor, armor_thickness,
                 COMPONENT_DECK, bmin, bmax, 0, frozenset(), cancel_event=cancel_event)
             sub_placed += sub_n
-
-        # ★ 一次性实例化 MP 甲板设备（同模型多节点 → 一份几何 + 各节点矩阵）
-        for folder, items in mp_groups.items():
-            src = model_cache.get(folder)
-            if src is None:
-                continue
-            bmin, bmax = self._emit_instanced_mount(geom, src, folder, COMPONENT_DECK,
-                                                    items, bmin, bmax)
-
-        # ★ 统一收敛：把所有节点类型（含挂载模型骨架上的 MP 子设备）中共享同一
-        #   几何的 MountMesh 合并为实例化网格（一份几何 + 各节点矩阵），省 GPU 内存。
-        self._dedupe_mount_instances(geom)
-
-        if np.isfinite(bmin).all():
-            geom.bounds_min = bmin
-            geom.bounds_max = bmax
-        geom.stats["mounts"] = placed
-        geom.stats["deck_equipment"] = mp_placed
-        geom.stats["sub_equipment"] = sub_placed
-        geom.stats["unique_mount_models"] = len(model_cache)
+        return mp_groups, mp_placed, sub_placed, bmin, bmax
 
     def _skeleton_bone_world(self, folder: str, bone_name: str) -> np.ndarray | None:
         """读挂载模型骨架某 bone 的世界矩阵（bind pose，**只从 assets_data.db 读取**）。
@@ -987,7 +1055,6 @@ class GeometryService:
         mp_nodes = {k: v for k, v in bones.items() if k.startswith("MP_")}
         if not mp_nodes:
             return 0, bmin, bmax
-        _negz = np.diag([1.0, 1.0, -1.0, 1.0])
         placed = 0
         visited_next = visited | {folder}
         for mp_name, W in mp_nodes.items():
@@ -1003,10 +1070,10 @@ class GeometryService:
             sub_skel_to_ship = skel_to_ship_game @ W
             rb_sub = self._mount_root_blend(sub_folder)
             mtx = np.ascontiguousarray(
-                _negz @ (sub_skel_to_ship @ rb_sub) @ _negz, dtype=np.float32)
+                _NEGZ @ (sub_skel_to_ship @ rb_sub) @ _NEGZ, dtype=np.float32)
             # 装甲用原始变换（不做 Root_BlendBone 修正，同 HP 挂载）
             armor_mtx = np.ascontiguousarray(
-                _negz @ sub_skel_to_ship @ _negz, dtype=np.float32)
+                _NEGZ @ sub_skel_to_ship @ _NEGZ, dtype=np.float32)
             if sub_folder not in model_cache:
                 model_cache[sub_folder] = self._load_mount_model(
                     sub_folder, extractor, armor_thickness, component,

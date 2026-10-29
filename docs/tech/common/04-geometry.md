@@ -17,6 +17,16 @@
 `ShipGeometry` 的渲染集索引来自 `assets_data.db` 的 `render_set`，
 按 `model_folder` 取该船全部记录（含跨分段的同名 shape）。
 
+实现上，`_load_ship_impl` 只做编排，上面几步各对应一个方法（按名字 grep，行号会漂）：
+
+```text
+_resolve_hull_folder   皮肤变体的目录覆盖（hullConfig > peculiarityModels > 原目录）
+_list_hull_parts       发现 / 去重 / 拆出主文件
+_load_hull_segments    分段合并 + 船体装甲 + 碰撞模型
+_load_main_armor       主文件里只取装甲
+_load_mounts           HP_* 挂点 → _place_hp_mounts；MP_* 甲板设备 → _place_deck_mounts
+```
+
 ## 2. 二进制格式
 
 ```text
