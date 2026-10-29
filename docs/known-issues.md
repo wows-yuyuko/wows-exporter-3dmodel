@@ -2,7 +2,9 @@
 
 更新时间：2026-10-27
 
-本文档记录当前导出器仍未解决的问题、已经排除的方向，以及下一步建议。
+本文档记录问题档案（现象 / 根因 / 修法），含已修复的历史条目，**不再维护「当前清单」**。
+> **当前还没解决的项看 [open-items.md](open-items.md)** —— 那是唯一入口，已按最新代码逐条核实。
+
 设计说明见 [web-render-design.md](web-render-design.md)；
 待办清单（对照 Wows_Paragrams_Unpack 的 todo_list 逐条判定）见 [todo-backlog.md](todo-backlog.md)。
 

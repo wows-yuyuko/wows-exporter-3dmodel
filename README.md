@@ -122,5 +122,6 @@
 
 - docs/tech/README.md：**已实现模块的技术细节**（按模块分文件，Lesta / WG 差异单独成篇）。
 - docs/web-render-design.md：网页端产物结构（geometry/manifest/armor/textures/skins）与 three.js 渲染/换肤设计。
-- docs/known-issues.md：已知问题与剩余工作。
-- docs/todo-backlog.md：待办（对照 Wows_Paragrams_Unpack/todo_list 逐条判定）。
+- docs/open-items.md：**当前未解决清单**（缺陷 / 保真度 / 体积 / 性能 / 工程化，唯一入口）。
+- docs/known-issues.md：问题档案（现象与根因，含已修复历史）。
+- docs/todo-backlog.md：待办档案（对照 Wows_Paragrams_Unpack/todo_list 逐条判定）。
