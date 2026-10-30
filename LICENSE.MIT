@@ -1,0 +1,51 @@
+MIT License
+
+Copyright 2026 Lander Brandt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+适用文件 / Applies to
+=====================
+
+本许可证适用于 `uncode_assets/` 中明确标注为移植/对应的文件：
+
+| 本仓库 | wows-toolkit（Rust） |
+|---|---|
+| `parser.py` | `crates/wowsunpack/src/models/assets_bin.rs` |
+| `vfs.py` | `data/assets_bin_vfs.rs` |
+| `binary.py` | `parser_utils.rs` |
+| `decoders.py` | `models/{material,visual,model}.rs` |
+
+同目录下其余文件（`fx.py` / `atlas_contour.py` / `service.py` / `types.py` /
+`parse_rules.py` / `errors.py` / `selftest.py`）为本项目自研，按 Apache-2.0。
+
+This license applies to the files in `uncode_assets/` that are explicitly
+marked as ports of / corresponding to wows-toolkit (Rust) modules: `parser.py`
+(assets_bin.rs), `vfs.py` (assets_bin_vfs.rs), `binary.py` (parser_utils.rs),
+and `decoders.py` (models/{material,visual,model}.rs). The remaining files in
+that directory are original work under Apache-2.0.
+
+MIT 与 Apache-2.0 兼容，可与本仓库其余部分一同分发；本目录保留 MIT 归属，
+其余部分按 Apache-2.0（见 LICENSE.Apache-2.0）。
+
+MIT is compatible with Apache-2.0 and may be distributed together with the
+rest of this repository; this directory retains its MIT attribution while the
+remainder is under Apache-2.0 (see LICENSE.Apache-2.0).

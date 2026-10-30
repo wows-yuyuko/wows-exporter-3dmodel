@@ -116,7 +116,25 @@
 - import 每服只需跑一次（客户端更新后重跑）；
 - 首次运行会自动从包里提取 GameParams 到 <game>/data/；
 - geometry.glb 默认只含完好状态：`_crack_*` / `*_in` 断面几何被剔除（与 wows-model-exporter 的 `--damage` 口径一致）；
-- 许可证：主体 Apache-2.0；data_extractor/kraken.py 为 GPLv3（见 LICENSE 文件）。
+- 许可证见下方「来源与许可」。
+
+## 来源与许可
+
+本项目是 [walksQAQ/Wows_Paragrams_Unpack](https://github.com/walksQAQ/Wows_Paragrams_Unpack)
+的**二次开发版本（非官方分支）**：删除了 GUI / D3D11 渲染器 / 数据浏览等功能，
+重写了 GLB 导出、几何装配与数据库层，并新增装甲导出、manifest、顶点量化等模块。
+
+| 范围 | 许可 |
+|---|---|
+| 主体（含上游原作与本项目的修改） | **Apache-2.0**，全文见 `LICENSE.Apache-2.0` |
+| `data_extractor/kraken.py` | **GPLv3**（移植自 domdfcoding/kraken-decompressor），全文见 `LICENSE.GPLv3` |
+| `uncode_assets/{parser,vfs,binary,decoders}.py` | **MIT**（移植自 landaire/wows-toolkit，© Lander Brandt），全文见 `LICENSE.MIT` |
+
+> ⚠️ `kraken.py` 被主程序导入，构成同一组合程序。**分发整个程序**（如打包 exe）时
+> 整体须遵守 GPLv3 义务（提供对应源代码）。仅本地使用或只分发 Apache-2.0 部分不受此约束。
+
+上游未提供 NOTICE 文件，故无 Apache-2.0 §4(d) 的 NOTICE 义务；所引用的第三方项目、
+格式规范与游戏数据归各自版权所有者。完整声明与版权行见 `LICENSE`。
 
 ## 文档
 

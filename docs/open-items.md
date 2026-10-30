@@ -111,9 +111,9 @@
 |---|---|---|
 | D1 | 自动化测试 | 没有 `tests/`。回归手段只有 `tools/ab_render_compare.py`（像素 A/B）和 `.workbuddy/tmp/probe_*.py` 一次性脚本 |
 | D2 | CI | 没有 `.github/workflows` |
-| D3 | NOTICE | 没有。`data_extractor/kraken.py` 是 **GPLv3**，其余 Apache-2.0，分发必须带 NOTICE |
+| D3 | NOTICE / 第三方归属 | ✅ 已完成（2026-10-30）：补 `LICENSE.MIT`（`uncode_assets/{parser,vfs,binary,decoders}.py` ← landaire/wows-toolkit，MIT）；`LICENSE` 改为「衍生作品声明 + 双版权行」。上游无 NOTICE，Apache-2.0 §4(d) 不强制 |
 | D4 | 文档行号漂移 | `文件:行号` 会漂（上一轮核对 18 处里 8 处失准，最大偏 290 行）。约定见 `tech/README.md`：**按符号 grep**，改符号锚点暂不做 |
-| D5 | 剩余大函数 | `geometry_service._load_ship_impl`(274 行)、`_load_mounts`(174 行)。`_GlbBuilder`(709 行) 评估后结构合理，不动 |
+| D5 | 剩余大函数 | `_place_skeleton_mps`(105) / `_load_mount_model`(103) —— 都是数据密集循环，拆分收益低，**决定不动** |
 
 ---
 
